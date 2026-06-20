@@ -415,12 +415,54 @@ static void send_response(OrbisNetId c, const char *status, const char *ctype,
         send_all(c, body, bodylen);
 }
 
+// Case-insensitive strstr (HTTP header names vary in case across clients).
+static const char *ci_strstr(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    if (!nl) return hay;
+    for (; *hay; hay++) {
+        size_t i = 0;
+        while (i < nl) {
+            char a = hay[i], b = needle[i];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) break;
+            i++;
+        }
+        if (i == nl) return hay;
+    }
+    return NULL;
+}
+
 static void handle_client(OrbisNetId c) {
     char req[8192];
     int n = sceNetRecv(c, req, sizeof(req) - 1, 0);
     if (n <= 0)
         return;
     req[n] = '\0';
+
+    // A single recv may not contain the whole request: the POST body (the cast
+    // URL) often arrives in a later TCP segment, which previously left body=""
+    // and surfaced as "bad url" on intermittent casts. Keep reading until we have
+    // the header terminator AND the full Content-Length body (bounded by req[]).
+    char *hdrend = strstr(req, "\r\n\r\n");
+    while (!hdrend && n < (int)sizeof(req) - 1) {           // headers not complete yet
+        int r = sceNetRecv(c, req + n, sizeof(req) - 1 - n, 0);
+        if (r <= 0) break;
+        n += r; req[n] = '\0';
+        hdrend = strstr(req, "\r\n\r\n");
+    }
+    if (hdrend) {
+        int clen = 0;
+        const char *cl = ci_strstr(req, "Content-Length:");
+        if (cl) clen = atoi(cl + (int)strlen("Content-Length:"));
+        int have = n - (int)((hdrend + 4) - req);           // body bytes already read
+        while (clen > have && n < (int)sizeof(req) - 1) {    // wait for the rest of the body
+            int r = sceNetRecv(c, req + n, sizeof(req) - 1 - n, 0);
+            if (r <= 0) break;
+            n += r; req[n] = '\0';
+            have = n - (int)((hdrend + 4) - req);
+        }
+    }
 
     // Method + path
     char method[8] = {0}, path[256] = {0};
