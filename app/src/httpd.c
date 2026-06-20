@@ -563,6 +563,20 @@ static void handle_client(OrbisNetId c) {
         return;
     }
 
+    // Last fatal-signal capture (signal + fault address), persisted by the crash
+    // handler before clean-exit, so we can diagnose what crashed after a reopen.
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/crashlog") == 0) {
+        int fd = sceKernelOpen("/data/ps4cast_crash.log", 0 /*O_RDONLY*/, 0);
+        if (fd < 0) { send_response(c, "200 OK", "text/plain", "(no crash logged)", 17); return; }
+        static char cb[512];
+        int cn = (int)sceKernelRead(fd, cb, sizeof(cb) - 1);
+        sceKernelClose(fd);
+        if (cn < 0) cn = 0;
+        cb[cn] = '\0';
+        send_response(c, "200 OK", "text/plain", cb, cn);
+        return;
+    }
+
     // Transport controls. /pause body: "1"/"0"/empty(toggle). /seek body: seconds.
     if (strcmp(method, "POST") == 0 && strcmp(path, "/pause") == 0) {
         int want;

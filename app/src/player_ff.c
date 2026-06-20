@@ -85,6 +85,11 @@ static int               g_sepAudioMode = 0;
 static uint8_t *g_scaled;          // BGRA scaled output, display-fit (software path)
 static int      g_scaledW, g_scaledH;
 static int      g_srcW, g_srcH;
+// Source geometry/format the cached g_sws was built for. If a frame arrives with
+// different source dims/format (e.g. an HLS discontinuity changes resolution),
+// the old sws context would read fr->data with wrong strides -> over-read/crash.
+static int      g_swsSrcW, g_swsSrcH;
+static int      g_swsSrcFmt = -1;  // AV_PIX_FMT_NONE
 // HW path presents NV12 straight to the framebuffer (no g_scaled), so we keep a
 // ref to the last shown frame and re-present it on holds/pause/EOF — otherwise a
 // held frame flips to a stale back-buffer (judder). NULL in software mode.
@@ -633,6 +638,7 @@ static int build_scaled(AVFrame *fr, Gfx *g) {
     if (scaledH > dh) { scaledH = dh; scaledW = (int)((int64_t)dh * sw / sh); }
     if (scaledW < 1) scaledW = 1; if (scaledH < 1) scaledH = 1;
 
+    enum AVPixelFormat srcFmt = g_useHw ? AV_PIX_FMT_NV12 : g_vdec->pix_fmt;
     if (scaledW != g_scaledW || scaledH != g_scaledH || !g_scaled) {
         free(g_scaled);
         g_scaled = malloc((size_t)scaledW * scaledH * 4);
@@ -640,12 +646,17 @@ static int build_scaled(AVFrame *fr, Gfx *g) {
         g_scaledW = scaledW; g_scaledH = scaledH;
         if (g_sws) { sws_freeContext(g_sws); g_sws = NULL; }
     }
+    // Rebuild sws if the SOURCE geometry/format changed too (not just the output)
+    // — otherwise a discontinuity-driven resolution change reads with wrong strides.
+    if (g_sws && (sw != g_swsSrcW || sh != g_swsSrcH || (int)srcFmt != g_swsSrcFmt)) {
+        sws_freeContext(g_sws); g_sws = NULL;
+    }
     if (!g_sws) {
-        enum AVPixelFormat srcFmt = g_useHw ? AV_PIX_FMT_NV12 : g_vdec->pix_fmt;
         g_sws = sws_getContext(sw, sh, srcFmt,
                                scaledW, scaledH, AV_PIX_FMT_BGRA,
                                SWS_BILINEAR, NULL, NULL, NULL);
         if (!g_sws) return -1;
+        g_swsSrcW = sw; g_swsSrcH = sh; g_swsSrcFmt = (int)srcFmt;
     }
     uint8_t *dst[4] = { g_scaled, NULL, NULL, NULL };
     int dstStride[4] = { g_scaledW * 4, 0, 0, 0 };

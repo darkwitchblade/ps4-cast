@@ -106,10 +106,15 @@ static void *audio_main(void *arg) {
         }
         scePthreadMutexUnlock(&g_amtx);
         for (int i = avail; i < GRAIN; i++) { out[i*2] = 0; out[i*2+1] = 0; } // pad
-        sceAudioOutOutput(g_handle, out);   // blocks ~GRAIN/RATE => realtime pacing
-        if (!g_paused && avail < GRAIN) g_underruns++;
-        g_contentOut += (uint64_t)avail;
-        g_hwOut += GRAIN;
+        sceAudioOutOutput(g_handle, out);   // blocks ~GRAIN/RATE => realtime pacing (also when paused)
+        // Advance the clock ONLY when not paused. A rebuffer pause must FREEZE the
+        // clock — otherwise it runs ahead during the hold and every refilled video
+        // frame is "late" on resume, dumping the whole queue (mass drops).
+        if (!g_paused) {
+            if (avail < GRAIN) g_underruns++;
+            g_contentOut += (uint64_t)avail;
+            g_hwOut += GRAIN;
+        }
     }
     return NULL;
 }

@@ -64,12 +64,34 @@
 // A fatal fault on ANY thread (decode/present/audio/http) should fully CLOSE the
 // app, not leave it half-alive and suspended (the rotating-circle hang). We catch
 // the fatal signals process-wide and _exit immediately so the system reaps it
-// cleanly — a clean exit instead of a stuck/suspended title. Exit 0 so the shell
-// treats the handler path as an intentional close instead of an app-error exit.
-static void fatal_signal(int sig) { (void)sig; _exit(0); }
+// cleanly. BUT _exit hides the fault from the klog/coredump — so first record the
+// signal + fault address to /data (read back via GET /crashlog) so we can still
+// diagnose WHAT crashed. Runs on an alt-stack so it works even on stack overflow.
+#ifndef SA_SIGINFO
+#define SA_SIGINFO 0x0040
+#endif
+#ifndef SA_ONSTACK
+#define SA_ONSTACK 0x0001
+#endif
+extern int sigaltstack(const stack_t *, stack_t *);
+
+static void fatal_signal(int sig, struct __siginfo *info, void *uap) {
+    (void)uap;
+    char b[160];
+    unsigned long a = info ? (unsigned long)info->si_addr : 0;
+    int n = snprintf(b, sizeof(b), "CRASH v" APP_VER " sig=%d addr=0x%lx\n", sig, a);
+    int fd = sceKernelOpen("/data/ps4cast_crash.log", 0x0201 /*WRONLY|CREAT*/ | 0x0400 /*TRUNC*/, 0666);
+    if (fd >= 0) { sceKernelWrite(fd, b, (size_t)n); sceKernelClose(fd); }
+    _exit(0);
+}
 static void install_fatal_handlers(void) {
+    static char altstk[64 * 1024];           // alt-stack so the handler runs on stack overflow
+    stack_t ss; memset(&ss, 0, sizeof(ss));
+    ss.ss_sp = altstk; ss.ss_size = sizeof(altstk); ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
     struct sigaction sa; memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = fatal_signal;
+    sa.__sa_handler.__sa_sigaction = fatal_signal;   // toolchain's sa_sigaction macro is broken
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     int sigs[10] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP,
                      SIGHUP, SIGINT, SIGQUIT, SIGTERM };
     for (int i = 0; i < 10; i++) sigaction(sigs[i], &sa, NULL);
