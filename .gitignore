@@ -1,0 +1,17 @@
+# build artifacts
+app/build/
+app/eboot.bin
+app/pkg.gp4
+app/sce_sys/param.sfo
+app/*.pkg
+payloads/*/build/
+*.o
+*.elf
+*.oelf
+# large external trees
+oo/
+portlibs/ffmpeg/
+portlibs/bearssl/
+# outputs
+dist/*.pkg
+/tmp/
