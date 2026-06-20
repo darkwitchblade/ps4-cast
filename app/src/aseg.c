@@ -39,6 +39,14 @@ static uint16_t g_port = 80;
 static uint32_t g_addr = 0;
 static int      g_tlsmode = 0;
 
+// HTTP keep-alive: live HLS hits the same CDN host for every segment, so reusing
+// the TLS connection (no per-segment handshake) is the difference between fetch
+// at ~realtime (can't build a buffer) and ~2.5x realtime (buffer fills, smooth).
+static int      g_kaAlive = 0;     // g_sock/g_tls are open + reusable
+static char     g_kaHost[256] = "";
+static uint16_t g_kaPort = 0;
+static int      g_kaTlsmode = 0;
+
 static const char *ci_strstr(const char *hay, const char *needle) {
     size_t nl = strlen(needle);
     if (!nl) return hay;
@@ -87,10 +95,17 @@ static int parse_url(const char *url) {
     return 0;
 }
 
+// 1-entry DNS cache: live HLS hits the same CDN host for every segment, so
+// resolving each time added 100s of ms of variable latency per fetch (a big part
+// of the segment-fetch time that kept the prefetcher from getting ahead).
+static char     g_dnsHost[256] = "";
+static uint32_t g_dnsAddr = 0;
+
 static int resolve_host(void) {
     OrbisNetInAddr a;
     memset(&a, 0, sizeof(a));
     if (sceNetInetPton(ORBIS_NET_AF_INET, g_host, &a.s_addr) > 0) { g_addr = a.s_addr; return 0; }
+    if (g_dnsAddr && strcmp(g_dnsHost, g_host) == 0) { g_addr = g_dnsAddr; return 0; }  // cache hit
     int pool = net_pool();
     if (pool < 0) return -1;
     OrbisNetId rid = sceNetResolverCreate("ps4cast_ares", pool, 0);
@@ -99,6 +114,8 @@ static int resolve_host(void) {
     sceNetResolverDestroy(rid);
     if (rc < 0) return -3;
     g_addr = a.s_addr;
+    strncpy(g_dnsHost, g_host, sizeof(g_dnsHost) - 1); g_dnsHost[sizeof(g_dnsHost) - 1] = '\0';
+    g_dnsAddr = a.s_addr;                                                                // cache it
     return 0;
 }
 
@@ -144,14 +161,16 @@ void aseg_abort(void) {
 // One request: connect, GET (Connection: close), parse headers. On 3xx returns
 // 1 and copies Location into `loc`. On 2xx returns 0 and leaves the connection
 // positioned at the first body byte, with header-adjacent body bytes in *lead.
-static int do_request(int *status, char *loc, int loccap,
-                      uint8_t *lead, int *leadLen) {
-    conn_close();
-    g_sock = tcp_connect();
-    if (g_sock < 0) return -1;
-    if (g_tlsmode) {
-        g_tls = tls_open(g_sock, g_host);
-        if (!g_tls) { conn_close(); return -2; }
+static int do_request(int reuse, int *status, char *loc, int loccap,
+                      uint8_t *lead, int *leadLen, long *clen) {
+    if (!reuse) {
+        conn_close();
+        g_sock = tcp_connect();
+        if (g_sock < 0) return -1;
+        if (g_tlsmode) {
+            g_tls = tls_open(g_sock, g_host);
+            if (!g_tls) { conn_close(); return -2; }
+        }
     }
 
     char req[1600];
@@ -160,7 +179,7 @@ static int do_request(int *status, char *loc, int loccap,
         "Host: %s\r\n"
         "User-Agent: PS4Cast/1.0\r\n"
         "Accept: */*\r\n"
-        "Connection: close\r\n"
+        "Connection: keep-alive\r\n"
         "\r\n",
         g_path, g_host);
     if (conn_write((const uint8_t *)req, n) != 0) { conn_close(); return -3; }
@@ -180,6 +199,12 @@ static int do_request(int *status, char *loc, int loccap,
     int st = 0;
     if (strncmp(hdr, "HTTP/", 5) == 0) { const char *sp = strchr(hdr, ' '); if (sp) st = atoi(sp + 1); }
     if (status) *status = st;
+
+    if (clen) {
+        *clen = -1;
+        const char *cl = ci_strstr(hdr, "Content-Length:");
+        if (cl) *clen = atol(cl + (int)strlen("Content-Length:"));
+    }
 
     if (st >= 300 && st < 400 && loc && loccap) {
         loc[0] = '\0';
@@ -207,41 +232,71 @@ static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
     char cur[1400];
     strncpy(cur, url, sizeof(cur) - 1); cur[sizeof(cur) - 1] = '\0';
 
-    uint8_t lead[4096]; int leadLen = 0;
+    uint8_t lead[4096]; int leadLen = 0; long clen = -1;
     int opened = 0;
     for (int hop = 0; hop < 5 && !opened; hop++) {
-        if (parse_url(cur) != 0) { conn_close(); return -1; }
-        if (resolve_host() != 0) { conn_close(); return -2; }
+        if (parse_url(cur) != 0) { conn_close(); g_kaAlive = 0; return -1; }
+        if (resolve_host() != 0) { conn_close(); g_kaAlive = 0; return -2; }
+        // Reuse the kept-alive socket if it's to the same host:port:tls.
+        int reuse = (g_kaAlive && g_sock >= 0 && g_kaPort == g_port &&
+                     g_kaTlsmode == g_tlsmode && strcmp(g_kaHost, g_host) == 0);
         int status = 0; char loc[1400];
-        int rc = do_request(&status, loc, sizeof(loc), lead, &leadLen);
-        if (rc == 1 && loc[0]) { strncpy(cur, loc, sizeof(cur) - 1); cur[sizeof(cur) - 1] = '\0'; continue; }
-        if (rc != 0) { conn_close(); return -3; }
-        if (status != 200 && status != 206) { conn_close(); return -4; }
+        int rc = do_request(reuse, &status, loc, sizeof(loc), lead, &leadLen, &clen);
+        if (rc != 0 && reuse) {            // stale keep-alive socket -> fresh connect once
+            conn_close(); g_kaAlive = 0;
+            rc = do_request(0, &status, loc, sizeof(loc), lead, &leadLen, &clen);
+        }
+        if (rc == 1 && loc[0]) { strncpy(cur, loc, sizeof(cur) - 1); cur[sizeof(cur) - 1] = '\0'; g_kaAlive = 0; continue; }
+        if (rc != 0) { conn_close(); g_kaAlive = 0; return -3; }
+        if (status != 200 && status != 206) { conn_close(); g_kaAlive = 0; return -4; }
         opened = 1;
     }
-    if (!opened) { conn_close(); return -5; }
+    if (!opened) { conn_close(); g_kaAlive = 0; return -5; }
 
-    // Read the whole body into a growing buffer (Connection: close => read to EOF).
     size_t cap = 256 * 1024, used = 0;
     uint8_t *buf = malloc(cap);
-    if (!buf) { conn_close(); return -6; }
+    if (!buf) { conn_close(); g_kaAlive = 0; return -6; }
     if (leadLen > 0) { memcpy(buf, lead, leadLen); used = leadLen; }
 
-    for (;;) {
-        if (g_abort) { free(buf); conn_close(); return -9; }
-        if (used + 64 * 1024 > cap) {
-            size_t ncap = cap * 2;
-            if (ncap > ASEG_FETCH_CAP) ncap = ASEG_FETCH_CAP;
-            if (ncap <= cap) { free(buf); conn_close(); return -10; }
-            uint8_t *nb = realloc(buf, ncap);
-            if (!nb) { free(buf); conn_close(); return -7; }
-            buf = nb; cap = ncap;
+    if (clen >= 0) {
+        // Known length: read exactly Content-Length bytes and KEEP the socket open
+        // for the next same-host segment (skips the TLS handshake — the big win).
+        size_t need = (size_t)clen;
+        if (need > ASEG_FETCH_CAP) { free(buf); conn_close(); g_kaAlive = 0; return -10; }
+        while (used < need) {
+            if (g_abort) { free(buf); conn_close(); g_kaAlive = 0; return -9; }
+            if (used + 64 * 1024 > cap) {
+                size_t ncap = cap * 2; if (ncap < need) ncap = need;
+                if (ncap > ASEG_FETCH_CAP) ncap = ASEG_FETCH_CAP;
+                uint8_t *nb = realloc(buf, ncap);
+                if (!nb) { free(buf); conn_close(); g_kaAlive = 0; return -7; }
+                buf = nb; cap = ncap;
+            }
+            int want = (int)(need - used); if (want > (int)(cap - used)) want = (int)(cap - used);
+            int r = conn_read(buf + used, want);
+            if (r <= 0) { free(buf); conn_close(); g_kaAlive = 0; return -11; }  // short read -> fail+reconnect
+            used += r;
         }
-        int r = conn_read(buf + used, (int)(cap - used));
-        if (r > 0) { used += r; continue; }
-        break;  // 0 = clean EOF, <0 = error/timeout (return what we have)
+        g_kaAlive = 1; g_kaPort = g_port; g_kaTlsmode = g_tlsmode;   // reusable next time
+        strncpy(g_kaHost, g_host, sizeof(g_kaHost) - 1); g_kaHost[sizeof(g_kaHost) - 1] = '\0';
+    } else {
+        // Unknown length (no Content-Length): read to EOF, then close (no reuse).
+        for (;;) {
+            if (g_abort) { free(buf); conn_close(); g_kaAlive = 0; return -9; }
+            if (used + 64 * 1024 > cap) {
+                size_t ncap = cap * 2;
+                if (ncap > ASEG_FETCH_CAP) ncap = ASEG_FETCH_CAP;
+                if (ncap <= cap) { free(buf); conn_close(); g_kaAlive = 0; return -10; }
+                uint8_t *nb = realloc(buf, ncap);
+                if (!nb) { free(buf); conn_close(); g_kaAlive = 0; return -7; }
+                buf = nb; cap = ncap;
+            }
+            int r = conn_read(buf + used, (int)(cap - used));
+            if (r > 0) { used += r; continue; }
+            break;
+        }
+        conn_close(); g_kaAlive = 0;
     }
-    conn_close();
 
     if (used == 0) { free(buf); return -8; }
     *outBuf = buf; *outLen = (int)used;

@@ -16,7 +16,7 @@
 #define HLS_MAX_SEGMENTS 8192
 #define PLAYLIST_CAP     (4 * 1024 * 1024)
 #define HLS_MEM_SEG_CAP  (16 * 1024 * 1024)
-#define HLS_PREFETCH_MAX 5
+#define HLS_PREFETCH_MAX 10          // deeper buffer: thin-margin live CDN streams need more segments ahead
 #define HLS_AUDIO_PREFETCH_SLOTS 3
 
 static char  **g_segs;            // resolved absolute segment URLs
@@ -127,11 +127,14 @@ static void prefer_plain_s3(char *url, int cap) {
 
 static void configure_prefetch_depth(void) {
     int bw = (g_curVariant >= 0 && g_curVariant < g_variantCount) ? g_variants[g_curVariant].bw : 0;
-    int d = 3;
-    if (g_isLive) d = 2;
-    else if (bw > 0 && bw <= 4000000) d = 5;
-    else if (bw > 0 && bw <= 8000000) d = 4;
-    else if (bw > 14000000) d = 2;
+    int d = 6;
+    // Live CDN streams (sliding window) buffered too shallow (d=2) -> constant
+    // rebuffer on thin-bandwidth-margin links. Buffer much deeper; prefetch_main
+    // only fetches segments that actually exist in the window, so this self-caps.
+    if (g_isLive) d = 8;
+    else if (bw > 0 && bw <= 4000000) d = 8;
+    else if (bw > 0 && bw <= 8000000) d = 6;
+    else if (bw > 14000000) d = 3;
     if (d < 1) d = 1;
     if (d > HLS_PREFETCH_MAX) d = HLS_PREFETCH_MAX;
     g_prefDepth = d;
