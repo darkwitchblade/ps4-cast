@@ -26,6 +26,39 @@
 #include <orbis/libkernel.h>
 #endif
 
+#include <signal.h>
+#include <unistd.h>   // _exit
+#ifndef SIGILL
+#define SIGILL  4
+#endif
+#ifndef SIGTRAP
+#define SIGTRAP 5
+#endif
+#ifndef SIGABRT
+#define SIGABRT 6
+#endif
+#ifndef SIGFPE
+#define SIGFPE  8
+#endif
+#ifndef SIGBUS
+#define SIGBUS  10
+#endif
+#ifndef SIGSEGV
+#define SIGSEGV 11
+#endif
+
+// A fatal fault on ANY thread (decode/present/audio/http) should fully CLOSE the
+// app, not leave it half-alive and suspended (the rotating-circle hang). We catch
+// the fatal signals process-wide and _exit immediately so the system reaps it
+// cleanly — a clean exit instead of a stuck/suspended title.
+static void fatal_signal(int sig) { (void)sig; _exit(1); }
+static void install_fatal_handlers(void) {
+    struct sigaction sa; memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = fatal_signal;
+    int sigs[6] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP };
+    for (int i = 0; i < 6; i++) sigaction(sigs[i], &sa, NULL);
+}
+
 #define FB_W 1920
 #define FB_H 1080
 #define PORT 8080
@@ -221,6 +254,7 @@ static void draw_hud(Gfx *g) {
 
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    install_fatal_handlers();   // crash on any thread -> clean full close, not a suspended hang
 
     Gfx g;
     if (gfx_init(&g, FB_W, FB_H) != 0) {
