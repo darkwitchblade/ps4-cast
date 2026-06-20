@@ -88,14 +88,9 @@ int handoff_play_url(const char *url) {
 }
 
 int handoff_stop(void) {
-    int appid = sceSystemServiceGetAppIdOfBigApp();
-    if ((appid & ~0xFFFFFF) != 0x60000000) {
-        snprintf(g_handoff_status, sizeof(g_handoff_status), "native no big app 0x%x", (unsigned)appid);
-        return -1;
-    }
-    int r = sceSystemServiceKillApp((uint32_t)appid, -1, 0, 0);
-    snprintf(g_handoff_status, sizeof(g_handoff_status), "native stop app=0x%x rc=0x%x", (unsigned)appid, (unsigned)r);
-    return r;
+    snprintf(g_handoff_status, sizeof(g_handoff_status), "native handoff disabled");
+    snprintf(g_dbg, sizeof(g_dbg), "native stop disabled after shell API crash reports");
+    return 0;
 }
 
 typedef int (*pfn_init)(void);

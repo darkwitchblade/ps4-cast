@@ -394,14 +394,21 @@ static int raw_seq_read(uint8_t *buf, int len) {
     int got = 0, reconnects = 0;
     while (got < len) {
         if (g_stop || g_abort) break;   // bail fast on stop/cast
+        if (g_total && g_rawPos + (uint64_t)got >= g_total) break;
         if (g_leadOff < g_leadLen) {
             int avail = g_leadLen - g_leadOff, take = len - got;
+            if (g_total && g_rawPos + (uint64_t)got + (uint64_t)take > g_total)
+                take = (int)(g_total - (g_rawPos + (uint64_t)got));
             if (take > avail) take = avail;
             memcpy(buf + got, g_lead + g_leadOff, take);
             g_leadOff += take; got += take;
             continue;
         }
-        int r = conn_read(buf + got, len - got);
+        int want = len - got;
+        if (g_total && g_rawPos + (uint64_t)got + (uint64_t)want > g_total)
+            want = (int)(g_total - (g_rawPos + (uint64_t)got));
+        if (want <= 0) break;
+        int r = conn_read(buf + got, want);
         if (r > 0) { got += r; reconnects = 0; continue; }   // progress resets backoff
         if (g_stop || g_abort) break;
         uint64_t curpos = g_rawPos + got;
@@ -490,6 +497,10 @@ static void *reader_main(void *arg) {
         ring_evict_locked((size_t)n);
         if (g_ringFill + (size_t)n <= RING_CAP) ring_append(tmp, n);
         g_rawPos += n;
+        if (g_total && g_rawPos >= g_total) {
+            g_eof = 1;
+            g_cleanEof = 1;
+        }
         scePthreadCondSignal(&g_condData);
         scePthreadMutexUnlock(&g_mtx);
     }

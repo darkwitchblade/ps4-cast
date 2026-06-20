@@ -1,6 +1,7 @@
 #include "hls.h"
 #include "httpsrc.h"
 #include "aseg.h"
+#include "trace.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -14,6 +15,7 @@
 
 #define HLS_MAX_SEGMENTS 8192
 #define PLAYLIST_CAP     (4 * 1024 * 1024)
+#define HLS_MEM_SEG_CAP  (16 * 1024 * 1024)
 #define HLS_PREFETCH_MAX 5
 #define HLS_AUDIO_PREFETCH_SLOTS 3
 
@@ -28,6 +30,8 @@ static int     g_targetDurMs;     // EXT-X-TARGETDURATION for live refresh pacin
 static int     g_mediaSeq;        // EXT-X-MEDIA-SEQUENCE for sliding live windows
 static uint64_t g_lastRefreshUs;
 static uint64_t g_segPos;         // byte cursor within current open segment
+static volatile int g_segGen;     // increments when advancing to the next media segment
+static volatile int g_resetGen;   // increments when live HLS skips/jumps and player must re-anchor
 static int     g_open;            // a segment is open in httpsrc
 static int     g_active;
 static char    g_dbg[360] = "idle";   // holds open errors; live status built in hls_debug
@@ -49,6 +53,7 @@ static int               g_prefDepth = 3;
 static int               g_memSeg = -1;
 static uint8_t          *g_memBuf;
 static int               g_memLen, g_memPos;
+static int               g_liveFetchFailStreak;
 static char              g_vLastUrl[96] = "";
 static int               g_vLastRc, g_vLastBytes, g_vLastMs, g_vFailCount;
 static uint64_t          g_vOpenUs;
@@ -105,6 +110,19 @@ static void short_url(const char *url, char *out, int cap) {
     const char *p = url;
     if (n >= cap) p = url + n - (cap - 1);
     snprintf(out, cap, "%s", p);
+}
+
+static void prefer_plain_s3(char *url, int cap) {
+    (void)cap;
+    if (!url) return;
+    if (strncmp(url, "https://", 8) != 0) return;
+    const char *slash = strchr(url + 8, '/');
+    int hostLen = slash ? (int)(slash - (url + 8)) : (int)strlen(url + 8);
+    if (hostLen <= 0) return;
+    if (strstr(url + 8, ".amazonaws.com") && strstr(url + 8, ".amazonaws.com") < url + 8 + hostLen) {
+        memmove(url + 7, url + 8, strlen(url + 8) + 1);
+        memcpy(url, "http://", 7);
+    }
 }
 
 static void configure_prefetch_depth(void) {
@@ -172,6 +190,13 @@ int hls_is_url(const char *url) {
     return 0;
 }
 
+int hls_generation(void) { return g_segGen; }
+int hls_reset_generation(void) { return g_resetGen; }
+int hls_is_live(void) { return g_isLive; }
+int hls_can_segment_demux(void) {
+    return g_active && g_isLive && !g_initSeg && !g_sepAudio && g_variantCount == 0;
+}
+
 static void free_segs(void) {
     if (g_segs) {
         for (int i = 0; i < g_segCount; i++) free(g_segs[i]);
@@ -210,6 +235,12 @@ static void prefetch_stop(void) {
     prefetch_clear_locked();
 }
 
+static int prefetch_is_fetching_locked(int seg) {
+    for (int i = 0; i < HLS_PREFETCH_MAX; i++)
+        if (g_pref[i].fetching && g_pref[i].seg == seg) return 1;
+    return 0;
+}
+
 static int prefetch_has_locked(int seg) {
     for (int i = 0; i < HLS_PREFETCH_MAX; i++)
         if ((g_pref[i].ready || g_pref[i].fetching) && g_pref[i].seg == seg) return 1;
@@ -226,7 +257,10 @@ static void *prefetch_main(void *arg) {
         scePthreadMutexLock(&g_prefMtx);
         if (g_prefStop) { scePthreadMutexUnlock(&g_prefMtx); break; }
 
-        int base = g_segIdx + 1;  // current segment is consumed by ffmpeg/httpsrc
+        // For live HLS, let the worker own the current segment too. This avoids
+        // the demux thread doing a duplicate blocking fetch while the worker is
+        // already downloading the same sliding-window segment.
+        int base = g_segIdx + (g_isLive ? 0 : 1);
         int depth = g_prefDepth;
         if (depth < 1) depth = 1;
         if (depth > HLS_PREFETCH_MAX) depth = HLS_PREFETCH_MAX;
@@ -286,6 +320,10 @@ static void *prefetch_main(void *arg) {
 
 static void prefetch_start(void) {
     if (g_prefUp) return;
+    // Live prefetch needs its own sequence-numbered queue. Reusing the VOD
+    // index cache can race tiny sliding windows and was observed to crash at
+    // the live edge. Keep v02.80 live-safe; VOD still prefetches normally.
+    if (g_isLive) return;
     configure_prefetch_depth();
     for (int i = 0; i < HLS_PREFETCH_MAX; i++) g_pref[i].seg = -1;
     g_prefStop = 0;
@@ -317,6 +355,32 @@ static int prefetch_take(int seg) {
     }
     scePthreadMutexUnlock(&g_prefMtx);
     return 0;
+}
+
+static int prefetch_wait_take(int seg) {
+    if (!g_prefUp) return 0;
+    int got = 0;
+    scePthreadMutexLock(&g_prefMtx);
+    scePthreadCondSignal(&g_prefCond);
+    for (int tries = 0; tries < 30 && !got && !g_prefStop; tries++) {
+        for (int i = 0; i < HLS_PREFETCH_MAX; i++) {
+            if (g_pref[i].ready && g_pref[i].seg == seg && g_pref[i].buf && g_pref[i].len > 0) {
+                g_memSeg = seg;
+                g_memBuf = g_pref[i].buf;
+                g_memLen = g_pref[i].len;
+                g_memPos = 0;
+                memset(&g_pref[i], 0, sizeof(g_pref[i]));
+                g_pref[i].seg = -1;
+                got = 1;
+                break;
+            }
+        }
+        if (got || !prefetch_is_fetching_locked(seg)) break;
+        scePthreadCondTimedwait(&g_prefCond, &g_prefMtx, 150 * 1000);
+    }
+    scePthreadCondSignal(&g_prefCond);
+    scePthreadMutexUnlock(&g_prefMtx);
+    return got;
 }
 
 static void apref_clear_locked(void) {
@@ -427,6 +491,38 @@ static void apref_start(void) {
     }
 }
 
+static int open_mem_segment(const char *u, int seg) {
+    uint8_t *buf = NULL;
+    int len = 0;
+    short_url(u, g_vLastUrl, sizeof(g_vLastUrl));
+    trace_mark("hls mem_fetch2 begin seg=%d idx=%d/%d url=%s", seg, g_segIdx, g_segCount, g_vLastUrl);
+    uint64_t t0 = sceKernelGetProcessTime();
+
+    int rc = aseg_fetch(u, &buf, &len);
+    trace_mark("hls mem_fetch2 fetched seg=%d rc=%d len=%d", seg, rc, len);
+
+    int ms = (int)((sceKernelGetProcessTime() - t0) / 1000);
+    g_vLastRc = rc;
+    g_vLastMs = ms;
+    g_vLastBytes = len;
+    if (rc == 0 && len > HLS_MEM_SEG_CAP) rc = -26;
+    if (rc != 0 || !buf || len <= 0) {
+        if (buf) free(buf);
+        g_vFailCount++;
+        if (g_isLive) g_liveFetchFailStreak++;
+        trace_mark("hls mem_fetch2 fail seg=%d rc=%d len=%d fail=%d", seg, rc, len, g_vFailCount);
+        return -1;
+    }
+    if (g_memBuf) free(g_memBuf);
+    g_memSeg = seg;
+    g_memBuf = buf;
+    g_memLen = len;
+    g_memPos = 0;
+    g_liveFetchFailStreak = 0;
+    trace_mark("hls mem_fetch2 ok seg=%d len=%d ms=%d", seg, len, ms);
+    return 0;
+}
+
 static int apref_take_locked(int seg) {
     for (int i = 0; i < HLS_AUDIO_PREFETCH_SLOTS; i++) {
         if (g_apref[i].ready && g_apref[i].seg == seg && g_apref[i].buf && g_apref[i].len > 0) {
@@ -469,6 +565,7 @@ void hls_close(void) {
 static void resolve_url(const char *base, const char *ref, char *out, int cap) {
     if (strncmp(ref, "http://", 7) == 0 || strncmp(ref, "https://", 8) == 0) {
         snprintf(out, cap, "%s", ref);
+        prefer_plain_s3(out, cap);
         return;
     }
     // scheme://host[:port]
@@ -480,6 +577,7 @@ static void resolve_url(const char *base, const char *ref, char *out, int cap) {
         // absolute path: scheme://host + ref
         int hostlen = host_end ? (int)(host_end - base) : (int)strlen(base);
         snprintf(out, cap, "%.*s%s", hostlen, base, ref);
+        prefer_plain_s3(out, cap);
         return;
     }
     // relative path: base up to last '/'
@@ -490,23 +588,26 @@ static void resolve_url(const char *base, const char *ref, char *out, int cap) {
     }
     int dirlen = last ? (int)(last - base + 1) : (int)strlen(base);
     snprintf(out, cap, "%.*s%s", dirlen, base, ref);
+    prefer_plain_s3(out, cap);
 }
 
 // Fetch an entire (small) resource into a malloc'd NUL-terminated buffer.
 static char *fetch_all(const char *url, int *outlen) {
-    if (httpsrc_open(url) != 0) return NULL;
-    char *buf = malloc(PLAYLIST_CAP + 1);
-    if (!buf) { httpsrc_close(); return NULL; }
-    int total = 0;
-    for (;;) {
-        int n = httpsrc_read((uint8_t *)buf + total, (uint64_t)total, 65536);
-        if (n <= 0) break;
-        total += n;
-        if (total >= PLAYLIST_CAP) break;
+    uint8_t *raw = NULL;
+    int len = 0;
+    char fetchUrl[2048];
+    snprintf(fetchUrl, sizeof(fetchUrl), "%s", url);
+    prefer_plain_s3(fetchUrl, sizeof(fetchUrl));
+    if (aseg_fetch(fetchUrl, &raw, &len) != 0 || !raw || len <= 0 || len >= PLAYLIST_CAP) {
+        if (raw) free(raw);
+        return NULL;
     }
-    httpsrc_close();
-    buf[total] = '\0';
-    if (outlen) *outlen = total;
+    char *buf = malloc((size_t)len + 1);
+    if (!buf) { free(raw); return NULL; }
+    memcpy(buf, raw, (size_t)len);
+    buf[len] = '\0';
+    free(raw);
+    if (outlen) *outlen = len;
     return buf;
 }
 
@@ -840,6 +941,7 @@ void hls_request_downshift(void) { g_downshiftReq = 1; }
 
 int hls_open(const char *url) {
     hls_close();
+    trace_mark("hls open %s", url);
     g_variantCount = 0; g_curVariant = -1; g_downshiftReq = 0; g_sepAudio = 0;
     g_vLastRc = g_vLastBytes = g_vLastMs = g_vFailCount = 0; g_vLastUrl[0] = '\0';
     g_aLastRc = g_aLastBytes = g_aLastMs = g_aFailCount = 0; g_aLastUrl[0] = '\0';
@@ -875,6 +977,9 @@ int hls_open(const char *url) {
     g_initPending = (g_initSeg != NULL);
     g_segIdx = (g_variantCount > 0) ? g_segIdx : 0;
     g_segPos = 0;
+    g_segGen = 0;
+    g_resetGen = 0;
+    g_liveFetchFailStreak = 0;
     g_open = 0;
     g_active = 1;
     g_lastRefreshUs = sceKernelGetProcessTime();
@@ -887,6 +992,7 @@ int hls_open(const char *url) {
 
 static int refresh_live_playlist(void) {
     if (!g_isLive || !g_mediaUrl[0]) return -1;
+    trace_mark("hls refresh begin idx=%d/%d seq=%d", g_segIdx, g_segCount, g_mediaSeq);
     uint64_t now = sceKernelGetProcessTime();
     int waitMs = g_targetDurMs / 2;
     if (waitMs < 500) waitMs = 500;
@@ -898,7 +1004,7 @@ static int refresh_live_playlist(void) {
     strncpy(mediaUrl, g_mediaUrl, sizeof(mediaUrl) - 1);
     mediaUrl[sizeof(mediaUrl) - 1] = '\0';
     char *body = fetch_all(mediaUrl, &len);
-    if (!body) return -1;
+    if (!body) { trace_mark("hls refresh fetch failed"); return -1; }
     int nextSeq = g_mediaSeq + g_segIdx;
     prefetch_stop();
     free_segs();
@@ -906,13 +1012,18 @@ static int refresh_live_playlist(void) {
     strncpy(g_mediaUrl, mediaUrl, sizeof(g_mediaUrl) - 1);
     g_mediaUrl[sizeof(g_mediaUrl) - 1] = '\0';
     free(body);
-    if (rc != 0) return -1;
+    if (rc != 0) { trace_mark("hls refresh parse failed rc=%d", rc); return -1; }
     // Avoid replaying/skipping after a sliding-window refresh.
     g_segIdx = nextSeq - g_mediaSeq;
-    if (g_segIdx < g_segCount) { prefetch_start(); return 0; }
+    if (g_segIdx < 0) {
+        g_segIdx = 0;             // old target fell off the live window
+        g_resetGen++;
+        trace_mark("hls live jump reset=%d idx=%d/%d seq=%d", g_resetGen, g_segIdx, g_segCount, g_mediaSeq);
+    }
+    if (g_segIdx < g_segCount) { trace_mark("hls refresh ok idx=%d/%d seq=%d", g_segIdx, g_segCount, g_mediaSeq); prefetch_start(); return 0; }
     if (g_segIdx > g_segCount) g_segIdx = g_segCount;  // no new segment yet
-    if (g_segIdx < 0) g_segIdx = 0;
     prefetch_start();
+    trace_mark("hls refresh no_new idx=%d/%d seq=%d", g_segIdx, g_segCount, g_mediaSeq);
     return -1;
 }
 
@@ -925,10 +1036,20 @@ static int ensure_segment(void) {
         u = g_initSeg;
     } else if (g_segIdx < g_segCount) {
         if (prefetch_take(g_segIdx)) return 0;
+        if (g_isLive && prefetch_wait_take(g_segIdx)) return 0;
         u = g_segs[g_segIdx];
     } else {
         if (refresh_live_playlist() == 0 && g_segIdx < g_segCount) u = g_segs[g_segIdx];
         else return g_isLive ? -2 : -1; // live: wait for next segment; VOD: EOF
+    }
+    if (g_isLive && !g_initPending) {
+        if (open_mem_segment(u, g_segIdx) == 0) return 0;
+        // A CDN-backed live playlist can expose a segment before every edge has
+        // it. Do not advance into segCount on a fetch miss; retry briefly and
+        // refresh the playlist so only a real sliding-window jump creates a gap.
+        if (g_liveFetchFailStreak >= 2) refresh_live_playlist();
+        trace_mark("hls fetch retry idx=%d/%d streak=%d", g_segIdx, g_segCount, g_liveFetchFailStreak);
+        return -2;
     }
     short_url(u, g_vLastUrl, sizeof(g_vLastUrl));
     int orc = httpsrc_open(u);
@@ -960,6 +1081,8 @@ int hls_read(uint8_t *buf, uint32_t len) {
             free(g_memBuf);
             g_memBuf = NULL; g_memLen = g_memPos = 0; g_memSeg = -1;
             g_segIdx++;
+            g_segGen++;
+            trace_mark("hls mem drained next_idx=%d/%d gen=%d", g_segIdx, g_segCount, g_segGen);
             if (g_prefUp) {
                 scePthreadMutexLock(&g_prefMtx);
                 scePthreadCondSignal(&g_prefCond);
@@ -972,6 +1095,7 @@ int hls_read(uint8_t *buf, uint32_t len) {
         if (n > 0) { g_segPos += (uint32_t)n; return n; }
 
         // Current segment finished — advance to the next one.
+        trace_mark("hls httpsrc drained idx=%d/%d pos=%llu", g_segIdx, g_segCount, (unsigned long long)g_segPos);
         httpsrc_close();
         g_vLastBytes = (int)g_segPos;
         g_vLastMs = (int)((sceKernelGetProcessTime() - g_vOpenUs) / 1000);
@@ -980,6 +1104,7 @@ int hls_read(uint8_t *buf, uint32_t len) {
             g_initPending = 0; // init streamed; now media segments
         } else {
             g_segIdx++;
+            g_segGen++;
             if (g_prefUp) {
                 scePthreadMutexLock(&g_prefMtx);
                 scePthreadCondSignal(&g_prefCond);
@@ -998,6 +1123,50 @@ int hls_read(uint8_t *buf, uint32_t len) {
             }
         }
         // loop to open the next segment
+    }
+}
+
+int hls_next_segment(uint8_t **outBuf, int *outLen, int *outResetGen) {
+    if (outBuf) *outBuf = NULL;
+    if (outLen) *outLen = 0;
+    if (outResetGen) *outResetGen = g_resetGen;
+    if (!g_active || !hls_can_segment_demux()) return -1;
+
+    for (;;) {
+        if (g_segIdx >= g_segCount) {
+            if (refresh_live_playlist() != 0) {
+                sceKernelUsleep(300 * 1000);
+                continue;
+            }
+        }
+        if (g_segIdx < 0 || g_segIdx >= g_segCount || !g_segs || !g_segs[g_segIdx]) {
+            sceKernelUsleep(200 * 1000);
+            continue;
+        }
+
+        int seg = g_segIdx;
+        if (open_mem_segment(g_segs[seg], seg) == 0 && g_memBuf && g_memLen > 0) {
+            if (outBuf) *outBuf = g_memBuf;
+            if (outLen) *outLen = g_memLen;
+            if (outResetGen) *outResetGen = g_resetGen;
+            g_memBuf = NULL;
+            g_memLen = g_memPos = 0;
+            g_memSeg = -1;
+            g_segIdx++;
+            g_segGen++;
+            trace_mark("hls segdemux take next_idx=%d/%d gen=%d reset=%d", g_segIdx, g_segCount, g_segGen, g_resetGen);
+            return 0;
+        }
+
+        if (g_memBuf) {
+            free(g_memBuf);
+            g_memBuf = NULL;
+            g_memLen = g_memPos = 0;
+            g_memSeg = -1;
+        }
+        if (g_liveFetchFailStreak >= 2) refresh_live_playlist();
+        trace_mark("hls segdemux retry idx=%d/%d streak=%d", g_segIdx, g_segCount, g_liveFetchFailStreak);
+        sceKernelUsleep(300 * 1000);
     }
 }
 

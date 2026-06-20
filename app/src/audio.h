@@ -14,8 +14,10 @@ void   audio_reset_base(double pts_sec); // force re-anchor after seek/new strea
 void   audio_flush(void);                // clear queued PCM after seek/stop
 void   audio_pause(int paused);          // pause consumption without draining PCM
 double audio_clock(void);                // current audible time, seconds
+int    audio_has_clock(void);            // true after decoded audio anchors the clock
 int    audio_ok(void);
 const char *audio_debug(void);           // one-line diagnostic
-void   audio_close(void);
+void   audio_close(void);                // end session, KEEP device open (reused next cast)
+void   audio_shutdown(void);             // full teardown of device+thread (app exit)
 
 #endif

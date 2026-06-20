@@ -7,6 +7,7 @@
 #include "ssdp.h"
 #include "pad_diag.h"
 #include "vdec_probe.h"
+#include "trace.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -511,6 +512,21 @@ static void handle_client(OrbisNetId c) {
                          APP_VER, jb_result(), goldhen_status(), player_status(), handoff_status(), ssdp_status(),
                          active, player_is_paused(), (int)(cur + 0.5), (int)(dur + 0.5), g_last_push, dbg, pad_diag_get());
         send_response(c, "200 OK", "application/json", json, j);
+        return;
+    }
+
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/trace") == 0) {
+        int fd = sceKernelOpen(trace_path(), 0 /*O_RDONLY*/, 0);
+        if (fd < 0) { send_response(c, "200 OK", "text/plain", "(no trace yet)", 14); return; }
+        static char tb[8192];
+        off_t end = sceKernelLseek(fd, 0, 2 /*SEEK_END*/);
+        if (end > (off_t)sizeof(tb) - 1) sceKernelLseek(fd, end - ((off_t)sizeof(tb) - 1), 0 /*SEEK_SET*/);
+        else sceKernelLseek(fd, 0, 0 /*SEEK_SET*/);
+        int tn = (int)sceKernelRead(fd, tb, sizeof(tb) - 1);
+        sceKernelClose(fd);
+        if (tn < 0) tn = 0;
+        tb[tn] = '\0';
+        send_response(c, "200 OK", "text/plain", tb, tn);
         return;
     }
 

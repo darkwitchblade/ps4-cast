@@ -135,6 +135,7 @@ tls_ctx *tls_open(int sock, const char *host) {
 }
 
 int tls_read(tls_ctx *t, uint8_t *buf, int len) {
+    if (len > 16 * 1024) len = 16 * 1024;  // one TLS record; avoids large-read instability on PS4
     int n = br_sslio_read(&t->io, buf, (size_t)len);
     if (n < 0) {
         // Clean closure shows up as an error after the close_notify; treat the

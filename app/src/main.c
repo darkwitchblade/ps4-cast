@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "gfx.h"
+#include "qr.h"
 
 #ifndef BOOT_MINIMAL
 #include "netutil.h"
@@ -17,6 +18,7 @@
 #include "ssdp.h"
 #include "pad_diag.h"
 #include "notify.h"
+#include "audio.h"
 #endif
 
 #ifndef BOOT_MINIMAL
@@ -46,17 +48,52 @@
 #ifndef SIGSEGV
 #define SIGSEGV 11
 #endif
+#ifndef SIGHUP
+#define SIGHUP 1
+#endif
+#ifndef SIGINT
+#define SIGINT 2
+#endif
+#ifndef SIGQUIT
+#define SIGQUIT 3
+#endif
+#ifndef SIGTERM
+#define SIGTERM 15
+#endif
 
 // A fatal fault on ANY thread (decode/present/audio/http) should fully CLOSE the
 // app, not leave it half-alive and suspended (the rotating-circle hang). We catch
 // the fatal signals process-wide and _exit immediately so the system reaps it
-// cleanly — a clean exit instead of a stuck/suspended title.
-static void fatal_signal(int sig) { (void)sig; _exit(1); }
+// cleanly — a clean exit instead of a stuck/suspended title. Exit 0 so the shell
+// treats the handler path as an intentional close instead of an app-error exit.
+static void fatal_signal(int sig) { (void)sig; _exit(0); }
 static void install_fatal_handlers(void) {
     struct sigaction sa; memset(&sa, 0, sizeof(sa));
     sa.sa_handler = fatal_signal;
-    int sigs[6] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP };
-    for (int i = 0; i < 6; i++) sigaction(sigs[i], &sa, NULL);
+    int sigs[10] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP,
+                     SIGHUP, SIGINT, SIGQUIT, SIGTERM };
+    for (int i = 0; i < 10; i++) sigaction(sigs[i], &sa, NULL);
+}
+
+// ---- freeze watchdog ------------------------------------------------------
+// fatal_signal handles CATCHABLE faults (a thread SIGSEGVs -> whole app exits ->
+// reopen). But a DEADLOCK (a worker died holding a mutex the main loop then waits
+// on) or a GPU HANG (gfx_present's flip-wait never returns) raises NO signal —
+// the app just freezes and the only recovery is a hard console reboot. The main
+// loop stamps a heartbeat each frame; this independent thread force-exits if the
+// heartbeat goes stale, turning an indefinite freeze into an auto clean-close.
+static volatile uint64_t g_heartbeat = 0;
+static void *watchdog_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        sceKernelUsleep(2 * 1000 * 1000);                 // poll every 2s
+        uint64_t hb = g_heartbeat;
+        if (hb == 0) continue;                            // main loop not running yet
+        uint64_t now = sceKernelGetProcessTime();
+        if (now > hb && (now - hb) > 15ULL * 1000 * 1000) // ~15s with zero progress = frozen
+            _exit(0);                                     // force full exit; user just reopens
+    }
+    return NULL;
 }
 
 #define FB_W 1920
@@ -87,6 +124,28 @@ static void fmt_time(double sec, char *out, int cap) {
     else snprintf(out, cap, "%d:%02d", m, s);
 }
 
+static void draw_qr(Gfx *g, const char *url, int cx, int y, int module) {
+    QrCode qr;
+    int quiet = 4;
+    int total = (QR_SIZE + quiet * 2) * module;
+    int x0 = cx - total / 2;
+    GfxColor paper = { 0xf8, 0xfa, 0xff };
+    GfxColor ink = { 0x05, 0x09, 0x15 };
+    GfxColor edge = { 0x2a, 0x35, 0x55 };
+
+    gfx_rect(g, x0 - 8, y - 8, total + 16, total + 16, edge);
+    gfx_rect(g, x0, y, total, total, paper);
+    if (qr_make_url(url, &qr) != 0)
+        return;
+
+    for (int yy = 0; yy < QR_SIZE; yy++) {
+        for (int xx = 0; xx < QR_SIZE; xx++) {
+            if (qr.m[yy][xx])
+                gfx_rect(g, x0 + (quiet + xx) * module, y + (quiet + yy) * module, module, module, ink);
+        }
+    }
+}
+
 static void draw_lobby(Gfx *g, const char *ip, int net_ok) {
     gfx_clear(g, BG);
 
@@ -99,16 +158,17 @@ static void draw_lobby(Gfx *g, const char *ip, int net_ok) {
         char url[64];
         snprintf(url, sizeof(url), "http://%s:%d", ip, PORT);
 
-        text_centered(g, 360, "On a phone or PC on the same Wi-Fi, open:", 3, MUTED);
+        text_centered(g, 270, "Scan to open the PS4 Cast controls", 3, MUTED);
+        draw_qr(g, url, g->width / 2, 330, 10);
 
         // URL plate
-        int uw = gfx_text_w(url, 6);
+        int uw = gfx_text_w(url, 5);
         int px = (g->width - uw) / 2 - 40;
-        gfx_rect(g, px, 430, uw + 80, 110, PANEL);
-        gfx_rect(g, px, 430, uw + 80, 4, ACCENT);
-        text_centered(g, 460, url, 6, WHITE);
+        gfx_rect(g, px, 700, uw + 80, 88, PANEL);
+        gfx_rect(g, px, 700, uw + 80, 4, ACCENT);
+        text_centered(g, 724, url, 5, WHITE);
 
-        text_centered(g, 640, "Paste a direct video link, or cast to PS4 Cast from a DLNA app.", 3, MUTED);
+        text_centered(g, 825, "Paste a direct video link, or cast to PS4 Cast from a DLNA app.", 3, MUTED);
     } else {
         text_centered(g, 430, "No network connection.", 5, WHITE);
         text_centered(g, 520, "Connect the PS4 to Wi-Fi or LAN, then relaunch.", 3, MUTED);
@@ -266,6 +326,11 @@ int main(void) {
     gfx_clear(&g, BG); gfx_present(&g, 0);
     gfx_clear(&g, BG); gfx_present(&g, 1);
 
+    // Start the freeze watchdog (auto-recovers a frozen app instead of a reboot).
+    g_heartbeat = sceKernelGetProcessTime();
+    OrbisPthread wd;
+    scePthreadCreate(&wd, NULL, watchdog_main, NULL, "ps4cast_wd");
+
 #ifdef BOOT_MINIMAL
     int frameID = 2;
     for (;;) {
@@ -300,6 +365,7 @@ int main(void) {
     pad_init(&pad);
 
     while (running) {
+        g_heartbeat = sceKernelGetProcessTime();   // pet the freeze watchdog each frame
         uint32_t pressed = pad_poll(&pad);
         if (player_started() && pressed) {
             double cur = 0, dur = 0;
@@ -404,6 +470,7 @@ int main(void) {
         gfx_present(&g, frameID++);
     }
     player_stop();
+    audio_shutdown();
 #endif
     return 0;
 }

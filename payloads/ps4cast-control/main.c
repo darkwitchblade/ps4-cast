@@ -15,7 +15,9 @@
 #define TITLE_ID TARGET_TITLE_ID
 #define CONTENT_ID "IV0000-PCST00001_00-PS4CAST000000001"
 #define ORBIS_KERNEL_PRIO_FIFO_NORMAL 0x2BC
-#define CALLBACK_IP 0x8B01A8C0U
+#ifndef CALLBACK_IP_ADDR
+#define CALLBACK_IP_ADDR 0x8B01A8C0U
+#endif
 #define CALLBACK_PORT 0xAB26U
 
 void *dlopen(const char *, int);
@@ -24,6 +26,7 @@ int socket(int, int, int);
 int connect(int, const void *, unsigned int);
 long write(int, const void *, unsigned long);
 int close(int);
+int reboot(int);
 
 void *memset(void *dst, int value, size_t len)
 {
@@ -163,7 +166,7 @@ static void callback(const char *msg)
         .len = sizeof(SockaddrIn),
         .family = 2,
         .port = CALLBACK_PORT,
-        .addr = CALLBACK_IP,
+        .addr = CALLBACK_IP_ADDR,
         .zero = {0}
     };
     if (connect(fd, &addr, sizeof(addr)) == 0) {
@@ -251,6 +254,55 @@ static uint32_t get_lnc_appid(char *report)
     }
     append_inplace(report, "\n");
     return appid;
+}
+
+static void get_appinst_status(char *report)
+{
+    void *appinst = dlopen("/system/common/lib/libSceAppInstUtil.sprx", 0);
+    int (*appinst_init)(void) = dlsym(appinst, "sceAppInstUtilInitialize");
+    int (*app_exists)(const char *, int32_t *) = dlsym(appinst, "sceAppInstUtilAppExists");
+    int (*app_updating)(const char *, int32_t *) = dlsym(appinst, "sceAppInstUtilAppIsInUpdating");
+    int (*get_progress)(const char *, uint32_t *) = dlsym(appinst, "sceAppInstUtilGetInstallProgress");
+    int (*get_progress_info)(const char *, uint32_t *, uint32_t *, uint32_t *, uint32_t *, uint32_t *) =
+        dlsym(appinst, "sceAppInstUtilGetInstallProgressInfo");
+    int (*is_installing)(const char *) = dlsym(appinst, "sceAppInstUtilAppIsInInstalling");
+
+    int init = appinst_init ? appinst_init() : -2;
+    int32_t exists = -1, updating = -1;
+    int exrc = app_exists ? app_exists(TITLE_ID, &exists) : -2;
+    int uprc = app_updating ? app_updating(TITLE_ID, &updating) : -2;
+    int inrc = is_installing ? is_installing(CONTENT_ID) : -2;
+    uint32_t progress = 0, state = 0, progressSize = 0, totalSize = 0, restSec = 0;
+    int prc = get_progress ? get_progress(CONTENT_ID, &progress) : -2;
+    int pirc = get_progress_info ? get_progress_info(CONTENT_ID, &state, &progress, &progressSize, &totalSize, &restSec) : -2;
+
+    append_inplace(report, "appinst init=");
+    append_dec(report, init);
+    append_inplace(report, " exists=");
+    append_dec(report, exists);
+    append_inplace(report, " exrc=");
+    append_dec(report, exrc);
+    append_inplace(report, " updating=");
+    append_dec(report, updating);
+    append_inplace(report, " uprc=");
+    append_dec(report, uprc);
+    append_inplace(report, " installing=");
+    append_dec(report, inrc);
+    append_inplace(report, " progress=");
+    append_dec(report, (int)progress);
+    append_inplace(report, " prc=");
+    append_dec(report, prc);
+    append_inplace(report, " state=");
+    append_dec(report, (int)state);
+    append_inplace(report, " pirc=");
+    append_dec(report, pirc);
+    append_inplace(report, " psize=");
+    append_dec(report, (int)progressSize);
+    append_inplace(report, " total=");
+    append_dec(report, (int)totalSize);
+    append_inplace(report, " rest=");
+    append_dec(report, (int)restSec);
+    append_inplace(report, "\n");
 }
 
 static uintptr_t find_cast_proc(char *report)
@@ -550,13 +602,19 @@ int main(void)
     callback(cb);
     notify(send, "PS4 Cast pkg install rv ", rv);
     return rv;
-#elif defined(CONTROL_APP_STATUS)
-    char report[0x400] = {0};
-    get_lnc_appid(report);
-    callback(report);
-    send(222, "PS4 Cast app status sent");
-    return 0;
-#elif defined(CONTROL_PROBE)
+	#elif defined(CONTROL_APP_STATUS)
+	    char report[0x400] = {0};
+	    get_lnc_appid(report);
+	    get_appinst_status(report);
+	    callback(report);
+	    send(222, "PS4 Cast app status sent");
+	    return 0;
+	#elif defined(CONTROL_REBOOT)
+	    send(222, "PS4 Cast ctrl rebooting");
+	    callback("reboot requested\n");
+	    reboot(0);
+	    return 0;
+	#elif defined(CONTROL_PROBE)
     char report[0x1000] = {0};
     append_inplace(report, "probe\n");
     find_cast_proc(report);

@@ -24,6 +24,7 @@ typedef struct {
 #define ORBIS_NET_SOL_SOCKET   0xffff
 #define ORBIS_NET_SO_SNDTIMEO  0x1005
 #define ORBIS_NET_SO_RCVTIMEO  0x1006
+#define ASEG_FETCH_CAP         (16 * 1024 * 1024)
 
 static int                 g_pool = -1;
 static int                 g_sock = -1;
@@ -230,6 +231,8 @@ static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
         if (g_abort) { free(buf); conn_close(); return -9; }
         if (used + 64 * 1024 > cap) {
             size_t ncap = cap * 2;
+            if (ncap > ASEG_FETCH_CAP) ncap = ASEG_FETCH_CAP;
+            if (ncap <= cap) { free(buf); conn_close(); return -10; }
             uint8_t *nb = realloc(buf, ncap);
             if (!nb) { free(buf); conn_close(); return -7; }
             buf = nb; cap = ncap;

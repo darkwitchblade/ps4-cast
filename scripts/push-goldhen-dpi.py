@@ -133,6 +133,7 @@ class PackageServer(threading.Thread):
         super().__init__(daemon=True)
         self.pkg = pkg
         self.hit = threading.Event()
+        self.done = threading.Event()
         parent = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -177,6 +178,7 @@ class PackageServer(threading.Thread):
 
                 if not send_body:
                     return
+                complete = False
                 try:
                     with parent.pkg.open("rb") as f:
                         f.seek(start)
@@ -187,8 +189,11 @@ class PackageServer(threading.Thread):
                                 break
                             self.wfile.write(chunk)
                             remaining -= len(chunk)
+                        complete = (remaining == 0)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+                if complete and end == size - 1:
+                    parent.done.set()
 
             def do_HEAD(self):  # noqa: N802
                 if self.path.split("?", 1)[0] != f"/{parent.pkg.name}":
@@ -329,8 +334,13 @@ def main() -> int:
         print("manifest fetched by PS4/BGFT")
         if pkg_server.hit.wait(args.keepalive):
             print("package fetched by PS4/BGFT")
-            print(f"keeping package server alive for {args.keepalive}s so BGFT can finish")
-            time.sleep(args.keepalive)
+            if pkg_server.done.wait(args.keepalive):
+                print("package transfer complete")
+            else:
+                print("package transfer did not complete before timeout", file=sys.stderr)
+                manifest.stop()
+                pkg_server.stop()
+                return 1
         else:
             print("package was not fetched before timeout", file=sys.stderr)
             manifest.stop()

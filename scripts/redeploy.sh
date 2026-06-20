@@ -14,19 +14,61 @@ PS4=${PS4_IP:-192.168.1.253}
 HOST=${HOST_IP:-192.168.1.139}
 CTRL="payloads/ps4cast-control"
 VER="$(awk -F':= *' '/^VERSION/{gsub(/[ \t]/,"",$2);print $2}' app/Makefile)"
+CB_IP_HEX="$(awk -F. '{printf "0x%02X%02X%02X%02XU", $4, $3, $2, $1}' <<<"$HOST")"
 
 free_ports(){ for p in 8000 9898; do lsof -ti :$p 2>/dev/null | xargs kill -9 2>/dev/null; done; pkill -f push-goldhen-dpi 2>/dev/null; true; }
 
 # Patiently POST a payload to :9090 until it lands (it re-arms slowly).
 send_payload(){ # $1 = built .bin
   local bin="$1" i out
-  make -C "$CTRL" "$bin" >/tmp/ctrl_build.log 2>&1 || true
+  make -C "$CTRL" CALLBACK_IP="$CB_IP_HEX" "$bin" >/tmp/ctrl_build.log 2>&1 || true
   for i in $(seq 1 18); do
     out=$(python3 scripts/send-goldhen-payload.py "$CTRL/$bin" --ps4 "$PS4" 2>&1)
     echo "$out" | grep -qiE "HTTP 200" && { echo "    ok (try $i)"; return 0; }
     sleep 4
   done
   echo "    payload did not land after retries"; return 1
+}
+
+payload_callback(){ # $1 = built .bin, stdout = callback text
+  local bin="$1" log="/tmp/ps4cast_payload_cb.$$" pid out
+  rm -f "$log"
+  nc -l 9899 >"$log" &
+  pid=$!
+  sleep 1
+  make -C "$CTRL" CALLBACK_IP="$CB_IP_HEX" "$bin" >/tmp/ctrl_build.log 2>&1 || true
+  out=$(python3 scripts/send-goldhen-payload.py "$CTRL/$bin" --ps4 "$PS4" 2>&1 || true)
+  if ! echo "$out" | grep -qiE "HTTP 200"; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$log"
+    return 1
+  fi
+  for _ in $(seq 1 8); do
+    if [ -s "$log" ]; then
+      cat "$log"
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      rm -f "$log"
+      return 0
+    fi
+    sleep 1
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -f "$log"
+  return 1
+}
+
+app_registered(){
+  local cb progress pirc installing updating
+  cb="$(payload_callback build/ps4cast-app-status.bin 2>/dev/null || true)"
+  progress="$(printf '%s' "$cb" | sed -n 's/.*progress=\([-0-9]\+\).*/\1/p' | tail -1)"
+  pirc="$(printf '%s' "$cb" | sed -n 's/.*pirc=\([-0-9]\+\).*/\1/p' | tail -1)"
+  installing="$(printf '%s' "$cb" | sed -n 's/.*installing=\([-0-9]\+\).*/\1/p' | tail -1)"
+  updating="$(printf '%s' "$cb" | sed -n 's/.*updating=\([-0-9]\+\).*/\1/p' | tail -1)"
+  [ "$pirc" = "0" ] && [ "$progress" = "100" ] && [ "${installing:-0}" = "0" ] && [ "${updating:-0}" != "1" ] && return 0
+  return 1
 }
 
 if [ "${1:-}" != "nobuild" ]; then
@@ -39,6 +81,19 @@ echo "[2/5] close running app"
 # PS4 crash dialog on this console, so keep it out of the normal deploy loop.
 send_payload build/ps4cast-kill.bin || true
 sleep 5                         # let GoldHEN re-arm :9090
+old="$(curl -sS -m3 "http://$PS4:8080/status" 2>/dev/null || true)"
+if echo "$old" | grep -q '"ver":'; then
+  echo "    external kill did not clear app; trying in-app idle /quit fallback"
+  curl -sS -m5 -X POST "http://$PS4:8080/quit" >/dev/null 2>&1 || true
+  sleep 5
+  old="$(curl -sS -m3 "http://$PS4:8080/status" 2>/dev/null || true)"
+fi
+if echo "$old" | grep -q '"ver":'; then
+  oldver="$(printf '%s' "$old" | sed -n 's/.*"ver":"\([^"]*\)".*/\1/p')"
+  echo "CLOSE FAILED: PS4 Cast is still responding on v${oldver:-unknown}."
+  echo "Close it from the PS4 menu, dismiss any crash/spinner screen, then rerun deploy."
+  exit 2
+fi
 
 echo "[3/5] uninstall old app"
 send_payload build/ps4cast-uninstall.bin || true
@@ -52,26 +107,28 @@ for i in $(seq 1 12); do
   echo "$out" | grep -qiE "manifest fetched by PS4|callback from" && { echo "    delivered (try $i)"; ok=1; break; }
   sleep 5
 done
-[ -z "$ok" ] && { echo "INSTALL FAILED (:9090 not accepting). pkg is hosted; install via Remote Pkg Installer: http://$HOST:8000/PS4-Cast-v$VER.pkg"; (cd dist && python3 -m http.server 8000 >/tmp/h.log 2>&1 &); exit 1; }
-sleep 2                         # let BGFT start; launch loop below retries until install is ready
+[ -z "$ok" ] && { echo "INSTALL FAILED (:9090 not accepting). pkg is hosted; install via Remote Pkg Installer: http://$HOST:8000/PS4-Cast-v$VER.pkg"; (cd dist && python3 -m http.server 8000 --bind "$HOST" >/tmp/h.log 2>&1 &); exit 1; }
 
-echo "[5/5] wait for install to finish, then launch once and wait for READY"
-# Let the system finish the background install (BGFT) BEFORE launching — launching
-# mid-install is what shows the long "stuck" screen. Then launch once and poll
-# /status patiently; /status responding == the app's "ready to cast" toast.
-sleep 25                        # install settle (15MB pkg + system processing)
-for round in $(seq 1 4); do
+echo "[5/5] launch after BGFT settle"
+# push-goldhen-dpi.py now returns only after serving the final package byte.
+# Give the shell a short promotion/indexing moment, then launch once. If the
+# title is still settling, the late retry below catches it without payload spam.
+sleep 4
+
+for round in 1 2; do
   echo "    launch attempt $round; waiting for ready toast (/status)…"
   send_payload build/ps4cast-launch.bin || true
-  for j in $(seq 1 25); do      # ~75s patient wait per launch (no re-launch churn)
+  for j in $(seq 1 30); do
     s=$(curl -sS -m3 "http://$PS4:8080/status" 2>/dev/null)
     if echo "$s" | grep -q "\"ver\":\"$VER\""; then
       echo "    READY — app open on v$VER"
-      (cd dist && python3 -m http.server 8000 >/tmp/h.log 2>&1 &); echo "DEPLOY OK"; exit 0
+      (cd dist && python3 -m http.server 8000 --bind "$HOST" >/tmp/h.log 2>&1 &); echo "DEPLOY OK"; exit 0
     fi
     sleep 3
   done
+  echo "    not ready yet; waiting for BGFT settle before one retry"
+  sleep 20
 done
 echo "installed but auto-launch didn't take — open PS4 Cast on the console (then it's v$VER)"
-(cd dist && python3 -m http.server 8000 >/tmp/h.log 2>&1 &)
+(cd dist && python3 -m http.server 8000 --bind "$HOST" >/tmp/h.log 2>&1 &)
 exit 0

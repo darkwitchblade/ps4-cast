@@ -11,6 +11,7 @@
 #include "audio.h"
 #include "notify.h"
 #include "vdec_hw.h"
+#include "trace.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -93,6 +94,7 @@ static int   g_started = 0;        // intent: from play() until stop/EOF
 static int   g_active  = 0;        // currently decoding
 static int   g_gotFrame = 0;
 static char  g_status[160] = "idle";
+static char  g_playUrl[2048];
 
 static int64_t  g_pos = 0;         // byte cursor for AVIO
 static uint64_t g_startProc = 0;   // wall clock at first presented frame (us)
@@ -113,6 +115,9 @@ static long g_drops = 0, g_audioPkts = 0, g_videoPkts = 0;
 static int  g_lastErr = 0;
 static int64_t g_lastLagUs = 0;
 static int  g_isHls = 0;   // HLS (m3u8): non-seekable concatenated segments
+static int  g_hlsSegGen = 0;
+static int  g_hlsResetGen = 0;
+static int  g_hlsSegDemux = 0;
 
 // ---- decode/render decouple (frame queue) ---------------------------------
 // 1 = a decode thread decodes+scales video into a ready-frame queue and the
@@ -120,7 +125,8 @@ static int  g_isHls = 0;   // HLS (m3u8): non-seekable concatenated segments
 // single heavy frame/GOP no longer hitches the screen. Set to 0 to fall back to
 // the single-thread decode-and-present path (the known-good 02.19 behaviour).
 #define PLAYER_DECODE_THREAD 1
-#define FQ_SLOTS 8
+#define FQ_SLOTS 24
+#define HLS_START_FRAMES 16
 
 typedef struct { AVFrame *frame; } FrameSlot;   // ref-counted clone, presented then freed
 static FrameSlot         g_fq[FQ_SLOTS];
@@ -131,6 +137,7 @@ static OrbisPthread      g_decThread;
 static int               g_threaded = 0;      // decode-thread path active
 static volatile int      g_decStop = 0;
 static volatile int      g_decEof = 0;
+static volatile int      g_liveRestartPending = 0;
 static volatile int      g_rebuffering = 0;    // cache-pause: holding for buffer
 static int               g_emptyCnt = 0;       // debounce queue-empty
 static int               g_rebufHits = 0;      // consecutive rebuffers (for HLS ABR)
@@ -140,6 +147,8 @@ static double            g_resumeSec = 2.0;    // buffered-seconds needed to res
 
 static void  fq_flush(void);
 static void  ro_clear(void);
+static void  apply_hls_reset(void);
+static void *decode_segment_thread_main(void *arg);
 static void  present_pool_start(void);
 static void  present_pool_stop(void);
 static void *decode_thread_main(void *arg);
@@ -158,6 +167,17 @@ static int avio_read_cb(void *o, uint8_t *buf, int size) {
     }
     if (n <= 0) return AVERROR_EOF;
     return n;
+}
+
+typedef struct { const uint8_t *buf; int len; int pos; } MemAvio;
+static int avio_mem_read_cb(void *o, uint8_t *buf, int size) {
+    MemAvio *m = (MemAvio *)o;
+    int left = m->len - m->pos;
+    if (left <= 0) return AVERROR_EOF;
+    int take = size < left ? size : left;
+    memcpy(buf, m->buf + m->pos, take);
+    m->pos += take;
+    return take;
 }
 // Second AVIO: the separate HLS audio rendition (its own segment byte stream).
 static int avio_aread_cb(void *o, uint8_t *buf, int size) {
@@ -233,6 +253,7 @@ void player_stop(void) {
     if (g_scaled){ free(g_scaled); g_scaled = NULL; }
     if (g_isHls) hls_close(); else httpsrc_close();
     g_isHls = 0;
+    g_hlsSegDemux = 0;
     g_vstream = -1; g_active = 0; g_started = 0; g_gotFrame = 0;
     g_pos = 0; g_startProc = 0; g_scaledW = g_scaledH = 0;
     g_paused = 0; g_wasPaused = 0; g_seekPending = 0; g_curSec = 0; g_durSec = 0;
@@ -262,13 +283,17 @@ static int open_sw_video(const AVCodec *dec) {
 }
 
 int player_play(const char *url) {
+    char startUrl[2048];
+    snprintf(startUrl, sizeof(startUrl), "%s", url ? url : "");
     player_stop();
+    strncpy(g_playUrl, startUrl, sizeof(g_playUrl) - 1);
+    g_playUrl[sizeof(g_playUrl) - 1] = '\0';
     g_pkts = g_frames = g_drops = g_audioPkts = g_videoPkts = 0; g_lastErr = 0; g_lastLagUs = 0;
 
     // Open the source. HLS (.m3u8) goes through the segment-streaming layer;
     // everything else (mp4/mov/mkv/avi/ts/... over http/https) via httpsrc.
-    g_isHls = hls_is_url(url);
-    int orc = g_isHls ? hls_open(url) : httpsrc_open(url);
+    g_isHls = hls_is_url(startUrl);
+    int orc = g_isHls ? hls_open(startUrl) : httpsrc_open(startUrl);
     if (orc != 0) {
         snprintf(g_status, sizeof(g_status), "source: %s", g_isHls ? hls_debug() : httpsrc_debug());
         g_isHls = 0;
@@ -373,7 +398,10 @@ int player_play(const char *url) {
     // runtime toggle being off) cleanly falls back to software below.
     AVCodecParameters *vpar = g_fmt->streams[g_vstream]->codecpar;
     g_useHw = 0;
-    if (g_hwEnabled && vpar->codec_id == AV_CODEC_ID_H264) {
+    // HLS TS streams can contain segment-boundary/discontinuity cases that the
+    // current low-level sceVideodec2 path does not survive yet. Keep HLS on the
+    // robust ffmpeg path for now; direct MP4/H.264 still uses hardware.
+    if (g_hwEnabled && !g_isHls && vpar->codec_id == AV_CODEC_ID_H264) {
         const AVBitStreamFilter *bf = av_bsf_get_by_name("h264_mp4toannexb");
         if (bf && av_bsf_alloc(bf, &g_bsf) == 0 &&
             avcodec_parameters_copy(g_bsf->par_in, vpar) >= 0 &&
@@ -408,15 +436,20 @@ int player_play(const char *url) {
     g_srcW = g_useHw ? vpar->width  : g_vdec->width;
     g_srcH = g_useHw ? vpar->height : g_vdec->height;
     g_durSec = (g_fmt->duration > 0) ? (double)g_fmt->duration / AV_TIME_BASE : 0;
+    g_hlsSegGen = g_isHls ? hls_generation() : 0;
+    g_hlsResetGen = g_isHls ? hls_reset_generation() : 0;
+    g_hlsSegDemux = g_isHls && hls_can_segment_demux();
     g_bytesPerSec = (g_fmt->bit_rate > 0) ? (double)g_fmt->bit_rate / 8.0
                   : (g_durSec > 0 && httpsrc_size() > 0) ? (double)httpsrc_size() / g_durSec
                   : 0;
     // Bigger cushion for public/CDN links (4s) than LAN (1.5s) — 2s was too
     // small for remote HTTPS streams.
     g_resumeSec = (!g_isHls && httpsrc_is_lan()) ? 1.5 : 4.0;
-    g_rebuffering = 0; g_emptyCnt = 0; g_rebufHits = 0; g_rebufTotal = 0;
+    g_rebuffering = g_isHls ? 1 : 0;
+    g_emptyCnt = 0; g_rebufHits = 0; g_rebufTotal = 0;
 
     g_started = 1; g_active = 1; g_gotFrame = 0;
+    if (g_isHls) audio_pause(1);  // startup headstart: fill frames/audio before first presentation
     snprintf(g_status, sizeof(g_status), "buffering %s %dx%d", dec->name, g_srcW, g_srcH);
     notify("PS4 Cast: ffmpeg %s %dx%d", dec->name, g_srcW, g_srcH);
 
@@ -428,14 +461,17 @@ int player_play(const char *url) {
     scePthreadMutexInit(&g_fqMtx, NULL, "ps4cast_fq");
     scePthreadCondInit(&g_fqNotFull, NULL, "ps4cast_fqnf");
     scePthreadCondInit(&g_fqNotEmpty, NULL, "ps4cast_fqne");
-    // Hardware decode needs a large stack (libSceVideodec2 uses ~31KB frames that
-    // overflow a default pthread stack). Give the decode thread 8MB when HW is on.
+    // FFmpeg's HLS/TS demux + decode path can also recurse/use stack heavily on
+    // Orbis. Use the same roomy stack for every decode thread so buffering
+    // cannot turn into a CE crash from a default pthread-stack overflow.
     OrbisPthreadAttr dattr; OrbisPthreadAttr *pdattr = NULL;
-    if (g_useHw && scePthreadAttrInit(&dattr) == 0) {
+    if (scePthreadAttrInit(&dattr) == 0) {
         scePthreadAttrSetstacksize(&dattr, 8 * 1024 * 1024);
         pdattr = &dattr;
     }
-    int dcr = scePthreadCreate(&g_decThread, pdattr, decode_thread_main, NULL, "ps4cast_dec");
+    int dcr = scePthreadCreate(&g_decThread, pdattr,
+                               g_hlsSegDemux ? decode_segment_thread_main : decode_thread_main,
+                               NULL, "ps4cast_dec");
     if (pdattr) scePthreadAttrDestroy(&dattr);
     if (dcr == 0) {
         g_threaded = 1;
@@ -447,7 +483,9 @@ int player_play(const char *url) {
         if (g_hwPkt) { av_packet_free(&g_hwPkt); }
         g_useHw = 0;
         if (open_sw_video(dec) == 0 &&
-            scePthreadCreate(&g_decThread, NULL, decode_thread_main, NULL, "ps4cast_dec") == 0) {
+            scePthreadCreate(&g_decThread, NULL,
+                             g_hlsSegDemux ? decode_segment_thread_main : decode_thread_main,
+                             NULL, "ps4cast_dec") == 0) {
             g_threaded = 1;
         } else {
             scePthreadCondDestroy(&g_fqNotFull);
@@ -552,11 +590,30 @@ static void apply_seek(void) {
     }
 }
 
+static void apply_hls_reset(void) {
+    fq_flush();
+    if (g_vdec) avcodec_flush_buffers(g_vdec);
+    if (g_adec) avcodec_flush_buffers(g_adec);
+    if (g_swr) { swr_close(g_swr); swr_init(g_swr); }
+    if (g_haveAudio) {
+        audio_flush();
+        audio_pause(1);
+    }
+    g_gotFrame = 0;
+    g_startProc = 0;
+    g_startPts = 0;
+    g_emptyCnt = 0;
+    g_rebuffering = 1;
+    g_decEof = 0;
+    g_lastLagUs = 0;
+    snprintf(g_status, sizeof(g_status), "buffering live");
+}
+
 void player_debug(char *out, int len) {
     double ahead = (g_bytesPerSec > 0) ? (double)httpsrc_ahead_bytes() / g_bytesPerSec : 0;
     snprintf(out, len,
              "ff%s%s%s %dx%d | fr=%ld drop=%ld q=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d | as=%d%s%s %s | %s",
-             g_useHw ? "/HW" : "", g_isHls ? "/hls" : "", g_threaded ? "/T" : "", g_srcW, g_srcH,
+             g_useHw ? "/HW" : "", g_isHls ? (g_hlsSegDemux ? "/hls-seg" : "/hls") : "", g_threaded ? "/T" : "", g_srcW, g_srcH,
              g_frames, g_drops, g_fqCount, FQ_SLOTS, g_rebufTotal, ahead,
              (long long)(g_lastLagUs / 1000), g_lastErr,
              g_sepAudioMode ? g_aastream : g_astream, g_sepAudioMode ? "/sep" : "",
@@ -601,6 +658,7 @@ static int64_t frame_pts_us(AVFrame *f) {
     int64_t pts = f->best_effort_timestamp;
     if (pts == AV_NOPTS_VALUE) pts = f->pts;
     if (pts == AV_NOPTS_VALUE) return 0;
+    if (g_hlsSegDemux) return pts;   // segment demux stores queue PTS directly in us
     return (int64_t)(pts * av_q2d(g_fmt->streams[g_vstream]->time_base) * 1000000.0);
 }
 
@@ -929,6 +987,16 @@ static void *decode_thread_main(void *arg) {
         if (g_seekPending) { apply_seek(); g_decEof = 0; }
         if (g_paused)      { sceKernelUsleep(8000); continue; }
 
+        if (g_isHls) {
+            int rgen = hls_reset_generation();
+            if (rgen != g_hlsResetGen) {
+                g_hlsResetGen = rgen;
+                g_liveRestartPending = 1;
+                snprintf(g_status, sizeof(g_status), "reopening live stream");
+                return NULL;
+            }
+        }
+
         int rc = av_read_frame(g_fmt, g_pkt);
         if (rc < 0) {
             if (g_useHw && g_roN > 0) ro_drain();   // flush remaining reordered frames
@@ -941,7 +1009,19 @@ static void *decode_thread_main(void *arg) {
         if (sidx != g_vstream) { av_packet_unref(g_pkt); continue; }
         g_videoPkts++;
 
-        if (g_useHw) { decode_video_hw(g_pkt); av_packet_unref(g_pkt); continue; }
+        if (g_useHw) {
+            if (g_isHls) {
+                int gen = hls_generation();
+                if (gen != g_hlsSegGen) {
+                    ro_clear();
+                    if (g_bsf) av_bsf_flush(g_bsf);
+                    vdec_hw_reset();
+                    g_lastEmitPts = AV_NOPTS_VALUE;
+                    g_hlsSegGen = gen;
+                }
+            }
+            decode_video_hw(g_pkt); av_packet_unref(g_pkt); continue;
+        }
 
         if (avcodec_send_packet(g_vdec, g_pkt) < 0) { av_packet_unref(g_pkt); continue; }
         av_packet_unref(g_pkt);
@@ -960,10 +1040,141 @@ static void *decode_thread_main(void *arg) {
     return NULL;
 }
 
+static int open_segment_demux(uint8_t *segBuf, int segLen, MemAvio *mem,
+                              AVFormatContext **outFmt, AVIOContext **outAvio) {
+    *outFmt = NULL; *outAvio = NULL;
+    uint8_t *avioBuf = av_malloc(256 * 1024);
+    if (!avioBuf) return -1;
+    mem->buf = segBuf; mem->len = segLen; mem->pos = 0;
+    AVIOContext *avio = avio_alloc_context(avioBuf, 256 * 1024, 0, mem, avio_mem_read_cb, NULL, NULL);
+    if (!avio) { av_free(avioBuf); return -2; }
+    avio->seekable = 0;
+    AVFormatContext *fmt = avformat_alloc_context();
+    if (!fmt) { av_freep(&avio->buffer); avio_context_free(&avio); return -3; }
+    fmt->pb = avio;
+    fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+    fmt->probesize = 512 * 1024;
+    fmt->max_analyze_duration = 1 * (int64_t)AV_TIME_BASE;
+    int rc = avformat_open_input(&fmt, "segment.ts", NULL, NULL);
+    if (rc < 0) {
+        avformat_free_context(fmt);
+        av_freep(&avio->buffer);
+        avio_context_free(&avio);
+        return rc;
+    }
+    avformat_find_stream_info(fmt, NULL);
+    trace_mark("segdemux open ok streams=%d len=%d", (int)fmt->nb_streams, segLen);
+    *outFmt = fmt;
+    *outAvio = avio;
+    return 0;
+}
+
+static void close_segment_demux(AVFormatContext **fmt, AVIOContext **avio) {
+    if (*fmt) {
+        // Custom AVIO is owned by us. Detach it before avformat_close_input so
+        // libavformat cannot free or poke it during close on malformed/live TS.
+        (*fmt)->pb = NULL;
+        avformat_close_input(fmt);
+    }
+    if (*avio) {
+        av_freep(&(*avio)->buffer);
+        avio_context_free(avio);
+    }
+}
+
+static void queue_sw_frame_us(AVRational tb) {
+    for (;;) {
+        int got = avcodec_receive_frame(g_vdec, g_frame);
+        if (got == AVERROR(EAGAIN)) break;
+        if (got < 0) { g_lastErr = got; break; }
+        int64_t pts = g_frame->best_effort_timestamp;
+        if (pts == AV_NOPTS_VALUE) pts = g_frame->pts;
+        int64_t ptsUs = (pts == AV_NOPTS_VALUE) ? (int64_t)g_frames * 33333
+                                                : (int64_t)(pts * av_q2d(tb) * 1000000.0);
+        g_frames++;
+        AVFrame *cl = av_frame_clone(g_frame);
+        av_frame_unref(g_frame);
+        if (!cl) continue;
+        cl->pts = ptsUs;
+        cl->best_effort_timestamp = ptsUs;
+        if (!fq_push(cl)) break;
+    }
+}
+
+static void *decode_segment_thread_main(void *arg) {
+    (void)arg;
+    while (!g_decStop) {
+        if (g_paused) { sceKernelUsleep(8000); continue; }
+
+        uint8_t *segBuf = NULL;
+        int segLen = 0;
+        int resetGen = 0;
+        int rc = hls_next_segment(&segBuf, &segLen, &resetGen);
+        if (g_decStop) { if (segBuf) free(segBuf); break; }
+        if (rc != 0 || !segBuf || segLen <= 0) { if (segBuf) free(segBuf); sceKernelUsleep(100000); continue; }
+        if (resetGen != g_hlsResetGen) {
+            trace_mark("segdemux reset old=%d new=%d", g_hlsResetGen, resetGen);
+            apply_hls_reset();
+            if (g_vdec) avcodec_flush_buffers(g_vdec);
+            if (g_adec) avcodec_flush_buffers(g_adec);
+            g_hlsResetGen = resetGen;
+        }
+
+        MemAvio mem;
+        AVFormatContext *sfmt = NULL;
+        AVIOContext *savio = NULL;
+        if (open_segment_demux(segBuf, segLen, &mem, &sfmt, &savio) != 0 || !sfmt) {
+            trace_mark("segdemux open fail len=%d", segLen);
+            free(segBuf);
+            continue;
+        }
+
+        int sv = av_find_best_stream(sfmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+        int sa = g_haveAudio ? av_find_best_stream(sfmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0) : -1;
+        trace_mark("segdemux streams v=%d a=%d", sv, sa);
+        AVRational vtb = (sv >= 0) ? sfmt->streams[sv]->time_base : (AVRational){1, 90000};
+        AVRational atb = (sa >= 0) ? sfmt->streams[sa]->time_base : (AVRational){1, 90000};
+        int segPkts = 0, segVideo = 0, segAudio = 0;
+
+        while (!g_decStop) {
+            rc = av_read_frame(sfmt, g_pkt);
+            if (rc < 0) break;
+            g_pkts++;
+            segPkts++;
+            if (sa >= 0 && g_haveAudio && g_pkt->stream_index == sa) {
+                g_audioPkts++; segAudio++;
+                decode_audio_frame(g_pkt, atb);
+                av_packet_unref(g_pkt);
+                continue;
+            }
+            if (sv < 0 || g_pkt->stream_index != sv) { av_packet_unref(g_pkt); continue; }
+            g_videoPkts++; segVideo++;
+            if (avcodec_send_packet(g_vdec, g_pkt) < 0) { av_packet_unref(g_pkt); continue; }
+            av_packet_unref(g_pkt);
+            queue_sw_frame_us(vtb);
+        }
+        trace_mark("segdemux eof pkts=%d v=%d a=%d rc=%d fr=%ld q=%d", segPkts, segVideo, segAudio, rc, g_frames, g_fqCount);
+        queue_sw_frame_us(vtb);
+        close_segment_demux(&sfmt, &savio);
+        trace_mark("segdemux closed fr=%ld q=%d", g_frames, g_fqCount);
+        free(segBuf);
+    }
+    return NULL;
+}
+
 // Present the due frame from the queue, synced to the audio clock (or wall clock
 // if no audio). Drops earlier-due frames to hold realtime; holds the last frame
 // when nothing new is due. Never blocks on decode/network.
 static int render_threaded(Gfx *g) {
+    if (g_liveRestartPending) {
+        char url[sizeof(g_playUrl)];
+        strncpy(url, g_playUrl, sizeof(url) - 1);
+        url[sizeof(url) - 1] = '\0';
+        g_liveRestartPending = 0;
+        if (url[0]) player_play(url);
+        return 0;
+    }
+
     if (g_paused) {
         if (!g_wasPaused) { g_wasPaused = 1; g_pauseAt = sceKernelGetProcessTime(); }
         if (g_useHw && g_lastShown) { build_scaled_nv12_direct(g_lastShown, g); return 1; }
@@ -971,6 +1182,12 @@ static int render_threaded(Gfx *g) {
         return 0;
     }
     if (g_wasPaused) { g_wasPaused = 0; if (g_startProc) g_startProc += sceKernelGetProcessTime() - g_pauseAt; }
+
+    if (g_isHls && !g_gotFrame && g_rebuffering) {
+        if (g_fqCount < HLS_START_FRAMES && !g_decEof) return 0;
+        g_rebuffering = 0;
+        audio_pause(0);
+    }
 
     // Cache-pause: when the queue starves (network underrun), freeze the audio
     // clock — which holds video at the current time — and keep filling. Resume
@@ -984,13 +1201,16 @@ static int render_threaded(Gfx *g) {
         }
         if (g_rebuffering) {
             double ahead = (g_bytesPerSec > 0) ? (double)httpsrc_ahead_bytes() / g_bytesPerSec : 99.0;
-            if (g_decEof || (g_fqCount >= FQ_SLOTS / 2 && ahead >= g_resumeSec)) {
+            int needFrames = g_gotFrame ? (FQ_SLOTS / 2) : HLS_START_FRAMES;
+            int ready = g_isHls ? (g_fqCount >= needFrames)
+                                : (g_fqCount >= FQ_SLOTS / 2 && ahead >= g_resumeSec);
+            if (g_decEof || ready) {
                 g_rebuffering = 0; g_emptyCnt = 0; audio_pause(0);
             }
         }
     }
 
-    int useAudio = (g_haveAudio && audio_ok() && !(g_sepAudioMode && g_sepAudioEof));
+    int useAudio = (g_haveAudio && audio_ok() && audio_has_clock() && !(g_sepAudioMode && g_sepAudioEof));
     int64_t clock;
     if (useAudio) clock = (int64_t)(audio_clock() * 1000000.0);
     else { uint64_t now = sceKernelGetProcessTime(); clock = g_gotFrame ? ((int64_t)(now - g_startProc) + g_startPts) : 0; }
@@ -1095,7 +1315,7 @@ int player_render(Gfx *g) {
                         : (int64_t)(pts * av_q2d(tb) * 1000000.0);
         g_curSec = ptsUs / 1000000.0;
 
-        int useAudio = (g_haveAudio && audio_ok() && !(g_sepAudioMode && g_sepAudioEof));
+        int useAudio = (g_haveAudio && audio_ok() && audio_has_clock() && !(g_sepAudioMode && g_sepAudioEof));
         if (!g_gotFrame) {
             g_startProc = sceKernelGetProcessTime(); g_startPts = ptsUs;
             g_gotFrame = 1;

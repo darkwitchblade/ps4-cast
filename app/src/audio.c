@@ -17,9 +17,11 @@
 static int16_t          *g_pcm;            // ring of stereo frames (2 int16 each)
 static size_t            g_head, g_fill;   // in frames
 static OrbisPthreadMutex g_amtx;
+static OrbisPthreadCond  g_acond;
 static OrbisPthread      g_athread;
 static int               g_handle = -1;
 static int               g_ok = 0, g_threadUp = 0;
+static int               g_devUp = 0;        // sceAudioOut device + thread opened (kept across casts)
 static volatile int      g_astop = 0;
 static volatile uint64_t g_contentOut = 0; // decoded content frames actually heard
 static volatile uint64_t g_hwOut = 0;      // frames submitted to the audio device
@@ -46,19 +48,22 @@ const char *audio_debug(void) {
     return b;
 }
 
-double audio_clock(void) { return g_base + (double)g_contentOut / RATE; }
+double audio_clock(void) { return g_base + (double)g_hwOut / RATE; }
+int    audio_has_clock(void) { return g_baseSet; }
 int    audio_ok(void)    { return g_ok; }
 
 void audio_set_base(double pts_sec) {
     if (!g_baseSet) {
-        // Account for decoded content already emitted so the clock reads pts_sec now.
-        g_base = pts_sec - (double)g_contentOut / RATE;
+        // Anchor to the real audio device timeline. During network/audio
+        // underruns the device still advances by outputting padded silence, and
+        // video must keep following that realtime clock instead of freezing.
+        g_base = pts_sec - (double)g_hwOut / RATE;
         g_baseSet = 1;
     }
 }
 
 void audio_reset_base(double pts_sec) {
-    g_base = pts_sec - (double)g_contentOut / RATE;
+    g_base = pts_sec - (double)g_hwOut / RATE;
     g_baseSet = 1;
 }
 
@@ -84,6 +89,12 @@ static void *audio_main(void *arg) {
     while (!g_astop) {
         int avail = 0;
         scePthreadMutexLock(&g_amtx);
+        while (!g_astop && !g_ok)
+            scePthreadCondWait(&g_acond, &g_amtx);
+        if (g_astop) {
+            scePthreadMutexUnlock(&g_amtx);
+            break;
+        }
         if (!g_paused) {
             avail = g_fill < GRAIN ? (int)g_fill : GRAIN;
             for (int i = 0; i < avail; i++) {
@@ -104,7 +115,20 @@ static void *audio_main(void *arg) {
 }
 
 int audio_open(void) {
-    audio_close();
+    // Reuse the already-open device across casts. The output format is always the
+    // same (S16 stereo 48kHz, since we resample to it), so there's no need to
+    // close+reopen per cast — and doing so rapidly exhausts sceAudioOut ports
+    // (open started failing after many casts, wedging all audio). Keep one port
+    // open for the app's lifetime; just reset the ring/clock for the new stream.
+    if (g_devUp && g_handle >= 0) {
+        scePthreadMutexLock(&g_amtx);
+        g_head = g_fill = 0; g_contentOut = 0; g_hwOut = 0; g_base = 0; g_baseSet = 0; g_paused = 0;
+        g_written = g_dropped = g_underruns = 0;
+        g_ok = 1;
+        scePthreadCondSignal(&g_acond);
+        scePthreadMutexUnlock(&g_amtx);
+        return 0;
+    }
     sceUserServiceInitialize(NULL);     // ensure user service is up
     g_initRc = sceAudioOutInit();        // 0 or already-initialized is fine
     // Use the SYSTEM user (0xFF), like the OpenOrbis audio sample — the initial
@@ -120,13 +144,17 @@ int audio_open(void) {
     if (!g_pcm) { sceAudioOutClose(g_handle); g_handle = -1; return -1; }
     g_head = g_fill = 0; g_contentOut = 0; g_hwOut = 0; g_base = 0; g_baseSet = 0; g_paused = 0; g_astop = 0;
     g_written = g_dropped = g_underruns = 0;
+    g_ok = 1;
     scePthreadMutexInit(&g_amtx, NULL, "ps4cast_a");
+    scePthreadCondInit(&g_acond, NULL, "ps4cast_ac");
     if (scePthreadCreate(&g_athread, NULL, audio_main, NULL, "ps4cast_aud") != 0) {
+        g_ok = 0;
         free(g_pcm); g_pcm = NULL; sceAudioOutClose(g_handle); g_handle = -1;
+        scePthreadCondDestroy(&g_acond);
         scePthreadMutexDestroy(&g_amtx);
         return -1;
     }
-    g_threadUp = 1; g_ok = 1;
+    g_threadUp = 1; g_devUp = 1;
     return 0;
 }
 
@@ -139,18 +167,39 @@ void audio_write(const int16_t *interleaved, int nframes) {
         g_pcm[idx] = interleaved[i*2]; g_pcm[idx+1] = interleaved[i*2+1];
         g_fill++; g_written++;
     }
+    scePthreadCondSignal(&g_acond);
     scePthreadMutexUnlock(&g_amtx);
 }
 
+// End the current playback session WITHOUT closing the device: stop accepting
+// writes and clear the ring. The device + output thread stay alive (the thread
+// outputs silence when idle) so the next cast reuses the same port — avoiding
+// the rapid-recast sceAudioOut exhaustion. Real teardown is audio_shutdown().
 void audio_close(void) {
+    if (!g_devUp) { g_ok = 0; return; }
+    scePthreadMutexLock(&g_amtx);
+    g_head = g_fill = 0; g_contentOut = 0; g_hwOut = 0; g_base = 0; g_baseSet = 0; g_paused = 0;
+    g_ok = 0;
+    scePthreadCondSignal(&g_acond);
+    scePthreadMutexUnlock(&g_amtx);
+}
+
+// Full teardown of the audio device + thread (app exit / fatal). Not used in the
+// normal play/stop cycle so the port is reused across casts.
+void audio_shutdown(void) {
     g_ok = 0;
     if (g_threadUp) {
+        scePthreadMutexLock(&g_amtx);
         g_astop = 1;
+        scePthreadCondSignal(&g_acond);
+        scePthreadMutexUnlock(&g_amtx);
         scePthreadJoin(g_athread, NULL);
+        scePthreadCondDestroy(&g_acond);
         scePthreadMutexDestroy(&g_amtx);
         g_threadUp = 0;
     }
     if (g_handle >= 0) { sceAudioOutClose(g_handle); g_handle = -1; }
     if (g_pcm) { free(g_pcm); g_pcm = NULL; }
+    g_devUp = 0;
     g_head = g_fill = 0; g_contentOut = 0; g_hwOut = 0; g_baseSet = 0; g_paused = 0;
 }

@@ -4,6 +4,8 @@ LD := /opt/homebrew/opt/lld/bin/ld.lld
 OBJCOPY := /opt/homebrew/opt/llvm/bin/llvm-objcopy
 YASM := yasm
 CFLAGS := --target=x86_64-pc-freebsd12-elf -fuse-ld=$(LD) -g -mcmodel=small -isystem $(DPI_PAYLOAD_DIR)/freebsd-headers -nostdinc -nostdlib -fno-stack-protector -static -fPIE -ffreestanding
+CALLBACK_IP ?= 0x8B01A8C0U
+CFLAGS += -DCALLBACK_IP_ADDR=$(CALLBACK_IP)
 LDFLAGS := -Wl,-T,payload.ld -Wl,-gc-sections
 LIB := build/lib.a
 JBC := $(wildcard $(DPI_PAYLOAD_DIR)/ps4-libjbc/*.c)
@@ -80,7 +82,10 @@ build/ps4cast-install-pkg.elf: main.c $(LIB) | build
 	$(CC) $(CFLAGS) -DCONTROL_INSTALL_PKG $(LIB) main.c $(JBC) $(LDFLAGS) -o $@
 
 build/ps4cast-app-status.elf: main.c $(LIB) | build
-	$(CC) $(CFLAGS) -DCONTROL_APP_STATUS -DCONTROL_LAUNCH_MEDIA $(LIB) main.c $(JBC) $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) -DCONTROL_APP_STATUS $(LIB) main.c $(JBC) $(LDFLAGS) -o $@
+
+build/ps4cast-reboot.elf: main.c $(LIB) | build
+	$(CC) $(CFLAGS) -DCONTROL_REBOOT $(LIB) main.c $(JBC) $(LDFLAGS) -o $@
 
 %.bin: %.elf
 	$(OBJCOPY) $< --only-section .text --only-section .data --only-section .bss --only-section .rodata -O binary $@
