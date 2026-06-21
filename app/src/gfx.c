@@ -302,8 +302,14 @@ void gfx_arc(Gfx *g, int cx, int cy, int r, int thick, int quad, GfxColor c) {
     }
 }
 
+static int default_track(int scale) {
+    return (scale >= 2 && scale <= FONT_MAXSCALE && FONT_DATA[scale]) ? -1 : 0;
+}
+
 int gfx_text_w(const char *s, int scale) {
-    return (int)strlen(s) * 8 * scale;
+    int n = (int)strlen(s);
+    int track = default_track(scale);
+    return n * 8 * scale + (n > 0 ? (n - 1) * track : 0);
 }
 
 int gfx_text_tr(Gfx *g, int x, int y, const char *s, int scale, GfxColor c, int track) {
@@ -343,5 +349,5 @@ int gfx_text_tr_w(const char *s, int scale, int track) {
 }
 
 int gfx_text(Gfx *g, int x, int y, const char *s, int scale, GfxColor c) {
-    return gfx_text_tr(g, x, y, s, scale, c, 0);
+    return gfx_text_tr(g, x, y, s, scale, c, default_track(scale));
 }

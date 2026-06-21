@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# Generate app/src/font_atlas.c/.h: an anti-aliased monospace glyph atlas baked
-# from a real font, so the on-screen PS4 UI text is readable and slick instead
-# of the 8x8 bitmap. Run once with a Pillow-enabled python:
+# Generate app/src/font_atlas.c/.h: an anti-aliased glyph atlas baked from a
+# real UI font, so the on-screen PS4 UI text is readable and slick instead of
+# the 8x8 bitmap. Run once with a Pillow-enabled python:
 #   python3 -m venv /tmp/fontvenv && /tmp/fontvenv/bin/pip install Pillow
 #   /tmp/fontvenv/bin/python tools/gen-font.py
 #
@@ -15,8 +15,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_C = os.path.join(ROOT, "app", "src", "font_atlas.c")
 OUT_H = os.path.join(ROOT, "app", "src", "font_atlas.h")
 
-# Slick, highly readable monospace. Fall back across common macOS choices.
+# Prefer readable humanist/system UI fonts. The renderer still uses fixed cells
+# so layout stays predictable on the PS4 framebuffer, but a proportional source
+# face reads less mechanical than the previous SF Mono atlas.
 FONT_CANDIDATES = [
+    "/System/Library/Fonts/SFCompact.ttf",
+    "/System/Library/Fonts/SFNS.ttf",
+    "/System/Library/Fonts/Avenir.ttc",
+    "/System/Library/Fonts/HelveticaNeue.ttc",
+    "/System/Library/Fonts/LucidaGrande.ttc",
     "/System/Library/Fonts/SFNSMono.ttf",
     "/System/Library/Fonts/Menlo.ttc",
     "/System/Library/Fonts/Monaco.ttf",
@@ -47,7 +54,10 @@ def render_scale(scale):
     font, path = load_font(px)
     asc, desc = font.getmetrics()
     baseline = asc + (cell - (asc + desc)) // 2
-    adv = font.getlength("M")
+    # Use a broad but not extreme uppercase width to center glyphs inside the
+    # fixed 8*scale cell. This keeps digits/labels tidy without the airy mono
+    # spacing that made channel names feel too loose.
+    adv = min(cell * 0.92, max(font.getlength("M"), font.getlength("0")))
     data = bytearray()
     for cp in range(FIRST, LAST + 1):
         img = Image.new("L", (cell, cell), 0)
