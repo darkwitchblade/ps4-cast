@@ -76,24 +76,39 @@ if [ "${1:-}" != "nobuild" ]; then
   ./build.sh >/tmp/redeploy_build.log 2>&1 || { echo "BUILD FAILED:"; tail -8 /tmp/redeploy_build.log; exit 1; }
 fi
 
-echo "[2/5] close running app"
-# Prefer the external control payload. The in-app /quit path can surface as a
-# PS4 crash dialog on this console, so keep it out of the normal deploy loop.
-send_payload build/ps4cast-kill.bin || true
-sleep 5                         # let GoldHEN re-arm :9090
-old="$(curl -sS -m3 "http://$PS4:8080/status" 2>/dev/null || true)"
-if echo "$old" | grep -q '"ver":'; then
-  echo "    external kill did not clear app; trying in-app idle /quit fallback"
+echo "[2/5] close running app cleanly + verify"
+# Best practice: close the OLD version cleanly, VERIFY it's gone, then proceed.
+# Never install over a running/frozen app. /quit now does LoadExec("exit") — a
+# normal return-to-home with NO crash dialog (v03.05+), so it's the preferred
+# clean close; the force-kill payload is the fallback for a wedged app.
+app_up() { curl -sS -m3 "http://$PS4:8080/status" 2>/dev/null | grep -q '"ver":'; }
+closed=""
+for attempt in 1 2 3 4 5; do
+  if ! app_up; then closed=1; break; fi
+  echo "    close attempt $attempt: clean /quit, then force-kill"
   curl -sS -m5 -X POST "http://$PS4:8080/quit" >/dev/null 2>&1 || true
-  sleep 5
-  old="$(curl -sS -m3 "http://$PS4:8080/status" 2>/dev/null || true)"
+  sleep 4
+  if ! app_up; then closed=1; break; fi
+  send_payload build/ps4cast-kill.bin || true
+  sleep 5                       # also lets GoldHEN re-arm :9090
+done
+# Verify truly closed: must be unreachable on 3 consecutive checks (not a blip).
+if [ -n "$closed" ]; then
+  downs=0
+  for _ in 1 2 3 4 5 6; do
+    if app_up; then downs=0; else downs=$((downs+1)); fi
+    [ "$downs" -ge 3 ] && break
+    sleep 2
+  done
+  [ "$downs" -ge 3 ] || closed=""
 fi
-if echo "$old" | grep -q '"ver":'; then
-  oldver="$(printf '%s' "$old" | sed -n 's/.*"ver":"\([^"]*\)".*/\1/p')"
-  echo "CLOSE FAILED: PS4 Cast is still responding on v${oldver:-unknown}."
-  echo "Close it from the PS4 menu, dismiss any crash/spinner screen, then rerun deploy."
+if [ -z "$closed" ]; then
+  oldver="$(curl -sS -m3 "http://$PS4:8080/status" 2>/dev/null | sed -n 's/.*"ver":"\([^"]*\)".*/\1/p')"
+  echo "CLOSE FAILED: app still responding/frozen on v${oldver:-unknown} and :9090 not accepting the kill."
+  echo "On the console: PS button -> Close Application (dismiss any dialog), re-arm GoldHEN :9090, then rerun."
   exit 2
 fi
+echo "    verified closed"
 
 echo "[3/5] uninstall old app"
 send_payload build/ps4cast-uninstall.bin || true
