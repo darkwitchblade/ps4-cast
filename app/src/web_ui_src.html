@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>PS4 Cast</title>
+<meta name="theme-color" content="#070a14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="PS4 Cast">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%231b2547'/><rect x='6' y='6.5' width='20' height='13' rx='2' fill='none' stroke='%235b6bbf' stroke-width='2'/><circle cx='8.5' cy='24' r='2' fill='%2336d399'/><path d='M7 19.5a4.5 4.5 0 0 1 4.5 4.5' fill='none' stroke='%233b82f6' stroke-width='2.4' stroke-linecap='round'/><path d='M7 14.5a9.5 9.5 0 0 1 9.5 9.5' fill='none' stroke='%233b82f6' stroke-width='2.4' stroke-linecap='round'/></svg>">
+<link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'><rect width='180' height='180' rx='40' fill='%231b2547'/><rect x='34' y='38' width='112' height='74' rx='12' fill='none' stroke='%235b6bbf' stroke-width='11'/><circle cx='48' cy='138' r='11' fill='%2336d399'/><path d='M40 110a28 28 0 0 1 28 28' fill='none' stroke='%233b82f6' stroke-width='13' stroke-linecap='round'/><path d='M40 82a56 56 0 0 1 56 56' fill='none' stroke='%233b82f6' stroke-width='13' stroke-linecap='round'/></svg>">
+<style>
+:root{
+ --bg:#070a14;--bg2:#0d1326;--surf:rgba(22,29,52,.66);--surf2:rgba(30,39,68,.7);
+ --line:rgba(123,140,200,.16);--line2:rgba(123,140,200,.28);
+ --txt:#f3f6ff;--mut:#9aa4c8;--faint:#6b7398;
+ --acc:#5b8cff;--acc2:#7c6cff;--live:#2ee6a6;--danger:#ff5d7a;
+ --r:20px;--rs:14px;--shadow:0 24px 70px rgba(0,0,0,.55);
+ color-scheme:dark;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0}
+body{
+ min-height:100vh;min-height:100dvh;
+ font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+ color:var(--txt);letter-spacing:.1px;
+ background:
+   radial-gradient(900px 520px at 18% -8%,rgba(91,140,255,.20),transparent 60%),
+   radial-gradient(820px 480px at 92% 0%,rgba(124,108,255,.16),transparent 58%),
+   linear-gradient(180deg,var(--bg2),var(--bg) 46%);
+ background-attachment:fixed;
+ padding:max(16px,env(safe-area-inset-top)) 16px calc(28px + env(safe-area-inset-bottom));
+ display:flex;flex-direction:column;align-items:center;gap:14px;
+}
+.wrap{width:100%;max-width:480px;display:flex;flex-direction:column;gap:14px}
+/* top bar */
+.top{display:flex;align-items:center;gap:11px;padding:2px 4px}
+.logo{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;
+ background:linear-gradient(160deg,#1d2750,#141a33);border:1px solid var(--line2);box-shadow:0 6px 18px rgba(0,0,0,.4)}
+.logo svg{width:20px;height:20px}
+.brand{display:flex;flex-direction:column;line-height:1.05}
+.brand b{font-size:16px;font-weight:800;letter-spacing:.2px}
+.brand small{font-size:10.5px;color:var(--faint);font-weight:600;letter-spacing:.4px;text-transform:uppercase}
+.pill{margin-left:auto;display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--mut);
+ background:var(--surf);border:1px solid var(--line);padding:6px 11px;border-radius:999px;backdrop-filter:blur(10px)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--faint);transition:.3s}
+.dot.live{background:var(--live);box-shadow:0 0 0 4px rgba(46,230,166,.16),0 0 12px var(--live);animation:pulse 2.4s ease-in-out infinite}
+@keyframes pulse{50%{box-shadow:0 0 0 6px rgba(46,230,166,.07),0 0 16px var(--live)}}
+.gear{margin-left:2px;width:38px;height:38px;border-radius:11px;border:1px solid var(--line);
+ background:var(--surf);color:var(--mut);display:grid;place-items:center;cursor:pointer;backdrop-filter:blur(10px);transition:.15s}
+.gear:active{transform:scale(.92)}.gear svg{width:19px;height:19px}
+/* card */
+.card{background:var(--surf);border:1px solid var(--line);border-radius:var(--r);
+ box-shadow:var(--shadow);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);padding:18px}
+.lbl{font-size:11.5px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:.7px;margin:0 0 10px 2px}
+/* now playing */
+#np{padding:18px 18px 20px;background:
+ linear-gradient(180deg,rgba(91,140,255,.12),rgba(22,29,52,.66) 70%);overflow:hidden;position:relative}
+#np::before{content:"";position:absolute;inset:0;background:radial-gradient(420px 160px at 12% 0%,rgba(91,140,255,.22),transparent 70%);pointer-events:none}
+.np-top{display:flex;align-items:center;gap:11px;position:relative}
+.np-art{width:46px;height:46px;border-radius:12px;flex:none;display:grid;place-items:center;
+ background:linear-gradient(160deg,var(--acc),var(--acc2));box-shadow:0 8px 22px rgba(91,140,255,.4)}
+.np-art svg{width:24px;height:24px}
+.np-meta{min-width:0}
+.np-meta .t{font-size:15.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.np-meta .s{font-size:12px;color:var(--mut);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.scrub{margin-top:16px;position:relative}
+input[type=range].seek{-webkit-appearance:none;width:100%;height:6px;border-radius:6px;outline:none;margin:0;
+ background:linear-gradient(90deg,var(--acc) var(--p,0%),rgba(123,140,200,.22) var(--p,0%))}
+input[type=range].seek::-webkit-slider-thumb{-webkit-appearance:none;width:17px;height:17px;border-radius:50%;
+ background:#fff;box-shadow:0 0 0 4px rgba(91,140,255,.35),0 3px 8px rgba(0,0,0,.4);cursor:pointer}
+input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-radius:50%;background:#fff}
+.times{display:flex;justify-content:space-between;margin-top:9px;font-size:11.5px;color:var(--mut);
+ font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}
+.transport{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:18px}
+.tbtn{width:50px;height:50px;border-radius:50%;border:1px solid var(--line);background:var(--surf2);color:var(--txt);
+ display:grid;place-items:center;cursor:pointer;transition:.14s}
+.tbtn:active{transform:scale(.9)}.tbtn svg{width:22px;height:22px}
+.tbtn.play{width:66px;height:66px;border:0;background:linear-gradient(160deg,var(--acc),var(--acc2));
+ box-shadow:0 12px 30px rgba(91,140,255,.42)}.tbtn.play svg{width:28px;height:28px}
+.tbtn.stop{color:var(--danger)}
+/* cast input */
+.inrow{display:flex;align-items:center;gap:9px;background:#0c1226;border:1px solid var(--line2);
+ border-radius:var(--rs);padding:4px 4px 4px 13px;transition:.16s}
+.inrow:focus-within{border-color:var(--acc);box-shadow:0 0 0 4px rgba(91,140,255,.14)}
+.inrow .lk{width:18px;height:18px;color:var(--faint);flex:none}
+.inrow input{flex:1;min-width:0;border:0;background:transparent;color:#fff;font-size:16px;padding:13px 2px;outline:none;font-family:inherit}
+.inrow input::placeholder{color:var(--faint)}
+.psbtn{flex:none;width:42px;height:42px;border-radius:10px;border:1px solid var(--line);background:var(--surf2);
+ color:var(--mut);display:grid;place-items:center;cursor:pointer;transition:.14s}
+.psbtn:active{transform:scale(.9)}.psbtn svg{width:19px;height:19px}
+.actions{display:flex;gap:9px;margin-top:13px}
+.btn{flex:1;display:flex;align-items:center;justify-content:center;gap:8px;height:50px;border:0;border-radius:var(--rs);
+ font-family:inherit;font-size:15px;font-weight:700;cursor:pointer;color:#fff;transition:.14s}
+.btn:active{transform:scale(.97)}
+.btn.primary{background:linear-gradient(160deg,var(--acc),var(--acc2));box-shadow:0 10px 26px rgba(91,140,255,.34)}
+.btn.primary svg{width:19px;height:19px}
+.chip{flex:none;width:50px;height:50px;border-radius:var(--rs);border:1px solid var(--line2);background:var(--surf2);
+ color:var(--mut);display:grid;place-items:center;cursor:pointer;transition:.14s}
+.chip:active{transform:scale(.92)}.chip svg{width:20px;height:20px}
+.chip.wide{width:auto;padding:0 16px;gap:8px;font-size:14px;font-weight:700;color:var(--txt);display:flex;align-items:center}
+/* tabs */
+.tabs{display:flex;gap:6px;background:var(--surf);border:1px solid var(--line);border-radius:14px;padding:5px;backdrop-filter:blur(10px)}
+.tabs button{flex:1;border:0;background:transparent;color:var(--mut);font-family:inherit;font-size:13px;font-weight:700;
+ padding:10px 6px;border-radius:10px;cursor:pointer;transition:.16s}
+.tabs button.on{background:var(--surf2);color:var(--txt);box-shadow:0 2px 8px rgba(0,0,0,.3)}
+.tabs .cnt{font-size:11px;color:var(--faint);margin-left:5px}
+/* list rows */
+.pane{display:flex;flex-direction:column;gap:8px;min-height:8px}
+.empty{text-align:center;color:var(--faint);font-size:13px;padding:26px 10px;line-height:1.6}
+.row{display:flex;align-items:center;gap:12px;padding:12px 13px;background:var(--surf);border:1px solid var(--line);
+ border-radius:13px;cursor:pointer;transition:.14s}
+.row:active{transform:scale(.985);background:var(--surf2)}
+.row .ic{width:34px;height:34px;border-radius:9px;flex:none;display:grid;place-items:center;
+ background:linear-gradient(160deg,#222c52,#161d36);color:var(--acc)}
+.row .ic svg{width:17px;height:17px}
+.row .tx{min-width:0;flex:1}
+.row .tx .n{font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .tx .u{font-size:11px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.row .go{color:var(--faint);flex:none}.row .go svg{width:16px;height:16px}
+.scrolly{max-height:320px;overflow:auto;-webkit-overflow-scrolling:touch;display:flex;flex-direction:column;gap:8px;
+ margin:-2px;padding:2px}
+/* status bar */
+.statusbar{display:flex;align-items:center;justify-content:center;gap:9px;font-size:12.5px;color:var(--mut);min-height:18px;padding:2px}
+.spin{width:14px;height:14px;border:2px solid rgba(123,140,200,.25);border-top-color:var(--acc);border-radius:50%;
+ animation:sp .7s linear infinite;display:none}@keyframes sp{to{transform:rotate(360deg)}}
+.hint{font-size:11.5px;color:var(--faint);text-align:center;line-height:1.6;padding:0 8px}
+/* settings sheet */
+.bg{position:fixed;inset:0;background:rgba(4,7,15,.55);backdrop-filter:blur(3px);opacity:0;pointer-events:none;transition:.25s;z-index:40}
+.bg.on{opacity:1;pointer-events:auto}
+.sheet{position:fixed;left:0;right:0;bottom:0;z-index:50;margin:0 auto;max-width:512px;
+ background:linear-gradient(180deg,#121833,#0c1124);border:1px solid var(--line2);border-bottom:0;
+ border-radius:24px 24px 0 0;box-shadow:0 -20px 60px rgba(0,0,0,.6);
+ padding:10px 20px calc(26px + env(safe-area-inset-bottom));transform:translateY(102%);transition:transform .3s cubic-bezier(.2,.8,.2,1)}
+.sheet.on{transform:translateY(0)}
+.grab{width:40px;height:4px;border-radius:4px;background:var(--line2);margin:4px auto 14px}
+.sheet h2{margin:0 0 4px;font-size:18px;font-weight:800}
+.sheet .sub{font-size:12px;color:var(--faint);margin:0 0 16px}
+.set{display:flex;align-items:center;gap:12px;padding:14px 0;border-top:1px solid var(--line)}
+.set .txt{flex:1}.set .txt .a{font-size:14px;font-weight:700}.set .txt .b{font-size:11.5px;color:var(--faint);margin-top:2px;line-height:1.4}
+.sw{flex:none;width:50px;height:30px;border-radius:999px;border:1px solid var(--line2);background:#0c1226;position:relative;cursor:pointer;transition:.2s}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#cdd6f4;transition:.2s}
+.sw.on{background:linear-gradient(160deg,var(--acc),var(--acc2));border-color:transparent}
+.sw.on::after{left:23px;background:#fff}
+.exit{width:100%;height:48px;margin-top:18px;border-radius:13px;border:1px solid rgba(255,93,122,.32);
+ background:rgba(255,93,122,.1);color:#ffabbc;font-family:inherit;font-size:14px;font-weight:700;cursor:pointer;transition:.14s}
+.exit:active{transform:scale(.98)}
+.verline{text-align:center;font-size:11px;color:var(--faint);margin-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+ <div class="top">
+  <div class="logo">
+   <svg viewBox="0 0 32 32" fill="none"><rect x="5" y="6" width="22" height="14" rx="2.5" stroke="#7c8fdf" stroke-width="2.1"/><circle cx="8" cy="25" r="2.1" fill="#2ee6a6"/><path d="M6 20.5a4.6 4.6 0 0 1 4.6 4.6" stroke="#5b8cff" stroke-width="2.5" stroke-linecap="round"/><path d="M6 15.4a9.7 9.7 0 0 1 9.7 9.7" stroke="#5b8cff" stroke-width="2.5" stroke-linecap="round"/></svg>
+  </div>
+  <div class="brand"><b>PS4 Cast</b><small>Receiver</small></div>
+  <div class="pill"><span class="dot" id="dot"></span><span id="state">Idle</span></div>
+  <button class="gear" id="gear" aria-label="Settings">
+   <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3.2" stroke="currentColor" stroke-width="1.9"/><path d="M19.4 13a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1V19a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 7 17.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.6 1.6 0 0 0 5 12.6a1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 4.7 6a1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.6 1.6 0 0 0 9 1.5h.1A1.6 1.6 0 0 0 10 0" stroke="currentColor" stroke-width="1.7" transform="translate(2 3)"/></svg>
+  </button>
+ </div>
+
+ <!-- now playing -->
+ <section class="card" id="np" hidden>
+  <div class="np-top">
+   <div class="np-art"><svg viewBox="0 0 24 24" fill="#fff"><path d="M8 5v14l11-7z"/></svg></div>
+   <div class="np-meta"><div class="t" id="npTitle">Now playing</div><div class="s" id="npSub">—</div></div>
+  </div>
+  <div class="scrub">
+   <input class="seek" id="sk" type="range" min="0" max="100" value="0" step="1">
+   <div class="times"><span id="cur">0:00</span><span id="dur">0:00</span></div>
+  </div>
+  <div class="transport">
+   <button class="tbtn" onclick="skip(-15)" aria-label="Back 15s"><svg viewBox="0 0 24 24" fill="none"><path d="M11 6 5 12l6 6M19 6l-6 6 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+   <button class="tbtn play" id="pp" onclick="toggle()" aria-label="Play/Pause"><svg id="ppic" viewBox="0 0 24 24" fill="#fff"><rect x="6" y="5" width="4" height="14" rx="1.2"/><rect x="14" y="5" width="4" height="14" rx="1.2"/></svg></button>
+   <button class="tbtn" onclick="skip(15)" aria-label="Forward 15s"><svg viewBox="0 0 24 24" fill="none"><path d="M13 6l6 6-6 6M5 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+   <button class="tbtn stop" onclick="stop()" aria-label="Stop"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2.2"/></svg></button>
+  </div>
+ </section>
+
+ <!-- cast input -->
+ <section class="card">
+  <div class="lbl">Cast a link</div>
+  <div class="inrow">
+   <svg class="lk" viewBox="0 0 24 24" fill="none"><path d="M9 15l6-6M10.5 6.5l1-1a4 4 0 0 1 6 6l-1 1M13.5 17.5l-1 1a4 4 0 0 1-6-6l1-1" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+   <input id="u" type="url" inputmode="url" placeholder="https://…/movie.mp4" autocomplete="off" autocapitalize="off" spellcheck="false">
+   <button class="psbtn" id="psbtn" onclick="paste()" aria-label="Paste"><svg viewBox="0 0 24 24" fill="none"><rect x="8" y="3" width="8" height="4" rx="1.2" stroke="currentColor" stroke-width="1.8"/><path d="M9 5H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
+  </div>
+  <div class="actions">
+   <button class="btn primary" onclick="cast()"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="12" rx="2" stroke="#fff" stroke-width="2"/><circle cx="6" cy="20" r="1.6" fill="#fff"/><path d="M3 16a4 4 0 0 1 4 4M3 12.5a7.5 7.5 0 0 1 7.5 7.5" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>Cast</button>
+   <button class="chip" onclick="fav()" aria-label="Favorite"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 17l-5.2 2.6 1-5.8-4.3-4.1 5.9-.9z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg></button>
+   <button class="chip" onclick="queue()" aria-label="Queue next"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7h11M4 12h11M4 17h7M18 13v6M15 16h6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg></button>
+  </div>
+  <div class="actions">
+   <button class="chip wide" style="flex:1" onclick="loadPlaylist()"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h11M4 12h11M4 18h7" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/><path d="M17 12l5 3-5 3z" fill="currentColor"/></svg>Load M3U / IPTV playlist</button>
+  </div>
+ </section>
+
+ <!-- library tabs -->
+ <div class="tabs">
+  <button class="on" data-t="pl" onclick="tab('pl')">Channels<span class="cnt" id="cPl"></span></button>
+  <button data-t="fav" onclick="tab('fav')">Favorites<span class="cnt" id="cFav"></span></button>
+  <button data-t="rec" onclick="tab('rec')">Recent<span class="cnt" id="cRec"></span></button>
+ </div>
+ <section class="pane" id="panePl"><div class="empty">Paste an M3U / IPTV link above and tap <b>Load playlist</b> to browse channels here.</div></section>
+ <section class="pane" id="paneFav" hidden></section>
+ <section class="pane" id="paneRec" hidden></section>
+
+ <div class="statusbar"><span class="spin" id="spin"></span><span id="msg">Ready</span></div>
+ <div class="hint">Direct links (MP4, MKV, HLS) play instantly. M3U / IPTV links expand into a channel list. You can also cast from any DLNA app.</div>
+</div>
+
+<!-- settings -->
+<div class="bg" id="bg" onclick="closeSheet()"></div>
+<div class="sheet" id="sheet">
+ <div class="grab"></div>
+ <h2>Settings</h2>
+ <div class="sub">Tune playback and clean up the TV display.</div>
+ <div class="set">
+  <div class="txt"><div class="a">Hardware decode</div><div class="b">GPU H.264 decoding. Auto-falls back to software when needed.</div></div>
+  <div class="sw" id="swHw" onclick="toggleHw()"></div>
+ </div>
+ <div class="set">
+  <div class="txt"><div class="a">Debug notifications</div><div class="b">Show diagnostic toasts on the TV. Off for a clean, final-product display.</div></div>
+  <div class="sw" id="swDbg" onclick="toggleDbg()"></div>
+ </div>
+ <button class="exit" onclick="exitApp()">Exit PS4 App</button>
+ <div class="verline">PS4 Cast <span id="ver">—</span></div>
+</div>
+
+<script>
+var $=function(i){return document.getElementById(i)};
+var drag=false,dur=0,hw=1,dbg=0,curTab='pl',plData=[];
+function busy(b){$('spin').style.display=b?'inline-block':'none'}
+function msg(t){$('msg').textContent=t}
+function fmt(s){s=Math.max(0,s|0);var h=(s/3600)|0,m=((s/60)|0)%60,x=s%60,p=function(n){return(n<10?'0':'')+n};return h>0?h+':'+p(m)+':'+p(x):m+':'+p(x)}
+function esc(s){return(''+s).replace(/[<>&]/g,function(c){return c=='<'?'&lt;':c=='>'?'&gt;':'&amp;'})}
+function shorten(u){try{u=decodeURIComponent(u)}catch(e){}return u.length>60?u.slice(0,34)+'…'+u.slice(-22):u}
+function nameFromUrl(u){try{u=decodeURIComponent(u)}catch(e){}u=u.split(/[?#]/)[0];var p=u.split('/').filter(Boolean);return p.length?p[p.length-1]:u}
+async function post(p,b){try{return await fetch(p,{method:'POST',headers:{'Content-Type':'text/plain'},body:b||''})}catch(e){}}
+async function getj(p){try{return await(await fetch(p)).json()}catch(e){return null}}
+
+async function cast(){var u=$('u').value.trim();if(!u){msg('Enter a link first');$('u').focus();return}busy(true);msg('Casting…');await post('/avplay',u)}
+function pick(u){try{u=decodeURIComponent(u)}catch(e){}$('u').value=u;cast()}
+async function stop(){busy(false);await post('/stop');msg('Stopped')}
+async function toggle(){await post('/pause')}
+async function skip(d){var v=Math.max(0,(+$('sk').value)+d);$('sk').value=v;setSeek(v);await post('/seek',''+v)}
+async function fav(){var u=$('u').value.trim();if(u){await post('/fav',u);msg('Saved to favorites');loadLists()}else msg('Enter a link first')}
+async function queue(){var u=$('u').value.trim();if(u){await post('/queue',u);msg('Added to queue')}else msg('Enter a link first')}
+
+async function paste(){var el=$('u');el.focus();el.select();
+ try{if(navigator.clipboard&&navigator.clipboard.readText){var t=await navigator.clipboard.readText();if(t){el.value=t.trim();el.setSelectionRange(el.value.length,el.value.length);msg('Pasted');return}msg('Clipboard empty');return}}catch(e){}
+ msg('Box is ready — paste with long-press or Ctrl/Cmd+V')}
+
+async function loadPlaylist(){var u=$('u').value.trim();if(!u){msg('Paste an M3U / playlist link first');$('u').focus();return}
+ busy(true);msg('Loading playlist…');
+ try{var r=await fetch('/playlist',{method:'POST',headers:{'Content-Type':'text/plain'},body:u});var a=await r.json();busy(false);
+  plData=a||[];renderPane('pl');tab('pl');
+  if(!plData.length){msg('No channels found in that link')}else{msg(plData.length+' channels — tap one to play')}}
+ catch(e){busy(false);msg('Could not load that playlist')}}
+
+function rowHtml(name,url,icon){return '<div class="row" onclick="pick(\''+encodeURIComponent(url)+'\')">'+
+ '<div class="ic">'+icon+'</div><div class="tx"><div class="n">'+esc(name)+'</div><div class="u">'+esc(shorten(url))+'</div></div>'+
+ '<div class="go"><svg viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div></div>'}
+var IC_TV='<svg viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="12" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M8 21h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+var IC_STAR='<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 4l2.3 4.7 5.2.8-3.8 3.6.9 5.1L12 16.6 7.2 18.8l.9-5.1L4.3 9.5l5.2-.8z"/></svg>';
+var IC_CLOCK='<svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8.2" stroke="currentColor" stroke-width="1.8"/><path d="M12 8v4.3l2.6 1.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+function renderPane(which){
+ if(which=='pl'){var h='';if(!plData.length){$('panePl').innerHTML='<div class="empty">Paste an M3U / IPTV link above and tap <b>Load playlist</b> to browse channels here.</div>';$('cPl').textContent='';return}
+  h='<div class="scrolly">';for(var i=0;i<plData.length;i++){h+=rowHtml(plData[i].n||nameFromUrl(plData[i].u),plData[i].u,IC_TV)}h+='</div>';
+  $('panePl').innerHTML=h;$('cPl').textContent=plData.length}
+}
+function listPane(id,cntId,arr,icon,emptyMsg){
+ var el=$(id);$(cntId).textContent=arr&&arr.length?arr.length:'';
+ if(!arr||!arr.length){el.innerHTML='<div class="empty">'+emptyMsg+'</div>';return}
+ var h='<div class="scrolly">';for(var i=0;i<arr.length;i++){h+=rowHtml(nameFromUrl(arr[i]),arr[i],icon)}h+='</div>';el.innerHTML=h}
+async function loadLists(){var f=await getj('/favs'),r=await getj('/recent');
+ listPane('paneFav','cFav',f,IC_STAR,'No favorites yet. Tap the ★ on a link to save it.');
+ listPane('paneRec','cRec',r,IC_CLOCK,'Nothing played yet.')}
+
+function tab(t){curTab=t;var ids={pl:'panePl',fav:'paneFav',rec:'paneRec'};
+ for(var k in ids){$(ids[k]).hidden=(k!=t)}
+ var b=document.querySelectorAll('.tabs button');for(var i=0;i<b.length;i++){b[i].classList.toggle('on',b[i].dataset.t==t)}
+ if(t=='pl')renderPane('pl')}
+
+/* settings */
+function openSheet(){$('bg').classList.add('on');$('sheet').classList.add('on')}
+function closeSheet(){$('bg').classList.remove('on');$('sheet').classList.remove('on')}
+$('gear').onclick=openSheet;
+function setSw(id,on){$(id).classList.toggle('on',!!on)}
+async function toggleHw(){hw=hw?0:1;setSw('swHw',hw);await post('/hwdecode',''+hw);msg(hw?'Hardware decode on':'Software decode')}
+async function toggleDbg(){dbg=dbg?0:1;setSw('swDbg',dbg);await post('/debug',''+dbg);msg(dbg?'Debug toasts on':'Debug toasts off')}
+async function exitApp(){if(confirm('Close PS4 Cast on the console?')){closeSheet();busy(false);msg('Closing app…');await post('/quit')}}
+
+/* seek visuals */
+function setSeek(v){var m=+$('sk').max||100;$('sk').style.setProperty('--p',(m?(v/m*100):0)+'%')}
+$('sk').addEventListener('input',function(){drag=true;setSeek(+this.value);$('cur').textContent=fmt(+this.value)});
+$('sk').addEventListener('change',async function(){await post('/seek',''+this.value);drag=false});
+
+async function poll(){var j=await getj('/status');
+ if(!j){$('dot').className='dot';$('state').textContent='offline';busy(false);msg('Reconnecting to PS4…');return}
+ var on=j.active==1||j.paused==1;
+ $('dot').className='dot'+(on?' live':'');$('state').textContent=on?(j.paused==1?'Paused':'Playing'):'Idle';
+ $('ver').textContent='v'+j.ver;
+ $('np').hidden=!on;
+ if(on){
+  var nm=j.last_push?nameFromUrl(j.last_push):'Now playing';
+  $('npTitle').textContent=nm;$('npSub').textContent=j.status||'';
+  $('ppic').innerHTML=j.paused==1?'<path d="M8 5v14l11-7z"/>':'<rect x="6" y="5" width="4" height="14" rx="1.2"/><rect x="14" y="5" width="4" height="14" rx="1.2"/>';
+  if(j.dur){dur=j.dur;$('sk').max=j.dur;$('dur').textContent=fmt(j.dur)}
+  if(!drag&&j.cur!=null){$('sk').value=j.cur;setSeek(j.cur);$('cur').textContent=fmt(j.cur)}
+ }
+ if(j.status){msg(j.status);busy(/buffer|cast|connect|seek|open|load/i.test(j.status)&&!on)}
+ if(j.hw_enabled!=null){hw=j.hw_enabled;setSw('swHw',hw)}
+ if(j.debug!=null){dbg=j.debug;setSw('swDbg',dbg)}
+}
+$('u').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();cast()}});
+$('u').addEventListener('focus',function(){this.select()});
+try{$('u').focus()}catch(e){}
+setInterval(poll,1000);poll();loadLists();setInterval(loadLists,5000);
+</script>
+</body>
+</html>

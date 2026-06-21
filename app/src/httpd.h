@@ -10,5 +10,6 @@ int  httpd_take_player_request(char *out, int len);
 int  httpd_take_stop_request(void);               // 1 if stop was posted
 int  httpd_take_quit_request(void);               // 1 if quit was posted
 int  httpd_take_next(char *out, int len);         // 1 if a queued URL (autoplay)
+const char *httpd_last_push(void);                // last cast URL (HUD title)
 
 #endif

@@ -17,6 +17,12 @@ if [ ! -e "$OO_PS4_TOOLCHAIN/bin/macos/create-fself" ]; then
     ln -sf create-fself-macos "$OO_PS4_TOOLCHAIN/bin/macos/create-fself"
 fi
 
+# Regenerate the embedded web UI header from its .html source so the served page
+# is always in sync with web_ui_src.html (the editable source of truth).
+if [ -f "$HERE/app/src/web_ui_src.html" ]; then
+    python3 "$HERE/scripts/gen-web-ui.py"
+fi
+
 cd "$HERE/app"
 
 if [ "${1:-}" = "clean" ]; then

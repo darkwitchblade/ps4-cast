@@ -413,7 +413,7 @@ int player_play(const char *url) {
                 g_aframe = av_frame_alloc();
                 if (audio_open() == 0) {
                     g_haveAudio = 1;
-                    notify("PS4 Cast: audio %s %dHz", adec->name, g_adec->sample_rate);
+                    notify_dbg("PS4 Cast: audio %s %dHz", adec->name, g_adec->sample_rate);
                 }
             }
         }
@@ -476,7 +476,7 @@ int player_play(const char *url) {
                 g_hwReorder = vpar->video_delay;          // B-frame reorder depth (adapts at runtime)
                 if (g_hwReorder < 0) g_hwReorder = 0;
                 if (g_hwReorder >= HW_REORDER) g_hwReorder = HW_REORDER - 1;
-                notify("PS4 Cast: HW H.264 %dx%d reorder=%d %s (%s)", vpar->width, vpar->height,
+                notify_dbg("PS4 Cast: HW H.264 %dx%d reorder=%d %s (%s)", vpar->width, vpar->height,
                        g_hwReorder, g_hlsSegDemux ? "hls-seg" : "direct", vdec_hw_debug());
             }
         }
@@ -513,7 +513,7 @@ int player_play(const char *url) {
     g_started = 1; g_active = 1; g_gotFrame = 0;
     if (g_isHls) audio_pause(1);  // startup headstart: fill frames/audio before first presentation
     snprintf(g_status, sizeof(g_status), "buffering %s %dx%d", dec->name, g_srcW, g_srcH);
-    notify("PS4 Cast: ffmpeg %s %dx%d", dec->name, g_srcW, g_srcH);
+    notify_dbg("PS4 Cast: ffmpeg %s %dx%d", dec->name, g_srcW, g_srcH);
 
 #if PLAYER_DECODE_THREAD
     // Start the decode thread; main thread will only present. On failure fall
@@ -837,7 +837,7 @@ static int setup_separate_audio(void) {
     if (audio_open() != 0) return -1;
     g_haveAudio = 1; g_sepAudioMode = 1;
     g_sepAudioEof = 0;
-    notify("PS4 Cast: audio %s %dHz (HLS rendition)", adec->name, g_adec->sample_rate);
+    notify_dbg("PS4 Cast: audio %s %dHz (HLS rendition)", adec->name, g_adec->sample_rate);
     return 0;
 }
 
@@ -881,7 +881,7 @@ static int hw_failover_to_software(int err) {
     g_lastEmitPts = AV_NOPTS_VALUE;
     if (g_vdec) avcodec_free_context(&g_vdec);
     if (g_swCodec && open_sw_video(g_swCodec) == 0) {
-        notify("PS4 Cast: HW decode failed; software fallback");
+        notify_dbg("PS4 Cast: HW decode failed; software fallback");
         return 1;
     }
     g_active = 0;

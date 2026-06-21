@@ -8,6 +8,7 @@
 #include "pad_diag.h"
 #include "vdec_probe.h"
 #include "trace.h"
+#include "notify.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -93,6 +94,28 @@ static void favs_load(void) {
         if (line[0]) { strncpy(g_fav[g_favN], line, URL_MAX - 1); g_fav[g_favN][URL_MAX-1]='\0'; g_favN++; }
     }
 }
+// ---- persisted settings (debug toasts on/off) ----------------------------
+#define CFG_PATH "/data/ps4cast_cfg.txt"
+static void cfg_save(void) {
+    int fd = sceKernelOpen(CFG_PATH, 0x0201 /*O_WRONLY|O_CREAT*/ | 0x0400 /*O_TRUNC*/, 0666);
+    if (fd < 0) return;
+    char line[32];
+    int n = snprintf(line, sizeof(line), "debug=%d\n", notify_get_debug());
+    sceKernelWrite(fd, line, n);
+    sceKernelClose(fd);
+}
+static void cfg_load(void) {
+    int fd = sceKernelOpen(CFG_PATH, 0 /*O_RDONLY*/, 0);
+    if (fd < 0) return;
+    char buf[64];
+    int n = (int)sceKernelRead(fd, buf, sizeof(buf) - 1);
+    sceKernelClose(fd);
+    if (n <= 0) return;
+    buf[n] = '\0';
+    const char *d = strstr(buf, "debug=");
+    if (d) notify_set_debug(atoi(d + 6));
+}
+
 static void fav_toggle(const char *url) {
     scePthreadMutexLock(&g_mtx);
     int idx = -1;
@@ -424,6 +447,9 @@ static const char CONNECTION_XML[] =
 static char g_dlna_uri[1024];
 static char g_last_push[1024];
 
+// The most recently cast URL, for the on-screen HUD title (filename).
+const char *httpd_last_push(void) { return g_last_push; }
+
 static void send_response(OrbisNetId c, const char *status, const char *ctype,
                           const char *body, int bodylen);
 
@@ -602,10 +628,10 @@ static void handle_client(OrbisNetId c) {
         double cur = 0, dur = 0;
         player_progress(&cur, &dur);
         int j = snprintf(json, sizeof(json),
-                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"native\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"debug\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d}",
+                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"native\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"diag\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d,\"debug\":%d}",
                          APP_VER, jb_result(), goldhen_status(), player_status(), handoff_status(), ssdp_status(),
                          active, player_is_paused(), (int)(cur + 0.5), (int)(dur + 0.5), g_last_push, dbg, pad_diag_get(),
-                         player_hw_enabled());
+                         player_hw_enabled(), notify_get_debug());
         send_response(c, "200 OK", "application/json", json, j);
         return;
     }
@@ -641,6 +667,15 @@ static void handle_client(OrbisNetId c) {
         int on = (body[0] != '0');
         player_set_hw(on);
         send_response(c, "200 OK", "text/plain", on ? "hw on" : "hw off", on ? 5 : 6);
+        return;
+    }
+
+    // Toggle on-screen debug toasts (Settings). POST /debug body "0"/"1".
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/debug") == 0) {
+        int on = (body[0] != '0');
+        notify_set_debug(on);
+        cfg_save();
+        send_response(c, "200 OK", "text/plain", on ? "debug on" : "debug off", on ? 8 : 9);
         return;
     }
 
@@ -994,6 +1029,7 @@ static void *server_main(void *arg) {
 int httpd_start(int port) {
     scePthreadMutexInit(&g_mtx, NULL, "ps4cast_mtx");
     favs_load();   // restore saved favorites from /data
+    cfg_load();    // restore persisted settings (debug toasts)
 
     g_listen = sceNetSocket("ps4cast", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_STREAM, 0);
     if (g_listen < 0)

@@ -190,7 +190,7 @@ static int cb_file_open(void *p, const char *filename) {
     g_fileSize = (int64_t)sceKernelLseek(g_fileFd, 0, 2 /*SEEK_END*/);
     sceKernelLseek(g_fileFd, 0, 0 /*SEEK_SET*/);
     g_dbgFileSize = (long long)g_fileSize;
-    notify("Cast: file opened, %lld bytes", (long long)g_fileSize);
+    notify_dbg("Cast: file opened, %lld bytes", (long long)g_fileSize);
     return 0;
 }
 static int cb_file_close(void *p) {
@@ -229,7 +229,7 @@ static int cb_http_open(void *p, const char *filename) {
     }
     g_fileSize = (int64_t)httpsrc_size();
     g_dbgFileSize = (long long)g_fileSize;
-    notify("Cast: http opened, %lld bytes", (long long)g_fileSize);
+    notify_dbg("Cast: http opened, %lld bytes", (long long)g_fileSize);
     return 0;
 }
 static int cb_http_close(void *p) {
@@ -282,7 +282,7 @@ static void on_event(void *p, int32_t eventId, int32_t srcId, void *data) {
         case SCE_AVPLAYER_STATE_PAUSE:     snprintf(g_status, sizeof(g_status), "paused"); break;
         case SCE_AVPLAYER_STATE_BUFFERING: snprintf(g_status, sizeof(g_status), "buffering"); break;
         case SCE_AVPLAYER_STATE_STOP:      snprintf(g_status, sizeof(g_status), "stopped"); g_active = 0; break;
-        case SCE_AVPLAYER_WARNING_ID:      notify("AvPlayer warning"); break;
+        case SCE_AVPLAYER_WARNING_ID:      notify_dbg("AvPlayer warning"); break;
         default: break;
     }
 }
@@ -308,7 +308,7 @@ int player_init(void) {
     int vw  = sceSysmoduleLoadModule((enum OrbisSysModule)0x00D0); // VDECWRAP
     int v1  = sceSysmoduleLoadModule((enum OrbisSysModule)0x008E); // VIDEODEC
     int ad  = sceSysmoduleLoadModule((enum OrbisSysModule)0x0088); // AUDIODEC
-    notify("Cast modules: vdec2=%d vdecw=%d vdec=%d adec=%d", v2, vw, v1, ad);
+    notify_dbg("Cast modules: vdec2=%d vdecw=%d vdec=%d adec=%d", v2, vw, v1, ad);
 
     int avmod = sceSysmoduleLoadModule(ORBIS_SYSMODULE_AV_PLAYER);
     if (avmod < 0) {
@@ -380,7 +380,7 @@ int player_play(const char *url) {
         return -3;
     }
 
-    notify("Cast: 1/4 init (%s)", is_local ? "local file" : (is_remote ? "remote url" : "source"));
+    notify_dbg("Cast: 1/4 init (%s)", is_local ? "local file" : (is_remote ? "remote url" : "source"));
 
     int initRc = player_init();
     if (initRc != 0) {
@@ -543,7 +543,7 @@ int player_render(Gfx *g) {
 
     if (!g_gotFrame) {
         g_gotFrame = 1;
-        notify("Cast: first frame %dx%d", sw, sh);
+        notify_dbg("Cast: first frame %dx%d", sw, sh);
         snprintf(g_status, sizeof(g_status), "playing %dx%d", sw, sh);
     }
 

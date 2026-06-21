@@ -138,14 +138,31 @@ static void *watchdog_main(void *arg) {
 #define FB_H 1080
 #define PORT 8080
 
-static const GfxColor BG     = { 0x0b, 0x10, 0x20 };
-static const GfxColor PANEL  = { 0x15, 0x1c, 0x33 };
-static const GfxColor ACCENT = { 0x3b, 0x82, 0xf6 };
-static const GfxColor WHITE  = { 0xf0, 0xf4, 0xff };
-static const GfxColor MUTED  = { 0x8b, 0x97, 0xc4 };
+// Modern palette (shared with the web UI). Anti-aliased rounded panels, vector
+// icons and gradients carry the polish; see tools/uipreview.c for a desktop
+// renderer used to design these screens.
+static const GfxColor BG_TOP = { 0x12, 0x18, 0x30 };
+static const GfxColor BG_BOT = { 0x06, 0x09, 0x13 };
+static const GfxColor BG     = { 0x06, 0x09, 0x13 };   // init clears
+static const GfxColor SURF   = { 0x18, 0x20, 0x3a };
+static const GfxColor SURF2  = { 0x22, 0x2c, 0x4e };
+static const GfxColor HAIR   = { 0x8a, 0x99, 0xd8 };
+static const GfxColor ACCENT = { 0x5b, 0x8c, 0xff };
+static const GfxColor ACC_LT = { 0x9d, 0xb8, 0xff };
+static const GfxColor LIVE   = { 0x2e, 0xe6, 0xa6 };
+static const GfxColor DANGER = { 0xff, 0x5d, 0x7a };
+static const GfxColor TXT    = { 0xf3, 0xf6, 0xff };
+static const GfxColor MUT    = { 0x9a, 0xa4, 0xc8 };
+static const GfxColor FAINT  = { 0x6b, 0x73, 0x98 };
+static const GfxColor INK    = { 0x07, 0x0a, 0x14 };
+static const GfxColor PAPER  = { 0xf4, 0xf7, 0xff };
 static const GfxColor BLACK  = { 0x00, 0x00, 0x00 };
-static const GfxColor HUD_BG = { 0x06, 0x08, 0x0f };
-static const GfxColor BAR_BG = { 0x24, 0x2b, 0x3d };
+static const GfxColor BTN_X  = { 0x86, 0xa9, 0xff };
+static const GfxColor BTN_O  = { 0xff, 0x73, 0x88 };
+static const GfxColor BTN_T  = { 0x44, 0xe0, 0xa6 };
+// Kept for the (compiled-out) BOOT_MINIMAL diagnostic path.
+static const GfxColor WHITE  = { 0xf3, 0xf6, 0xff };
+static const GfxColor MUTED  = { 0x9a, 0xa4, 0xc8 };
 
 static void text_centered(Gfx *g, int cy, const char *s, int scale, GfxColor c) {
     int w = gfx_text_w(s, scale);
@@ -162,65 +179,158 @@ static void fmt_time(double sec, char *out, int cap) {
     else snprintf(out, cap, "%d:%02d", m, s);
 }
 
-static void draw_qr(Gfx *g, const char *url, int cx, int y, int module) {
+// last path segment of a URL/path (HUD title), without query/fragment
+static void basename_of(const char *url, char *out, int cap) {
+    const char *q = url; while (*q && *q != '?' && *q != '#') q++;
+    const char *slash = q;
+    while (slash > url && slash[-1] != '/') slash--;
+    int n = (int)(q - slash);
+    if (n <= 0 || n >= cap) { strncpy(out, "Now playing", cap - 1); out[cap - 1] = '\0'; return; }
+    memcpy(out, slash, n); out[n] = '\0';
+}
+
+// ---- modern UI helpers (mirrored in tools/uipreview.c) -------------------
+static void thick_line(Gfx *g, float x0, float y0, float x1, float y1, float th, GfxColor c) {
+    float dx = x1 - x0, dy = y1 - y0, len = __builtin_sqrtf(dx * dx + dy * dy);
+    if (len < 0.001f) return;
+    float nx = -dy / len * (th / 2), ny = dx / len * (th / 2);
+    gfx_tri(g, (int)(x0 + nx), (int)(y0 + ny), (int)(x0 - nx), (int)(y0 - ny), (int)(x1 + nx), (int)(y1 + ny), c);
+    gfx_tri(g, (int)(x0 - nx), (int)(y0 - ny), (int)(x1 + nx), (int)(y1 + ny), (int)(x1 - nx), (int)(y1 - ny), c);
+}
+static void gtext(Gfx *g, int x, int y, const char *s, int sc, GfxColor c, int tr) {
+    if (sc >= 4) gfx_text_tr(g, x + 2, y + 2, s, sc, INK, tr);
+    gfx_text_tr(g, x, y, s, sc, c, tr);
+}
+static void ctext(Gfx *g, int cy, const char *s, int sc, GfxColor c, int tr) {
+    int w = gfx_text_tr_w(s, sc, tr);
+    gtext(g, (g->width - w) / 2, cy, s, sc, c, tr);
+}
+static void panel(Gfx *g, int x, int y, int w, int h, int r, GfxColor c, int a) {
+    gfx_round_a(g, x, y + 6, w, h, r, INK, 60);
+    gfx_round_a(g, x, y, w, h, r, c, a);
+    gfx_rect_a(g, x + r, y, w - 2 * r, 1, HAIR, 36);
+}
+static void icon_play(Gfx *g, int cx, int cy, int s, GfxColor c) {
+    gfx_tri(g, cx - (int)(s * 0.28f), cy - (int)(s * 0.5f),
+               cx - (int)(s * 0.28f), cy + (int)(s * 0.5f),
+               cx + (int)(s * 0.50f), cy, c);
+}
+static void icon_pause(Gfx *g, int cx, int cy, int s, GfxColor c) {
+    int bw = (int)(s * 0.28f), bh = s, gap = (int)(s * 0.26f), r = bw / 2;
+    gfx_round(g, cx - gap / 2 - bw, cy - bh / 2, bw, bh, r, c);
+    gfx_round(g, cx + gap / 2, cy - bh / 2, bw, bh, r, c);
+}
+static void icon_cast(Gfx *g, int cx, int cy, int box) {
+    panel(g, cx - box / 2, cy - box / 2, box, box, box / 4, SURF2, 255);
+    int s = (int)(box * 0.60f);
+    int sw = s, sh = (int)(s * 0.64f);
+    int sx = cx - sw / 2, sy = cy - (int)(s * 0.40f);
+    int rr = (int)(s * 0.17f); int th = (int)(s * 0.11f); if (th < 2) th = 2;
+    gfx_round(g, sx, sy, sw, sh, rr, ACC_LT);
+    gfx_round(g, sx + th, sy + th, sw - 2 * th, sh - 2 * th, rr - 1, SURF2);
+    int dx = sx, dy = sy + sh + (int)(s * 0.18f);
+    gfx_circle(g, dx, dy, (int)(s * 0.08f) + 1, LIVE);
+    gfx_arc(g, dx, dy, (int)(s * 0.24f), th, 1, ACCENT);
+    gfx_arc(g, dx, dy, (int)(s * 0.42f), th, 1, ACCENT);
+}
+static void btn_cross(Gfx *g, int cx, int cy, int r, GfxColor c) {
+    float t = r * 0.42f;
+    thick_line(g, cx - r * 0.7f, cy - r * 0.7f, cx + r * 0.7f, cy + r * 0.7f, t, c);
+    thick_line(g, cx - r * 0.7f, cy + r * 0.7f, cx + r * 0.7f, cy - r * 0.7f, t, c);
+}
+static void btn_circle(Gfx *g, int cx, int cy, int r, GfxColor c) {
+    int th = (int)(r * 0.42f); if (th < 2) th = 2;
+    for (int q = 0; q < 4; q++) gfx_arc(g, cx, cy, r, th, q, c);
+}
+static void btn_triangle(Gfx *g, int cx, int cy, int r, GfxColor c) {
+    float t = r * 0.40f;
+    float ax = cx, ay = cy - r;
+    float bx = cx - r * 0.92f, by = cy + r * 0.75f;
+    float dx = cx + r * 0.92f, dy = cy + r * 0.75f;
+    thick_line(g, ax, ay, bx, by, t, c);
+    thick_line(g, bx, by, dx, dy, t, c);
+    thick_line(g, dx, dy, ax, ay, t, c);
+}
+static void draw_qr_card(Gfx *g, const char *url, int cx, int top, int module) {
+    int quiet = 3;
+    int qpix = (QR_SIZE + quiet * 2) * module;
+    int pad = 30;
+    int card = qpix + pad * 2;
+    int x0 = cx - card / 2;
+    panel(g, x0, top, card, card, 26, PAPER, 255);
     QrCode qr;
-    int quiet = 4;
-    int total = (QR_SIZE + quiet * 2) * module;
-    int x0 = cx - total / 2;
-    GfxColor paper = { 0xf8, 0xfa, 0xff };
-    GfxColor ink = { 0x05, 0x09, 0x15 };
-    GfxColor edge = { 0x2a, 0x35, 0x55 };
-
-    gfx_rect(g, x0 - 8, y - 8, total + 16, total + 16, edge);
-    gfx_rect(g, x0, y, total, total, paper);
-    if (qr_make_url(url, &qr) != 0)
-        return;
-
-    for (int yy = 0; yy < QR_SIZE; yy++) {
-        for (int xx = 0; xx < QR_SIZE; xx++) {
-            if (qr.m[yy][xx])
-                gfx_rect(g, x0 + (quiet + xx) * module, y + (quiet + yy) * module, module, module, ink);
-        }
+    if (qr_make_url(url, &qr) != 0) return;
+    int qx = x0 + pad + quiet * module, qy = top + pad + quiet * module;
+    for (int yy = 0; yy < QR_SIZE; yy++)
+        for (int xx = 0; xx < QR_SIZE; xx++)
+            if (qr.m[yy][xx]) gfx_rect(g, qx + xx * module, qy + yy * module, module, module, INK);
+}
+// control hint: PS4 button glyph + label. kinds: 0 cross,1 circle,2 triangle,3 seek
+static int legend(Gfx *g, int x, int cy, int kind, const char *label) {
+    int r = 13, gx = x + r;
+    if (kind == 0) btn_cross(g, gx, cy, r, BTN_X);
+    else if (kind == 1) btn_circle(g, gx, cy, r, BTN_O);
+    else if (kind == 2) btn_triangle(g, gx, cy, r, BTN_T);
+    else {
+        gfx_tri(g, gx + 4, cy, gx + 12, cy - 7, gx + 12, cy + 7, MUT);
+        gfx_tri(g, gx - 4, cy, gx - 12, cy - 7, gx - 12, cy + 7, MUT);
     }
+    gfx_text(g, x + r * 2 + 12, cy - 8, label, 2, MUT);
+    return r * 2 + 12 + gfx_text_w(label, 2) + 40;
+}
+static void draw_legend_row(Gfx *g, int cx, int ly) {
+    struct { int k; const char *l; } items[] = { {0,"Pause"},{1,"Stop"},{3,"Seek"},{2,"Exit"} };
+    int total = 0;
+    for (int i = 0; i < 4; i++) total += 13 * 2 + 12 + gfx_text_w(items[i].l, 2) + 40;
+    int lx = cx - (total - 40) / 2;
+    for (int i = 0; i < 4; i++) lx += legend(g, lx, ly, items[i].k, items[i].l);
 }
 
 static void draw_lobby(Gfx *g, const char *ip, int net_ok) {
-    gfx_clear(g, BG);
+    gfx_vgrad(g, 0, 0, g->width, g->height, BG_TOP, BG_BOT);
+    gfx_rect_a(g, 0, 0, g->width, 360, ACCENT, 14);
+    int W = g->width;
 
-    // Header band
-    gfx_rect(g, 0, 0, g->width, 200, PANEL);
-    gfx_rect(g, 0, 200, g->width, 4, ACCENT);
-    text_centered(g, 78, "PS4 CAST", 8, WHITE);
+    // brand row, centered: logo tile + wordmark
+    int track = 3, ws = 6;
+    const char *wm = "PS4 Cast";
+    int ww = gfx_text_tr_w(wm, ws, track);
+    int box = 92, group = box + 26 + ww, gx = (W - group) / 2, brandCy = 150;
+    icon_cast(g, gx + box / 2, brandCy, box);
+    gtext(g, gx + box + 26, brandCy - (ws * 8) / 2, wm, ws, TXT, track);
+    ctext(g, 250, "WIRELESS CAST RECEIVER", 2, FAINT, 6);
 
     if (net_ok) {
-        char url[64];
+        char url[80];
         snprintf(url, sizeof(url), "http://%s:%d", ip, PORT);
+        draw_qr_card(g, url, W / 2, 320, 9);
+        int below = 320 + ((QR_SIZE + 6) * 9 + 60) + 40;
+        ctext(g, below, "Scan with your phone to open the controls", 3, MUT, 1);
 
-        text_centered(g, 270, "Scan to open the PS4 Cast controls", 3, MUTED);
-        draw_qr(g, url, g->width / 2, 330, 10);
-
-        // URL plate
-        int uw = gfx_text_w(url, 5);
-        int px = (g->width - uw) / 2 - 40;
-        gfx_rect(g, px, 700, uw + 80, 88, PANEL);
-        gfx_rect(g, px, 700, uw + 80, 4, ACCENT);
-        text_centered(g, 724, url, 5, WHITE);
-
-        text_centered(g, 825, "Paste a direct video link, or cast to PS4 Cast from a DLNA app.", 3, MUTED);
+        int uw = gfx_text_tr_w(url, 4, 1);
+        int pw = uw + 64, ph = 64, px = (W - pw) / 2, py = below + 52;
+        panel(g, px, py, pw, ph, ph / 2, SURF2, 235);
+        gfx_circle(g, px + 30, py + ph / 2, 6, LIVE);
+        gtext(g, px + 52, py + (ph - 32) / 2, url, 4, TXT, 1);
+        ctext(g, py + ph + 34, "or cast from any DLNA / UPnP app on your network", 2, FAINT, 1);
     } else {
-        text_centered(g, 430, "No network connection.", 5, WHITE);
-        text_centered(g, 520, "Connect the PS4 to Wi-Fi or LAN, then relaunch.", 3, MUTED);
+        ctext(g, 470, "No network connection", 5, TXT, 1);
+        ctext(g, 560, "Connect the PS4 to Wi-Fi or LAN, then relaunch.", 3, MUT, 1);
     }
 
-    // Status line
-    char st[200];
+    // status chip
+    char st[160];
 #ifdef BOOT_MINIMAL
-    snprintf(st, sizeof(st), "Status: minimal boot diagnostic");
+    snprintf(st, sizeof(st), "minimal boot diagnostic");
 #else
-    snprintf(st, sizeof(st), "Status: %s", player_status());
+    snprintf(st, sizeof(st), "%s", player_status());
 #endif
-    text_centered(g, 900, st, 3, MUTED);
-    text_centered(g, 1000, "Controls:  Triangle Exit    Cross Pause    Circle Stop    D-Pad Seek", 2, MUTED);
+    int sw = gfx_text_w(st, 2) + 60, sx = (W - sw) / 2, sy = 884;
+    panel(g, sx, sy, sw, 44, 22, SURF, 220);
+    gfx_circle(g, sx + 26, sy + 22, 5, net_ok ? LIVE : FAINT);
+    gfx_text(g, sx + 42, sy + 14, st, 2, MUT);
+
+    draw_legend_row(g, W / 2, 984);
 }
 
 #ifndef BOOT_MINIMAL
@@ -322,33 +432,45 @@ static uint32_t pad_poll(PadState *p) {
 static void draw_hud(Gfx *g) {
     double cur = 0, dur = 0;
     player_progress(&cur, &dur);
+    int paused = player_is_paused();
 
-    int y = g->height - 206;
-    gfx_rect(g, 0, y, g->width, 206, HUD_BG);
-    gfx_rect(g, 0, y, g->width, 4, ACCENT);
+    int W = g->width, H = 224, y = g->height - H - 36, x = 40, w = W - 80;
+    panel(g, x, y, w, H, 24, INK, 200);
+    int pad = 34;
 
-    char curS[24], durS[24], leftS[24], line[220];
+    // now-playing badge + title
+    int bx = x + pad, by = y + 26, bs = 56;
+    panel(g, bx, by, bs, bs, 14, SURF2, 255);
+    if (paused) icon_pause(g, bx + bs / 2, by + bs / 2, 22, ACC_LT);
+    else icon_play(g, bx + bs / 2 + 2, by + bs / 2, 24, ACC_LT);
+
+    char title[160];
+    basename_of(httpd_last_push(), title, sizeof(title));
+    gtext(g, bx + bs + 20, by + 2, title, 3, TXT, 0);
+    gfx_text(g, bx + bs + 20, by + 32, paused ? "Paused" : player_status(), 2, MUT);
+
+    // state pill
+    const char *badge = paused ? "PAUSED" : "PLAYING";
+    int pw = gfx_text_w(badge, 2) + 44, px = x + w - pad - pw, py = by + 8;
+    panel(g, px, py, pw, 34, 17, SURF2, 255);
+    gfx_circle(g, px + 20, py + 17, 5, paused ? FAINT : LIVE);
+    gfx_text(g, px + 34, py + 9, badge, 2, paused ? MUT : LIVE);
+
+    // progress bar with knob
+    char curS[24], durS[24];
     fmt_time(cur, curS, sizeof(curS));
     fmt_time(dur, durS, sizeof(durS));
-    fmt_time((dur > cur) ? (dur - cur) : 0, leftS, sizeof(leftS));
+    int barX = x + pad, barY = y + 118, barW = w - pad * 2, barH = 8;
+    gfx_round(g, barX, barY, barW, barH, barH / 2, SURF2);
+    float p = dur > 0 ? (float)(cur / dur) : 0; if (p < 0) p = 0; if (p > 1) p = 1;
+    int fw = (int)(barW * p);
+    if (fw > barH) gfx_round(g, barX, barY, fw, barH, barH / 2, ACCENT);
+    gfx_circle(g, barX + fw, barY + barH / 2, 11, TXT);
+    gfx_circle(g, barX + fw, barY + barH / 2, 5, ACCENT);
+    gfx_text(g, barX, barY + 24, curS, 2, MUT);
+    gfx_text(g, barX + barW - gfx_text_w(durS, 2), barY + 24, durS, 2, MUT);
 
-    snprintf(line, sizeof(line), "%s   %s / %s   -%s",
-             player_is_paused() ? "Paused" : player_status(), curS, durS, leftS);
-    gfx_text(g, 56, y + 28, line, 3, WHITE);
-
-    char dbg[220];
-    player_debug(dbg, sizeof(dbg));
-    gfx_text(g, 56, y + 62, dbg, 2, MUTED);
-
-    int bx = 56, by = y + 126, bw = g->width - 112, bh = 18;
-    gfx_rect(g, bx, by, bw, bh, BAR_BG);
-    if (dur > 0) {
-        int fill = (int)((cur / dur) * bw);
-        if (fill < 0) fill = 0;
-        if (fill > bw) fill = bw;
-        gfx_rect(g, bx, by, fill, bh, ACCENT);
-    }
-    gfx_text(g, 56, y + 166, "Cross Pause   Circle Stop   L/R/D-Pad Seek   Triangle Exit", 2, MUTED);
+    draw_legend_row(g, W / 2, y + H - 30);
 }
 #endif
 
@@ -481,32 +603,30 @@ int main(void) {
             if (drew) {
                 everDrew = 1;
             } else if (!everDrew) {
-                gfx_clear(&g, BLACK);
-                text_centered(&g, 460, "Buffering...", 4, WHITE);
+                gfx_vgrad(&g, 0, 0, g.width, g.height, BG_TOP, BG_BOT);
+                int pw = 720, ph = 264, px = (g.width - pw) / 2, py = (g.height - ph) / 2;
+                panel(&g, px, py, pw, ph, 24, SURF, 235);
+                icon_cast(&g, g.width / 2, py + 84, 96);
+                ctext(&g, py + 156, "Connecting...", 4, TXT, 1);
                 char st[200];
                 snprintf(st, sizeof(st), "%s", player_status());
-                text_centered(&g, 540, st, 3, MUTED);
-                char dbg[200];
-                player_debug(dbg, sizeof(dbg));
-                text_centered(&g, 620, dbg, 3, ACCENT);
+                ctext(&g, py + 212, st, 2, MUT, 0);
             }
             // if !drew && everDrew: keep the previous frame (no black flicker)
 
             // Mid-playback stall: overlay a buffering panel on the held frame so
             // it's clear what's happening, with a live buffer gauge + controls.
             if (everDrew && player_buffering()) {
-                int pw = 620, ph = 170, px = (g.width - pw) / 2, py = (g.height - ph) / 2;
-                gfx_rect(&g, px, py, pw, ph, HUD_BG);
-                gfx_rect(&g, px, py, pw, 4, ACCENT);
+                int pw = 560, ph = 188, px = (g.width - pw) / 2, py = (g.height - ph) / 2;
+                panel(&g, px, py, pw, ph, 22, INK, 225);
                 char b[80];
-                snprintf(b, sizeof(b), "Buffering   %d%%", player_buffer_pct());
-                text_centered(&g, py + 40, b, 5, WHITE);
-                // gauge bar
-                int gx = px + 60, gy = py + 96, gw = pw - 120, gh = 16;
-                gfx_rect(&g, gx, gy, gw, gh, BAR_BG);
+                snprintf(b, sizeof(b), "Buffering  %d%%", player_buffer_pct());
+                ctext(&g, py + 38, b, 4, TXT, 1);
+                int gx = px + 50, gy = py + 106, gw = pw - 100, gh = 10;
+                gfx_round(&g, gx, gy, gw, gh, gh / 2, SURF2);
                 int fillw = gw * player_buffer_pct() / 100; if (fillw < 0) fillw = 0; if (fillw > gw) fillw = gw;
-                gfx_rect(&g, gx, gy, fillw, gh, ACCENT);
-                text_centered(&g, py + 132, "(O) Stop    (left) seek back", 3, MUTED);
+                if (fillw > gh) gfx_round(&g, gx, gy, fillw, gh, gh / 2, ACCENT);
+                ctext(&g, py + 140, "Circle  Stop      Left  seek back", 2, MUT, 0);
                 hudUntil = sceKernelGetProcessTime() + 2000000ULL;  // keep HUD visible too
             }
 
