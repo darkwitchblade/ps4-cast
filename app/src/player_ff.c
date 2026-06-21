@@ -652,9 +652,12 @@ static int build_scaled(AVFrame *fr, Gfx *g) {
         sws_freeContext(g_sws); g_sws = NULL;
     }
     if (!g_sws) {
+        // FAST_BILINEAR: the software present (HLS path) was dropping frames because
+        // the single-threaded 720p->1080p upscale couldn't sustain 30fps. Fast
+        // bilinear is materially cheaper at near-identical quality for upscales.
         g_sws = sws_getContext(sw, sh, srcFmt,
                                scaledW, scaledH, AV_PIX_FMT_BGRA,
-                               SWS_BILINEAR, NULL, NULL, NULL);
+                               SWS_FAST_BILINEAR, NULL, NULL, NULL);
         if (!g_sws) return -1;
         g_swsSrcW = sw; g_swsSrcH = sh; g_swsSrcFmt = (int)srcFmt;
     }
