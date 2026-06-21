@@ -408,14 +408,21 @@ int player_play(const char *url) {
     // runtime toggle being off) cleanly falls back to software below.
     AVCodecParameters *vpar = g_fmt->streams[g_vstream]->codecpar;
     g_useHw = 0;
-    // HLS TS streams can contain segment-boundary/discontinuity cases that the
-    // current low-level sceVideodec2 path does not survive yet. Keep HLS on the
-    // robust ffmpeg path for now; direct MP4/H.264 still uses hardware.
-    if (g_hwEnabled && !g_isHls && vpar->codec_id == AV_CODEC_ID_H264) {
-        const AVBitStreamFilter *bf = av_bsf_get_by_name("h264_mp4toannexb");
-        if (bf && av_bsf_alloc(bf, &g_bsf) == 0 &&
-            avcodec_parameters_copy(g_bsf->par_in, vpar) >= 0 &&
-            av_bsf_init(g_bsf) == 0) {
+    g_hlsSegDemux = g_isHls && hls_can_segment_demux();
+    // Hardware H.264: direct MP4 (needs the mp4->annexb bitstream filter) or live
+    // HLS via the segment-demux path (MPEG-TS packets are already annex-b, so no
+    // bsf). The plain AVIO-concatenated HLS path (no seg-demux) stays software.
+    int hwEligible = g_hwEnabled && vpar->codec_id == AV_CODEC_ID_H264 &&
+                     (!g_isHls || g_hlsSegDemux);
+    if (hwEligible) {
+        int bsfOk = 1;
+        if (!g_isHls) {     // MP4/AVCC source -> convert to annex-b for the decoder
+            const AVBitStreamFilter *bf = av_bsf_get_by_name("h264_mp4toannexb");
+            bsfOk = (bf && av_bsf_alloc(bf, &g_bsf) == 0 &&
+                     avcodec_parameters_copy(g_bsf->par_in, vpar) >= 0 &&
+                     av_bsf_init(g_bsf) == 0);
+        }
+        if (bsfOk) {
             g_hwPkt = av_packet_alloc();                  // allocate BEFORE enabling HW
             if (g_hwPkt && vdec_hw_open(vpar->width, vpar->height,
                                         vpar->profile > 0 ? vpar->profile : 0,
@@ -425,7 +432,8 @@ int player_play(const char *url) {
                 g_hwReorder = vpar->video_delay;          // B-frame reorder depth (adapts at runtime)
                 if (g_hwReorder < 0) g_hwReorder = 0;
                 if (g_hwReorder >= HW_REORDER) g_hwReorder = HW_REORDER - 1;
-                notify("PS4 Cast: HW H.264 %dx%d reorder=%d (%s)", vpar->width, vpar->height, g_hwReorder, vdec_hw_debug());
+                notify("PS4 Cast: HW H.264 %dx%d reorder=%d %s (%s)", vpar->width, vpar->height,
+                       g_hwReorder, g_hlsSegDemux ? "hls-seg" : "direct", vdec_hw_debug());
             }
         }
         if (!g_useHw) {     // HW unavailable -> tear down the half-built HW state
@@ -844,6 +852,33 @@ static void decode_video_hw(AVPacket *pkt) {
     }
 }
 
+// HLS segment-demux hardware path: MPEG-TS packets are already annex-b (SPS/PPS
+// in-band, one access unit per packet), so feed them straight to the GPU decoder
+// — no bitstream filter. Unlike the direct path, the queue stores PTS in
+// microseconds (frame_pts_us returns it verbatim for seg-demux), so convert from
+// the segment time_base here before the reorder buffer.
+static void decode_video_hw_seg(AVPacket *pkt, AVRational vtb) {
+    VdecHwFrame hf;
+    int got = vdec_hw_decode(pkt->data, pkt->size, pkt->pts, pkt->dts, &hf);
+    if (got != 1) return;
+    AVFrame *cl = av_frame_alloc();
+    if (!cl) return;
+    cl->format = AV_PIX_FMT_NV12; cl->width = hf.width; cl->height = hf.height;
+    if (av_frame_get_buffer(cl, 32) < 0) { av_frame_free(&cl); return; }
+    for (int y = 0; y < hf.height; y++)
+        memcpy(cl->data[0] + (size_t)y * cl->linesize[0], hf.y + (size_t)y * hf.pitch, hf.width);
+    for (int y = 0; y < hf.height / 2; y++)
+        memcpy(cl->data[1] + (size_t)y * cl->linesize[1], hf.uv + (size_t)y * hf.pitch, hf.width);
+    int64_t ptsUs = (hf.pts == AV_NOPTS_VALUE) ? (int64_t)g_frames * 33333
+                                               : (int64_t)(hf.pts * av_q2d(vtb) * 1000000.0);
+    cl->pts = ptsUs; cl->best_effort_timestamp = ptsUs;
+    g_frames++;
+    if (g_lastEmitPts != AV_NOPTS_VALUE && cl->pts < g_lastEmitPts && g_hwReorder < HW_REORDER - 1)
+        g_hwReorder++;
+    if (g_roN < HW_REORDER) g_ro[g_roN++] = cl; else av_frame_free(&cl);
+    while (g_roN > g_hwReorder) ro_emit_one();
+}
+
 // ---- parallel NV12 present (hardware path) --------------------------------
 // Hardware decode freed all 6 CPU cores, so we use them to do the NV12->BGRA
 // colour-convert + scale that single-threaded couldn't sustain at 1080p. Worker
@@ -1133,9 +1168,8 @@ static void *decode_segment_thread_main(void *arg) {
         if (rc != 0 || !segBuf || segLen <= 0) { if (segBuf) free(segBuf); sceKernelUsleep(100000); continue; }
         if (resetGen != g_hlsResetGen) {
             trace_mark("segdemux reset old=%d new=%d", g_hlsResetGen, resetGen);
-            apply_hls_reset();
-            if (g_vdec) avcodec_flush_buffers(g_vdec);
-            if (g_adec) avcodec_flush_buffers(g_adec);
+            apply_hls_reset();   // flushes g_vdec/g_adec + audio + fq
+            if (g_useHw) { ro_clear(); vdec_hw_reset(); g_lastEmitPts = AV_NOPTS_VALUE; }
             g_hlsResetGen = resetGen;
         }
 
@@ -1185,12 +1219,17 @@ static void *decode_segment_thread_main(void *arg) {
             }
             if (sv < 0 || g_pkt->stream_index != sv) { av_packet_unref(g_pkt); continue; }
             g_videoPkts++; segVideo++;
-            if (avcodec_send_packet(g_vdec, g_pkt) < 0) { av_packet_unref(g_pkt); continue; }
-            av_packet_unref(g_pkt);
-            queue_sw_frame_us(vtb);
+            if (g_useHw) {
+                decode_video_hw_seg(g_pkt, vtb);
+                av_packet_unref(g_pkt);
+            } else {
+                if (avcodec_send_packet(g_vdec, g_pkt) < 0) { av_packet_unref(g_pkt); continue; }
+                av_packet_unref(g_pkt);
+                queue_sw_frame_us(vtb);
+            }
         }
         trace_mark("segdemux eof pkts=%d v=%d a=%d rc=%d fr=%ld q=%d", segPkts, segVideo, segAudio, rc, g_frames, g_fqCount);
-        queue_sw_frame_us(vtb);
+        if (!g_useHw) queue_sw_frame_us(vtb);
         close_segment_demux(&sfmt, &savio);
         trace_mark("segdemux closed fr=%ld q=%d", g_frames, g_fqCount);
         free(segBuf);
