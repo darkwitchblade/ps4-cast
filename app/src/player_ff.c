@@ -167,10 +167,15 @@ static void  seg_readahead_stop(void);
 // Raw segments are ~1MB each (far cheaper to buffer than decoded frames). The
 // ring depth is the "headstart" that rides over fetch-latency dips. If the
 // thread/ring fails to start, decode falls back to fetching inline.
+// Bounded by BOTH a slot count AND a byte budget: small segments use all 3 slots
+// (~9s cushion); large-segment streams cap at the byte budget so RAM can't blow
+// up (always keep >=1 buffered so a single huge segment can't deadlock).
 #define SEG_RING 3
+#define SEG_BUDGET_BYTES (24 * 1024 * 1024)
 typedef struct { uint8_t *buf; int len; int gen; } SegSlot;
 static SegSlot           g_segRing[SEG_RING];
 static int               g_srHead, g_srCount;
+static long              g_srBytes;       // total bytes buffered in the ring
 static OrbisPthreadMutex g_srMtx;
 static OrbisPthreadCond  g_srNotFull, g_srNotEmpty;
 static OrbisPthread      g_segFetchThread;
@@ -1129,11 +1134,16 @@ static void *decode_thread_main(void *arg) {
 
 static int seg_ring_push(uint8_t *buf, int len, int gen) {
     scePthreadMutexLock(&g_srMtx);
-    while (!g_segFetchStop && g_srCount >= SEG_RING)
+    // Block while full by slot count OR by byte budget — but always allow the
+    // first segment in (g_srCount == 0) so one oversized segment can't deadlock.
+    while (!g_segFetchStop &&
+           (g_srCount >= SEG_RING ||
+            (g_srCount > 0 && g_srBytes + (long)len > SEG_BUDGET_BYTES)))
         scePthreadCondWait(&g_srNotFull, &g_srMtx);
     if (g_segFetchStop) { scePthreadMutexUnlock(&g_srMtx); return 0; }
     g_segRing[(g_srHead + g_srCount) % SEG_RING] = (SegSlot){ buf, len, gen };
     g_srCount++;
+    g_srBytes += (long)len;
     scePthreadCondSignal(&g_srNotEmpty);
     scePthreadMutexUnlock(&g_srMtx);
     return 1;
@@ -1149,6 +1159,7 @@ static int seg_ring_pop(uint8_t **buf, int *len, int *gen) {
     g_segRing[g_srHead].buf = NULL;
     g_srHead = (g_srHead + 1) % SEG_RING;
     g_srCount--;
+    g_srBytes -= (long)s.len;
     scePthreadCondSignal(&g_srNotFull);
     scePthreadMutexUnlock(&g_srMtx);
     *buf = s.buf; *len = s.len; *gen = s.gen;
@@ -1165,6 +1176,7 @@ static void seg_ring_flush(void) {
         g_srCount--;
     }
     g_srHead = g_srCount = 0;
+    g_srBytes = 0;
     scePthreadMutexUnlock(&g_srMtx);
 }
 
@@ -1184,7 +1196,7 @@ static void *seg_fetch_thread_main(void *arg) {
 // Bring up the read-ahead ring + fetch thread. On any failure, leaves
 // g_segReadAhead = 0 so decode fetches inline (no read-ahead, still works).
 static void seg_readahead_start(void) {
-    g_srHead = g_srCount = 0; g_segFetchStop = 0; g_segReadAhead = 0; g_segFetchUp = 0;
+    g_srHead = g_srCount = 0; g_srBytes = 0; g_segFetchStop = 0; g_segReadAhead = 0; g_segFetchUp = 0;
     for (int i = 0; i < SEG_RING; i++) g_segRing[i].buf = NULL;
     if (scePthreadMutexInit(&g_srMtx, NULL, "ps4cast_sr") != 0) return;
     if (scePthreadCondInit(&g_srNotFull, NULL, "ps4cast_srnf") != 0) { scePthreadMutexDestroy(&g_srMtx); return; }
