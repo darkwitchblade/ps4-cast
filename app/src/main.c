@@ -88,6 +88,7 @@ static void fatal_signal(int sig, struct __siginfo *info, void *uap) {
     unsigned long a = info ? (unsigned long)info->si_addr : 0;
     int n = snprintf(b, sizeof(b), "CRASH v" APP_VER " sig=%d addr=0x%lx\n", sig, a);
     persist_crash(b, n);
+    gfx_emergency_release();   // release display/GPU so the exit is reclaimable, not unkillable
     _exit(0);
 }
 static void install_fatal_handlers(void) {
@@ -119,6 +120,10 @@ static void *watchdog_main(void *arg) {
         if (hb == 0) continue;                            // main loop not running yet
         uint64_t now = sceKernelGetProcessTime();
         if (now > hb && (now - hb) > 15ULL * 1000 * 1000) { // ~15s with zero progress = frozen
+            // Release the display/GPU FIRST so the exit is reclaimable (not
+            // unkillable) — do this before the crash-log write, which could
+            // itself stall on a frozen /data mount and gate the recovery.
+            gfx_emergency_release();
             char b[96];
             int n = snprintf(b, sizeof(b), "HANG v" APP_VER " watchdog stale=%llums\n",
                              (unsigned long long)((now - hb) / 1000));

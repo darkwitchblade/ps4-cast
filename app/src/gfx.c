@@ -16,6 +16,10 @@
 // the full 60Hz flip rate.
 #define GFX_BUFFERS 3
 
+// Set in gfx_init; used by gfx_emergency_release to tear down the display/GPU
+// context on a fatal exit so the process stays reclaimable (not unkillable).
+static Gfx *g_gfx = NULL;
+
 // Pixel format used by sceVideoOut here is 32-bit; the proven sample encodes
 // 0x80000000 | (r<<16)|(g<<8)|b into each uint32 of the buffer.
 static inline uint32_t encode(GfxColor c) {
@@ -72,19 +76,36 @@ int gfx_init(Gfx *g, int width, int height) {
         return -5;
 
     sceVideoOutSetFlipRate(g->video, 0);
+    g_gfx = g;                 // for gfx_emergency_release on a fatal exit
     return 0;
+}
+
+// Best-effort release of the display + GPU context. A bare _exit() with a flip
+// still registered/queued leaves the VideoOut scanout context wedged so the
+// kernel cannot reclaim it — the app becomes UNKILLABLE (the system menu can't
+// close it; only a power-cycle clears it). Quiescing the GPU ring and closing
+// the video-out here lets a recoverable fault exit cleanly instead. Idempotent;
+// safe to call from the watchdog / fatal paths. _exit still follows as the
+// guaranteed fallback, so even if these calls no-op we still terminate.
+void gfx_emergency_release(void) {
+    Gfx *g = g_gfx;
+    if (!g) return;
+    g_gfx = NULL;                                  // run once
+    sceGnmSubmitDone();                            // quiesce GPU work (graphics + compute)
+    if (g->video >= 0) { sceVideoOutClose(g->video); g->video = -1; }
 }
 
 // Fail-closed: a display/GPU fault surfaces here (flip submit error, or flips
 // stop completing). Rather than let the app limp on as "shadow playback" with a
 // dead display — which the system eventually turns into the "error has occurred"
-// dialog while our CPU threads keep running — record a precise reason and exit
-// cleanly. A clean exit also avoids the system crash dialog.
+// dialog while our CPU threads keep running — record a precise reason, RELEASE
+// the display/GPU context (so the exit is reclaimable, not unkillable), and exit.
 static void gfx_fatal(const char *what, int rc) {
     char b[128];
     int n = snprintf(b, sizeof(b), "GFX-FAULT v" APP_VER " %s rc=%d\n", what, rc);
     int fd = sceKernelOpen("/data/ps4cast_crash.log", 0x0201 /*WRONLY|CREAT*/ | 0x0400 /*TRUNC*/, 0666);
     if (fd >= 0) { sceKernelWrite(fd, b, (size_t)n); sceKernelClose(fd); }
+    gfx_emergency_release();
     _exit(0);
 }
 
