@@ -25,6 +25,14 @@ while true; do
   elif ! echo "$st" | grep -q '"status":"playing'; then
     curl -s -m6 -X POST "http://$PS4:8080/play" --data "$URL" >/dev/null 2>&1
     echo "[$(date +%H:%M:%S)] (re)cast live sim (was idle/stopped)" >> "$LOG"
+  else
+    # If the app drifts far behind the live edge (lag huge), re-cast to reset to
+    # the edge so the soak keeps exercising fresh live decode rather than chasing.
+    lag=$(echo "$st" | sed -n 's/.*lag=\([0-9]*\)ms.*/\1/p')
+    if [ -n "$lag" ] && [ "$lag" -gt 15000 ]; then
+      curl -s -m6 -X POST "http://$PS4:8080/play" --data "$URL" >/dev/null 2>&1
+      echo "[$(date +%H:%M:%S)] re-cast (lag=${lag}ms > 15s, resetting to live edge)" >> "$LOG"
+    fi
   fi
   sleep 20
 done
