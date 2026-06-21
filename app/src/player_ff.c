@@ -8,6 +8,7 @@
 #include "player.h"
 #include "httpsrc.h"
 #include "hls.h"
+#include "aseg.h"
 #include "audio.h"
 #include "notify.h"
 #include "vdec_hw.h"
@@ -157,6 +158,25 @@ static double            g_resumeSec = 2.0;    // buffered-seconds needed to res
 static void  fq_flush(void);
 static void  ro_clear(void);
 static void  apply_hls_reset(void);
+static void  seg_readahead_start(void);
+static void  seg_readahead_stop(void);
+
+// ---- live HLS segment read-ahead -----------------------------------------
+// A dedicated fetch thread pulls TS segments ahead of decode into a small ring,
+// so the decode thread never blocks on the ~1.4s per-segment network fetch.
+// Raw segments are ~1MB each (far cheaper to buffer than decoded frames). The
+// ring depth is the "headstart" that rides over fetch-latency dips. If the
+// thread/ring fails to start, decode falls back to fetching inline.
+#define SEG_RING 3
+typedef struct { uint8_t *buf; int len; int gen; } SegSlot;
+static SegSlot           g_segRing[SEG_RING];
+static int               g_srHead, g_srCount;
+static OrbisPthreadMutex g_srMtx;
+static OrbisPthreadCond  g_srNotFull, g_srNotEmpty;
+static OrbisPthread      g_segFetchThread;
+static volatile int      g_segFetchStop;
+static int               g_segFetchUp;       // fetch thread joined-state tracking
+static int               g_segReadAhead;     // 1 = decode pops ring; 0 = inline fetch
 static void *decode_segment_thread_main(void *arg);
 static void  present_pool_start(void);
 static void  present_pool_stop(void);
@@ -214,19 +234,28 @@ void player_stop(void) {
 #if PLAYER_DECODE_THREAD
     if (g_threaded) {
         g_decStop = 1;
+        g_segFetchStop = 1;
         httpsrc_abort();   // unblock the decode thread if stuck in a network read
+        if (g_segReadAhead) {           // unblock decode pop / fetch push on the ring
+            aseg_abort();
+            scePthreadMutexLock(&g_srMtx);
+            scePthreadCondSignal(&g_srNotFull);
+            scePthreadCondSignal(&g_srNotEmpty);
+            scePthreadMutexUnlock(&g_srMtx);
+        }
         scePthreadMutexLock(&g_fqMtx);
         scePthreadCondSignal(&g_fqNotFull);
         scePthreadCondSignal(&g_fqNotEmpty);
         scePthreadMutexUnlock(&g_fqMtx);
         scePthreadJoin(g_decThread, NULL);
+        seg_readahead_stop();           // join fetch thread, free buffered segs, destroy ring
         fq_flush();
         scePthreadCondDestroy(&g_fqNotFull);
         scePthreadCondDestroy(&g_fqNotEmpty);
         scePthreadMutexDestroy(&g_fqMtx);
         g_threaded = 0;
     }
-    g_decStop = 0; g_decEof = 0;
+    g_decStop = 0; g_decEof = 0; g_segFetchStop = 0;
 #endif
     // Stop the separate-audio thread before tearing down its demuxer/decoder.
     if (g_audioThreadUp) {
@@ -487,6 +516,10 @@ int player_play(const char *url) {
         scePthreadAttrSetstacksize(&dattr, 8 * 1024 * 1024);
         pdattr = &dattr;
     }
+    // Bring up segment read-ahead BEFORE the decode thread so exactly one path
+    // (the fetch thread) advances the HLS segment index — no double-fetch race.
+    // If it fails to start, g_segReadAhead stays 0 and decode fetches inline.
+    if (g_hlsSegDemux) seg_readahead_start();
     int dcr = scePthreadCreate(&g_decThread, pdattr,
                                g_hlsSegDemux ? decode_segment_thread_main : decode_thread_main,
                                NULL, "ps4cast_dec");
@@ -630,9 +663,9 @@ static void apply_hls_reset(void) {
 void player_debug(char *out, int len) {
     double ahead = (g_bytesPerSec > 0) ? (double)httpsrc_ahead_bytes() / g_bytesPerSec : 0;
     snprintf(out, len,
-             "ff%s%s%s %dx%d | fr=%ld drop=%ld q=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d | as=%d%s%s %s | %s",
+             "ff%s%s%s %dx%d | fr=%ld drop=%ld q=%d/%d ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d | as=%d%s%s %s | %s",
              g_useHw ? "/HW" : "", g_isHls ? (g_hlsSegDemux ? "/hls-seg" : "/hls") : "", g_threaded ? "/T" : "", g_srcW, g_srcH,
-             g_frames, g_drops, g_fqCount, FQ_SLOTS, g_rebufTotal, ahead,
+             g_frames, g_drops, g_fqCount, FQ_SLOTS, g_srCount, SEG_RING, g_rebufTotal, ahead,
              (long long)(g_lastLagUs / 1000), g_lastErr,
              g_sepAudioMode ? g_aastream : g_astream, g_sepAudioMode ? "/sep" : "",
              (g_sepAudioMode && g_sepAudioEof) ? "/eof" : "",
@@ -1094,6 +1127,95 @@ static void *decode_thread_main(void *arg) {
     return NULL;
 }
 
+static int seg_ring_push(uint8_t *buf, int len, int gen) {
+    scePthreadMutexLock(&g_srMtx);
+    while (!g_segFetchStop && g_srCount >= SEG_RING)
+        scePthreadCondWait(&g_srNotFull, &g_srMtx);
+    if (g_segFetchStop) { scePthreadMutexUnlock(&g_srMtx); return 0; }
+    g_segRing[(g_srHead + g_srCount) % SEG_RING] = (SegSlot){ buf, len, gen };
+    g_srCount++;
+    scePthreadCondSignal(&g_srNotEmpty);
+    scePthreadMutexUnlock(&g_srMtx);
+    return 1;
+}
+
+// Blocks until a segment is ready. Returns 0 (out params set) or -1 on stop.
+static int seg_ring_pop(uint8_t **buf, int *len, int *gen) {
+    scePthreadMutexLock(&g_srMtx);
+    while (!g_decStop && g_srCount == 0)
+        scePthreadCondWait(&g_srNotEmpty, &g_srMtx);
+    if (g_srCount == 0) { scePthreadMutexUnlock(&g_srMtx); return -1; }
+    SegSlot s = g_segRing[g_srHead];
+    g_segRing[g_srHead].buf = NULL;
+    g_srHead = (g_srHead + 1) % SEG_RING;
+    g_srCount--;
+    scePthreadCondSignal(&g_srNotFull);
+    scePthreadMutexUnlock(&g_srMtx);
+    *buf = s.buf; *len = s.len; *gen = s.gen;
+    return 0;
+}
+
+static void seg_ring_flush(void) {
+    scePthreadMutexLock(&g_srMtx);
+    while (g_srCount > 0) {
+        uint8_t *b = g_segRing[g_srHead].buf;
+        if (b) free(b);
+        g_segRing[g_srHead].buf = NULL;
+        g_srHead = (g_srHead + 1) % SEG_RING;
+        g_srCount--;
+    }
+    g_srHead = g_srCount = 0;
+    scePthreadMutexUnlock(&g_srMtx);
+}
+
+static void *seg_fetch_thread_main(void *arg) {
+    (void)arg;
+    while (!g_segFetchStop) {
+        if (g_paused) { sceKernelUsleep(8000); continue; }
+        uint8_t *buf = NULL; int len = 0, gen = 0;
+        int rc = hls_next_segment(&buf, &len, &gen);
+        if (g_segFetchStop) { if (buf) free(buf); break; }
+        if (rc != 0 || !buf || len <= 0) { if (buf) free(buf); sceKernelUsleep(100000); continue; }
+        if (!seg_ring_push(buf, len, gen)) { free(buf); break; }
+    }
+    return NULL;
+}
+
+// Bring up the read-ahead ring + fetch thread. On any failure, leaves
+// g_segReadAhead = 0 so decode fetches inline (no read-ahead, still works).
+static void seg_readahead_start(void) {
+    g_srHead = g_srCount = 0; g_segFetchStop = 0; g_segReadAhead = 0; g_segFetchUp = 0;
+    for (int i = 0; i < SEG_RING; i++) g_segRing[i].buf = NULL;
+    if (scePthreadMutexInit(&g_srMtx, NULL, "ps4cast_sr") != 0) return;
+    if (scePthreadCondInit(&g_srNotFull, NULL, "ps4cast_srnf") != 0) { scePthreadMutexDestroy(&g_srMtx); return; }
+    if (scePthreadCondInit(&g_srNotEmpty, NULL, "ps4cast_srne") != 0) {
+        scePthreadCondDestroy(&g_srNotFull); scePthreadMutexDestroy(&g_srMtx); return;
+    }
+    if (scePthreadCreate(&g_segFetchThread, NULL, seg_fetch_thread_main, NULL, "ps4cast_segf") != 0) {
+        scePthreadCondDestroy(&g_srNotEmpty); scePthreadCondDestroy(&g_srNotFull); scePthreadMutexDestroy(&g_srMtx);
+        return;
+    }
+    g_segFetchUp = 1; g_segReadAhead = 1;
+}
+
+// Stop + join the fetch thread and free buffered segments. Safe to call when the
+// ring was never started (g_segReadAhead == 0).
+static void seg_readahead_stop(void) {
+    if (!g_segReadAhead) return;
+    g_segFetchStop = 1;
+    aseg_abort();                       // unblock an in-flight segment fetch
+    scePthreadMutexLock(&g_srMtx);
+    scePthreadCondSignal(&g_srNotFull);
+    scePthreadCondSignal(&g_srNotEmpty);
+    scePthreadMutexUnlock(&g_srMtx);
+    if (g_segFetchUp) { scePthreadJoin(g_segFetchThread, NULL); g_segFetchUp = 0; }
+    seg_ring_flush();
+    scePthreadCondDestroy(&g_srNotEmpty);
+    scePthreadCondDestroy(&g_srNotFull);
+    scePthreadMutexDestroy(&g_srMtx);
+    g_segReadAhead = 0;
+}
+
 static int open_segment_demux(uint8_t *segBuf, int segLen, MemAvio *mem,
                               AVFormatContext **outFmt, AVIOContext **outAvio) {
     *outFmt = NULL; *outAvio = NULL;
@@ -1163,7 +1285,9 @@ static void *decode_segment_thread_main(void *arg) {
         uint8_t *segBuf = NULL;
         int segLen = 0;
         int resetGen = 0;
-        int rc = hls_next_segment(&segBuf, &segLen, &resetGen);
+        int rc;
+        if (g_segReadAhead) rc = seg_ring_pop(&segBuf, &segLen, &resetGen);   // fetched ahead
+        else                rc = hls_next_segment(&segBuf, &segLen, &resetGen); // inline fallback
         if (g_decStop) { if (segBuf) free(segBuf); break; }
         if (rc != 0 || !segBuf || segLen <= 0) { if (segBuf) free(segBuf); sceKernelUsleep(100000); continue; }
         if (resetGen != g_hlsResetGen) {
