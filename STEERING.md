@@ -65,5 +65,9 @@ The stream is live muxed TS with `EXT-X-DISCONTINUITY-SEQUENCE`; crash hits ~9s 
 
 **Already fixed (safe, build-verified, no device test needed):** the `g_sws` over-read — it now rebuilds when the SOURCE resolution/format changes, not just the output size (player_ff.c build_scaled). This is a real memory-safety bug independent of the above.
 
-## Dismissing the crash dialog automatically
-You asked if a crash dialog can be auto-dismissed. The app can't dismiss the *system* crash dialog from inside (it's already dead). Options to explore: a control payload that sends the "OK/close" to the shell, or preventing the dialog entirely by always exiting cleanly (the watchdog + fatal-signal handler aim for this). Needs your input on acceptable approach.
+## Dev pipeline / crash auto-recovery (v03.02) — IMPLEMENTED
+Goal: tolerate crashes during autonomous test loops without getting stuck.
+- **Capture:** signal crashes write `CRASH v.. sig=.. addr=..` to /data; hangs now write `HANG v.. stale=..ms` (freeze-watchdog) — both readable via GET /crashlog. (Earlier gap: hangs left an empty log; fixed.)
+- **Dialog:** the fatal-signal handler and the freeze-watchdog both `_exit(0)` (clean exit) → this PREVENTS the system CE-error dialog from appearing at all. So there's normally no dialog to dismiss. (A hard fault that bypasses the handler could still raise a modal needing a manual OK — rare; true pad-injection dismiss remains a future option if it ever shows up.)
+- **Recover:** `scripts/auto-recover.sh` — detects down/hung app (NORESP + console alive), captures /crashlog, then force-kill (`ps4cast-kill.bin`) + relaunch (`ps4cast-launch.bin`) via :9090 with retries. **Verified end-to-end** (killed app → recovered on attempt 1 → plays). Use it in/around test loops to self-heal.
+- **Remaining limit:** if GoldHEN `:9090` itself stops accepting (the flaky/single-shot loader, as happened once), auto-recover can't relaunch and reports "re-arm needed" — the one case still requiring you. A more persistent loader payload would close this gap.
