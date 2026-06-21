@@ -51,6 +51,7 @@ Direct mp4 AND mkv from `test-videos.co.uk` fail the same way: httpsrc connects,
 
 ## Open investigations
 - **`SceShellUI` crashed once with `SYSTEM_VM_RUNTIME` (0xa0028401)** during repeated m3u8 crash+relaunch cycles — a GPU/video-memory runtime fault in the *system UI*, likely GPU/direct-memory not fully released across our app's crash cycles. Shell auto-recovered. Watch for recurrence; may need stricter GPU/dmem release on teardown.
+- **CE-36329-3 compositor-side HW decode fault:** v03.09 reproduced on the reverted 2-buffer present path, so triple-buffer is NOT the root cause. Likely lead is `sceVideodec2` open/close churn during repeated live-HLS recasts/discontinuities. v03.12 added `sceVideodec2` lifecycle trace/counters, extra GPU fences, short quiesce delays around decoder close/open, and HLS segment-param reset/reopen. The earlier production siglongjmp decode guard was removed: it was process-wide/cross-thread unsafe and cannot catch this async compositor-side fault anyway. After green testing, v03.13 restored triple-buffered present with fail-closed flip checks intact.
 
 ### RESOLVED
 - **Hardware decode for HLS** — DONE (v02.98). HW H.264 now runs on the live HLS seg-demux path (TS fed annex-b directly, no bsf; PTS→µs; reorder reset on discontinuity). Verified: drops halved (~10/s→~5/s), audio intact, survived a DISCONTINUITY reset with no crash. Toggle via `/hwdecode`. *(player_ff.c gate ~414, decode_video_hw_seg, decode_segment_thread_main)*

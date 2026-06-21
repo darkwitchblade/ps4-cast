@@ -1,5 +1,6 @@
 #include "vdec_hw.h"
 #include "goldhen.h"
+#include "trace.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -89,6 +90,8 @@ static uint64_t g_fbSize;
 static long    g_frames;
 static int     g_lastErr;
 static char    g_dbg[160] = "hw off";
+static long    g_openCount, g_closeCount, g_resetCount, g_faultCount, g_slowCount;
+static uint64_t g_lastOpenUs, g_lastCloseUs;
 
 // Input-timestamp FIFO: the decoder may emit a delayed/reordered picture, so we
 // push each AU's pts/dts on submit and pop the front when a frame comes out —
@@ -125,10 +128,20 @@ const char *vdec_hw_debug(void) { return g_dbg; }
 
 int vdec_hw_open(int maxW, int maxH, int profile, int level) {
     vdec_hw_close();
+    // Avoid rapid create/delete churn on the GPU-compute decoder. The compositor
+    // CE-36329-3 fault appears outside our process, so giving the driver a small
+    // quiesce window after a close is cheap insurance during automated recasts.
+    uint64_t now = sceKernelGetProcessTime();
+    if (g_lastCloseUs && now > g_lastCloseUs && now - g_lastCloseUs < 250ULL * 1000ULL)
+        sceKernelUsleep((unsigned)(250ULL * 1000ULL - (now - g_lastCloseUs)));
     if (maxW <= 0) maxW = 1920;
     if (maxH <= 0) maxH = 1088;
     char gh[160] = "";
     goldhen_enter(gh, sizeof(gh));            // privileged module load
+
+    g_openCount++;
+    g_lastOpenUs = sceKernelGetProcessTime();
+    trace_mark("vdec open #%ld %dx%d p%d/l%d", g_openCount, maxW, maxH, profile, level);
 
     int rc = bind_vdec2();
     if (rc != 0) { snprintf(g_dbg, sizeof(g_dbg), "hw bind fail %d", rc); goldhen_restore(NULL, 0); return -1; }
@@ -171,8 +184,9 @@ int vdec_hw_open(int maxW, int maxH, int profile, int level) {
     }
     g_poolIdx = 0; g_frames = 0; g_lastErr = 0;
     goldhen_restore(NULL, 0);                 // decode runs unprivileged
-    snprintf(g_dbg, sizeof(g_dbg), "hw H264 %dx%d p%d/l%d fb=%lluKB pool=%d",
-             maxW, maxH, (int)cfg.profile, (int)cfg.maxLevel, (unsigned long long)(g_fbSize / 1024), g_poolN);
+    snprintf(g_dbg, sizeof(g_dbg), "hw H264 %dx%d p%d/l%d fb=%lluKB pool=%d open=%ld close=%ld slow=%ld fault=%ld",
+             maxW, maxH, (int)cfg.profile, (int)cfg.maxLevel, (unsigned long long)(g_fbSize / 1024), g_poolN,
+             g_openCount, g_closeCount, g_slowCount, g_faultCount);
     return 0;
 
 fail:
@@ -198,9 +212,20 @@ int vdec_hw_decode(const uint8_t *au, int len, int64_t pts, int64_t dts, VdecHwF
     fbi.thisSize = sizeof(fbi); fbi.frameBuffer = fb; fbi.frameBufferSize = g_fbSize;
     Vdec2Output od; memset(&od, 0, sizeof(od)); od.thisSize = sizeof(od);
 
+    uint64_t t0 = sceKernelGetProcessTime();
     int rc = pDecode(g_decoder, &in, &fbi, &od);
+    uint64_t dt = sceKernelGetProcessTime() - t0;
+    if (dt > 500ULL * 1000ULL) {
+        g_slowCount++;
+        snprintf(g_dbg, sizeof(g_dbg), "hw slow decode %llums rc=%d",
+                 (unsigned long long)(dt / 1000), rc);
+        trace_mark("vdec slow decode %llums rc=%d frames=%ld",
+                   (unsigned long long)(dt / 1000), rc, g_frames);
+    }
     if (rc != 0) {
         if (g_fifoCount > 0) g_fifoCount--;              // decode failed -> undo the push
+        g_faultCount++;
+        trace_mark("vdec decode rc=%d frames=%ld", rc, g_frames);
         g_lastErr = rc; return -1;
     }
     g_frames++;
@@ -225,26 +250,43 @@ int vdec_hw_decode(const uint8_t *au, int len, int64_t pts, int64_t dts, VdecHwF
 // close+reopen is not possible here without config, so if Reset is unavailable
 // we just drop the pool rotation; the next keyframe re-establishes refs anyway.
 void vdec_hw_reset(void) {
+    g_resetCount++;
+    trace_mark("vdec reset #%ld frames=%ld", g_resetCount, g_frames);
     if (g_decoder && pReset) pReset(g_decoder);
     g_poolIdx = 0;
     fifo_clear();
 }
 
 void vdec_hw_close(void) {
+    if (!g_decoder && !g_computeQueue && !g_cpu.size && !g_gpu.size && !g_cgpu.size && !g_compute.size && g_poolN == 0) {
+        snprintf(g_dbg, sizeof(g_dbg), "hw off open=%ld close=%ld slow=%ld fault=%ld",
+                 g_openCount, g_closeCount, g_slowCount, g_faultCount);
+        return;
+    }
+    g_closeCount++;
+    trace_mark("vdec close #%ld frames=%ld dmem=%ldKB", g_closeCount, g_frames, g_dmemOutstanding / 1024);
     // Fence outstanding GPU compute work BEFORE deleting the decoder / releasing
     // the compute queue / freeing garlic+onion memory. Freeing direct memory the
     // GPU is still DMA-ing into causes an unrecoverable GPU page fault (hung GPU
     // -> unkillable). It also leaves the compute queue quiesced so the system can
     // suspend/close the app without CPU_FAULT_SUBMITDONE_TIMEOUT_IN_SUSPEND.
     sceGnmSubmitDone();
+    sceKernelUsleep(20 * 1000);
     if (g_decoder && pDelete) pDelete(g_decoder);
     g_decoder = NULL;
+    sceGnmSubmitDone();
+    sceKernelUsleep(20 * 1000);
     if (g_computeQueue && pReleaseCompute) pReleaseCompute(g_computeQueue);
     g_computeQueue = NULL;
+    sceGnmSubmitDone();
+    sceKernelUsleep(20 * 1000);
     for (int i = 0; i < POOL_MAX; i++) dmem_free(&g_pool[i]);
     g_poolN = g_poolIdx = 0;
     dmem_free(&g_cgpu); dmem_free(&g_gpu); dmem_free(&g_cpu); dmem_free(&g_compute);
     g_frames = 0;
     fifo_clear();
-    snprintf(g_dbg, sizeof(g_dbg), "hw off");
+    g_lastCloseUs = sceKernelGetProcessTime();
+    trace_mark("vdec closed #%ld dmem=%ldKB", g_closeCount, g_dmemOutstanding / 1024);
+    snprintf(g_dbg, sizeof(g_dbg), "hw off open=%ld close=%ld reset=%ld slow=%ld fault=%ld",
+             g_openCount, g_closeCount, g_resetCount, g_slowCount, g_faultCount);
 }

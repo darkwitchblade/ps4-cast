@@ -197,7 +197,12 @@ int hls_generation(void) { return g_segGen; }
 int hls_reset_generation(void) { return g_resetGen; }
 int hls_is_live(void) { return g_isLive; }
 int hls_can_segment_demux(void) {
-    return g_active && g_isLive && !g_initSeg && !g_sepAudio && g_variantCount == 0;
+    // Segment-demux is safe for live MPEG-TS media playlists. Earlier builds
+    // limited this to simple non-master playlists; master playlists and
+    // separate-audio variants are still just live TS video segments after
+    // variant selection, and the separate audio path has its own demuxer. Keep
+    // fMP4 (EXT-X-MAP/init segment) on the generic AVIO path.
+    return g_active && g_isLive && !g_initSeg;
 }
 
 static void free_segs(void) {

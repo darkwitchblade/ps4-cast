@@ -58,6 +58,9 @@ static int               g_roN = 0;
 static int               g_hwReorder = 0;
 static int64_t           g_lastEmitPts = AV_NOPTS_VALUE;  // adaptive reorder: grow window if a frame arrives late
 static int               g_hwEnabled = 1;                 // runtime HW on/off (toggle via httpd for A/B testing)
+static int               g_hwFailCount = 0;
+static const AVCodec    *g_swCodec = NULL;
+static int               g_hwMaxW = 0, g_hwMaxH = 0, g_hwProfile = 0, g_hwLevel = 0;
 
 // audio
 static int               g_astream = -1;
@@ -160,6 +163,7 @@ static void  ro_clear(void);
 static void  apply_hls_reset(void);
 static void  seg_readahead_start(void);
 static void  seg_readahead_stop(void);
+static int   open_sw_video(const AVCodec *dec);
 
 // ---- live HLS segment read-ahead -----------------------------------------
 // A dedicated fetch thread pulls TS segments ahead of decode into a small ring,
@@ -332,6 +336,7 @@ int player_play(const char *url) {
     strncpy(g_playUrl, startUrl, sizeof(g_playUrl) - 1);
     g_playUrl[sizeof(g_playUrl) - 1] = '\0';
     g_pkts = g_frames = g_drops = g_audioPkts = g_videoPkts = 0; g_lastErr = 0; g_lastLagUs = 0;
+    g_hwFailCount = 0;
 
     // Open the source. HLS (.m3u8) goes through the segment-streaming layer;
     // everything else (mp4/mov/mkv/avi/ts/... over http/https) via httpsrc.
@@ -375,6 +380,7 @@ int player_play(const char *url) {
         snprintf(g_status, sizeof(g_status), "no video stream");
         player_stop(); return -4;
     }
+    g_swCodec = dec;
 
     // Pick the audio stream (for sound). Discard any OTHER streams (data/subs)
     // so the demuxer doesn't seek across the file for packets we never use.
@@ -462,6 +468,10 @@ int player_play(const char *url) {
                                         vpar->profile > 0 ? vpar->profile : 0,
                                         vpar->level   > 0 ? vpar->level   : 0) == 0) {
                 g_useHw = 1;
+                g_hwFailCount = 0;
+                g_hwMaxW = vpar->width; g_hwMaxH = vpar->height;
+                g_hwProfile = vpar->profile > 0 ? vpar->profile : 0;
+                g_hwLevel   = vpar->level   > 0 ? vpar->level   : 0;
                 g_roN = 0; g_lastEmitPts = AV_NOPTS_VALUE;
                 g_hwReorder = vpar->video_delay;          // B-frame reorder depth (adapts at runtime)
                 if (g_hwReorder < 0) g_hwReorder = 0;
@@ -858,6 +868,67 @@ static void ro_emit_one(void) {
 static void ro_drain(void) { while (g_roN > 0) ro_emit_one(); }     // EOF: flush in order
 static void ro_clear(void) { for (int i = 0; i < g_roN; i++) av_frame_free(&g_ro[i]); g_roN = 0; }
 
+static int hw_failover_to_software(int err) {
+    g_lastErr = err;
+    if (++g_hwFailCount < 3) return 0;
+    trace_mark("hw failover err=%d dbg=%s", err, vdec_hw_debug());
+    snprintf(g_status, sizeof(g_status), "HW decode failed; switching to software");
+    ro_clear();
+    vdec_hw_close();
+    if (g_bsf)   { av_bsf_free(&g_bsf); g_bsf = NULL; }
+    if (g_hwPkt) { av_packet_free(&g_hwPkt); }
+    g_useHw = 0;
+    g_lastEmitPts = AV_NOPTS_VALUE;
+    if (g_vdec) avcodec_free_context(&g_vdec);
+    if (g_swCodec && open_sw_video(g_swCodec) == 0) {
+        notify("PS4 Cast: HW decode failed; software fallback");
+        return 1;
+    }
+    g_active = 0;
+    g_decEof = 1;
+    snprintf(g_status, sizeof(g_status), "HW decode failed; SW fallback failed");
+    return 1;
+}
+
+static int hw_reopen_for_params(const AVCodecParameters *par) {
+    if (!g_useHw || !par || par->codec_id != AV_CODEC_ID_H264) return 0;
+    int w = par->width  > 0 ? par->width  : g_hwMaxW;
+    int h = par->height > 0 ? par->height : g_hwMaxH;
+    int p = par->profile > 0 ? par->profile : 0;
+    int l = par->level   > 0 ? par->level   : 0;
+
+    // SPS/PPS can legally change at HLS discontinuities or variant switches.
+    // Reset is enough when the already-open decoder maxima cover the new
+    // geometry/profile; reopen when the max config itself must change.
+    int needReopen = (w > g_hwMaxW || h > g_hwMaxH ||
+                      (p && g_hwProfile && p != g_hwProfile) ||
+                      (l && g_hwLevel && l > g_hwLevel));
+    int changed = (w != g_srcW || h != g_srcH ||
+                   (p && p != g_hwProfile) || (l && l != g_hwLevel));
+    if (!changed && !needReopen) return 0;
+
+    trace_mark("hw params change %dx%d p%d/l%d -> %dx%d p%d/l%d reopen=%d",
+               g_srcW, g_srcH, g_hwProfile, g_hwLevel, w, h, p, l, needReopen);
+    ro_clear();
+    g_lastEmitPts = AV_NOPTS_VALUE;
+    g_hwFailCount = 0;
+    g_srcW = w; g_srcH = h;
+
+    if (!needReopen) {
+        vdec_hw_reset();
+        if (p) g_hwProfile = p;
+        if (l) g_hwLevel = l;
+        return 0;
+    }
+
+    vdec_hw_close();
+    if (vdec_hw_open(w, h, p, l) == 0) {
+        g_hwMaxW = w; g_hwMaxH = h; g_hwProfile = p; g_hwLevel = l;
+        return 0;
+    }
+    return hw_failover_to_software(-9001);
+}
+
 // Hardware H.264 path: convert the packet to Annex B, decode each access unit on
 // the GPU silicon into NV12, copy it into an AVFrame, and feed it through the
 // reorder buffer -> queue -> sync/scale/blit path (sws converts NV12->BGRA).
@@ -867,7 +938,9 @@ static void decode_video_hw(AVPacket *pkt) {
         VdecHwFrame hf;
         int got = vdec_hw_decode(g_hwPkt->data, g_hwPkt->size, g_hwPkt->pts, g_hwPkt->dts, &hf);
         av_packet_unref(g_hwPkt);
+        if (got < 0) { if (hw_failover_to_software(got)) break; continue; }
         if (got != 1) continue;
+        g_hwFailCount = 0;
         AVFrame *cl = av_frame_alloc();
         if (!cl) continue;
         cl->format = AV_PIX_FMT_NV12; cl->width = hf.width; cl->height = hf.height;
@@ -898,7 +971,9 @@ static void decode_video_hw(AVPacket *pkt) {
 static void decode_video_hw_seg(AVPacket *pkt, AVRational vtb) {
     VdecHwFrame hf;
     int got = vdec_hw_decode(pkt->data, pkt->size, pkt->pts, pkt->dts, &hf);
+    if (got < 0) { hw_failover_to_software(got); return; }
     if (got != 1) return;
+    g_hwFailCount = 0;
     AVFrame *cl = av_frame_alloc();
     if (!cl) return;
     cl->format = AV_PIX_FMT_NV12; cl->width = hf.width; cl->height = hf.height;
@@ -1338,6 +1413,8 @@ static void *decode_segment_thread_main(void *arg) {
         if (sa >= 0) g_segAudioIdx = sa;
         else if (g_haveAudio && g_segAudioIdx >= 0 && g_segAudioIdx < (int)sfmt->nb_streams) sa = g_segAudioIdx;
         trace_mark("segdemux streams v=%d a=%d", sv, sa);
+        if (g_useHw && sv >= 0)
+            hw_reopen_for_params(sfmt->streams[sv]->codecpar);
         AVRational vtb = (sv >= 0) ? sfmt->streams[sv]->time_base : (AVRational){1, 90000};
         AVRational atb = (sa >= 0) ? sfmt->streams[sa]->time_base : (AVRational){1, 90000};
         int segPkts = 0, segVideo = 0, segAudio = 0;

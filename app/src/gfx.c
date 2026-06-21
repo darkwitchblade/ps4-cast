@@ -10,14 +10,11 @@
 #include <orbis/VideoOut.h>
 #include <orbis/GnmDriver.h>
 
-// Double-buffered, fully-blocking present (the long-proven-stable config).
-// Triple-buffered pipelined flips were tried (v03.01) to lift the ~30Hz present
-// cap on 50/60fps content, but they correlated with CE-36329-3 graphics faults
-// (a GPU/compositor crash our flip path can't catch) — not worth it: <=48fps
-// content (essentially all real content) was already smooth. Reverted to 2
-// buffers + wait-for-this-flip. Re-attempt the present-rate win later via a
-// HW-scaled framebuffer (cheaper convert), not aggressive flip pipelining.
-#define GFX_BUFFERS 2
+// Triple buffering lets us submit a flip and immediately render the next frame
+// into a third buffer while the previous one is still scanning out, instead of
+// blocking on each flip. The v03.12 HW-decoder soak exonerated this as the
+// CE-36329-3 root cause, so restore it for smoother 40/50/60fps presentation.
+#define GFX_BUFFERS 3
 
 // Set in gfx_init; used by gfx_emergency_release to tear down the display/GPU
 // context on a fatal exit so the process stays reclaimable (not unkillable).
@@ -122,22 +119,24 @@ void gfx_present(Gfx *g, int frameID) {
     // hits CPU_FAULT_SUBMITDONE_TIMEOUT_IN_SUSPEND and crashes instead of quitting.
     sceGnmSubmitDone();
 
-    // 2-buffer: wait until THIS frame is actually on screen before we reuse the
-    // back buffer next frame (no flip pipelining — the proven-stable behavior).
-    // Hard ceiling: if flips stop completing the display/GPU has hung -> fail-closed
-    // with a precise reason (faster + clearer than the generic freeze-watchdog).
+    // Advance to the next render target WITHOUT blocking on this flip. Then
+    // throttle only if too many flips are still outstanding: with GFX_BUFFERS
+    // buffers we let up to (GFX_BUFFERS-1) be in flight, which guarantees the
+    // buffer we're about to render into next has finished its flip.
+    g->activeIdx = (g->activeIdx + 1) % GFX_BUFFERS;
+
+    // Hard ceiling: if flips stop completing the display/GPU has hung -> fail
+    // closed with a precise reason (faster than the generic freeze-watchdog).
     uint64_t t0 = sceKernelGetProcessTime();
     for (;;) {
         OrbisVideoOutFlipStatus st;
         sceVideoOutGetFlipStatus(g->video, &st);
-        if (st.flipArg == frameID)
+        if (frameID - (int)st.flipArg <= (GFX_BUFFERS - 1))
             break;
         if (sceKernelGetProcessTime() - t0 > 3ULL * 1000 * 1000)
             gfx_fatal("flip-stall", frameID - (int)st.flipArg);
-        sceKernelUsleep(1000);   // 1ms poll; flip completes within ~1 vblank
+        sceKernelUsleep(1000);
     }
-
-    g->activeIdx = (g->activeIdx + 1) % GFX_BUFFERS;
 }
 
 void gfx_pixel(Gfx *g, int x, int y, GfxColor c) {

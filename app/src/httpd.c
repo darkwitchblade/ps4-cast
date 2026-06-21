@@ -17,6 +17,12 @@
 #include <orbis/Net.h>
 #include <orbis/libkernel.h>
 
+extern int remote_set_enabled(int on);
+extern int remote_is_enabled(void);
+extern const char *remote_status(void);
+extern const char *remote_capture(void);
+extern void remote_capture_clear(void);
+
 // IPv4 sockaddr (16 bytes) — OpenOrbis has no OrbisNetSockaddrIn, so we lay it
 // out by hand (matches FreeBSD / OrbisNetSockaddr size).
 typedef struct {
@@ -503,14 +509,15 @@ static void handle_client(OrbisNetId c) {
     if (strcmp(path, "/status") == 0) {
         char dbg[512];
         player_debug(dbg, sizeof(dbg));
-        char json[1400];
+        char json[1800];
         int active = player_is_active();
         double cur = 0, dur = 0;
         player_progress(&cur, &dur);
         int j = snprintf(json, sizeof(json),
-                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"native\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"debug\":\"%s\",\"pad\":\"%s\"}",
+                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"native\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"debug\":\"%s\",\"pad\":\"%s\",\"remote\":\"%s\",\"remote_enabled\":%d,\"hw_enabled\":%d}",
                          APP_VER, jb_result(), goldhen_status(), player_status(), handoff_status(), ssdp_status(),
-                         active, player_is_paused(), (int)(cur + 0.5), (int)(dur + 0.5), g_last_push, dbg, pad_diag_get());
+                         active, player_is_paused(), (int)(cur + 0.5), (int)(dur + 0.5), g_last_push, dbg, pad_diag_get(),
+                         remote_status(), remote_is_enabled(), player_hw_enabled());
         send_response(c, "200 OK", "application/json", json, j);
         return;
     }
@@ -546,6 +553,27 @@ static void handle_client(OrbisNetId c) {
         int on = (body[0] != '0');
         player_set_hw(on);
         send_response(c, "200 OK", "text/plain", on ? "hw on" : "hw off", on ? 5 : 6);
+        return;
+    }
+
+    // Toggle HDMI-CEC / TV remote SPECIAL-port reader. The reader runs on its
+    // own thread so a blocking CEC path cannot stall the render/control loop.
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/remote") == 0) {
+        int on = (body[0] != '0');
+        remote_set_enabled(on);
+        send_response(c, "200 OK", "text/plain", on ? "remote on" : "remote off", on ? 9 : 10);
+        return;
+    }
+
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/remote/capture") == 0) {
+        const char *r = remote_capture();
+        send_response(c, "200 OK", "text/plain", r, (int)strlen(r));
+        return;
+    }
+
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/remote/clear") == 0) {
+        remote_capture_clear();
+        send_response(c, "200 OK", "text/plain", "remote capture cleared", 22);
         return;
     }
 

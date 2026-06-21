@@ -308,16 +308,33 @@ static int request_from_ex(uint64_t pos, int *status, int64_t *total, char *loc,
     }
     g_cleanEof = 0;
 
-    char req[1600];
-    int n = snprintf(req, sizeof(req),
-        "GET %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "User-Agent: PS4Cast/1.0\r\n"
-        "Accept: */*\r\n"
-        "Range: bytes=%llu-\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n",
-        g_path, g_host, (unsigned long long)pos);
+    char req[1800];
+    // Do not send Range on the initial byte-0 open. Some HTTPS CDNs accept the
+    // 206 header then deliver zero body bytes on a first ranged request; a plain
+    // GET is the most compatible start. Real seeks still send Range below.
+    int n;
+    if (pos == 0) {
+        n = snprintf(req, sizeof(req),
+            "GET %s HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "User-Agent: PS4Cast/1.0\r\n"
+            "Accept: */*\r\n"
+            "Accept-Encoding: identity\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n",
+            g_path, g_host);
+    } else {
+        n = snprintf(req, sizeof(req),
+            "GET %s HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "User-Agent: PS4Cast/1.0\r\n"
+            "Accept: */*\r\n"
+            "Accept-Encoding: identity\r\n"
+            "Range: bytes=%llu-\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n",
+            g_path, g_host, (unsigned long long)pos);
+    }
     if (conn_write((const uint8_t *)req, n) != 0) {
         int te = g_tls ? tls_last_error(g_tls) : 0;
         conn_close();
@@ -359,6 +376,11 @@ static int request_from_ex(uint64_t pos, int *status, int64_t *total, char *loc,
             if (sl && (!eol || sl < eol)) *total = (int64_t)strtoull(sl + 1, NULL, 10); }
         if (*total < 0) { const char *cl = ci_strstr(hdr, "Content-Length:");
             if (cl) *total = (int64_t)strtoull(cl + (int)strlen("Content-Length:"), NULL, 10); }
+    }
+    if (ci_strstr(hdr, "Transfer-Encoding:") && ci_strstr(hdr, "chunked")) {
+        snprintf(g_dbg, sizeof(g_dbg), "chunked unsupported (%s)", g_host);
+        conn_close();
+        return -5;
     }
 
     // Stash trailing body bytes that arrived with the header block.
