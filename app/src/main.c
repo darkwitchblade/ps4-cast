@@ -313,6 +313,47 @@ static uint32_t pad_poll(PadState *p) {
     return pressed;
 }
 
+// ---- HDMI-CEC / TV remote ------------------------------------------------
+// The TV remote (and other SPECIAL-port devices) sit on
+// ORBIS_PAD_PORT_TYPE_SPECIAL and are read via scePadReadStateExt, which can
+// BLOCK — so they must NOT be polled in the render loop (that would stall casts,
+// which is exactly why the original code only polled STANDARD pads). This
+// dedicated thread blocks freely and publishes edge-detected presses into
+// g_remotePressed; the main loop ORs that into its normal pad handling, so every
+// existing control (pause / seek / stop) works from the remote with no new
+// mapping. Remote keys arrive in OrbisPadData.buttons using the same bit set.
+static volatile uint32_t g_remotePressed = 0;
+
+static void *remote_thread_main(void *arg) {
+    (void)arg;
+    int user = -1;
+    int h = -1;
+    uint32_t prev = 0;
+    for (;;) {
+        if (h < 0) {
+            if (user < 0) sceUserServiceGetInitialUser(&user);
+            for (int idx = 0; idx < 4 && h < 0; idx++)
+                h = scePadOpen(user, ORBIS_PAD_PORT_TYPE_SPECIAL, idx, NULL);
+            if (h < 0) { sceKernelUsleep(1000 * 1000); continue; }   // no remote yet; retry
+            prev = 0;
+            pad_diag_set("remote: SPECIAL port open");
+        }
+        OrbisPadData d;
+        memset(&d, 0, sizeof(d));
+        int rc = scePadReadStateExt(h, &d);
+        if (rc != 0) { scePadClose(h); h = -1; sceKernelUsleep(500 * 1000); continue; }
+        if (d.connected) {
+            uint32_t pressed = d.buttons & ~prev;   // rising edges only
+            prev = d.buttons;
+            if (pressed) g_remotePressed |= pressed;
+        } else {
+            prev = 0;
+        }
+        sceKernelUsleep(16 * 1000);                  // ~60Hz; blocking-safe on this thread
+    }
+    return NULL;
+}
+
 static void draw_hud(Gfx *g) {
     double cur = 0, dur = 0;
     player_progress(&cur, &dur);
@@ -396,10 +437,14 @@ int main(void) {
     uint64_t hudUntil = 0;
     PadState pad;
     pad_init(&pad);
+    // TV remote (HDMI-CEC) reader on its own thread — see remote_thread_main.
+    OrbisPthread rt;
+    scePthreadCreate(&rt, NULL, remote_thread_main, NULL, "ps4cast_remote");
 
     while (running) {
         g_heartbeat = sceKernelGetProcessTime();   // pet the freeze watchdog each frame
         uint32_t pressed = pad_poll(&pad);
+        uint32_t rp = g_remotePressed; g_remotePressed = 0; pressed |= rp;   // fold in TV-remote presses
         if (player_started() && pressed) {
             double cur = 0, dur = 0;
             player_progress(&cur, &dur);
