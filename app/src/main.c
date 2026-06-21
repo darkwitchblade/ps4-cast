@@ -203,6 +203,12 @@ static void gtext(Gfx *g, int x, int y, const char *s, int sc, GfxColor c, int t
     if (sc >= 4) gfx_text_tr(g, x + 2, y + 2, s, sc, INK, tr);
     gfx_text_tr(g, x, y, s, sc, c, tr);
 }
+// Always-shadowed text: legible directly over video with no panel behind it
+// (a cheap drop shadow instead of a translucent backing blend).
+static void stext(Gfx *g, int x, int y, const char *s, int sc, GfxColor c) {
+    gfx_text(g, x + 2, y + 2, s, sc, INK);
+    gfx_text(g, x, y, s, sc, c);
+}
 static void ctext(Gfx *g, int cy, const char *s, int sc, GfxColor c, int tr) {
     int w = gfx_text_tr_w(s, sc, tr);
     gtext(g, (g->width - w) / 2, cy, s, sc, c, tr);
@@ -435,45 +441,42 @@ static void draw_hud(Gfx *g) {
     player_progress(&cur, &dur);
     int paused = player_is_paused();
 
-    // Compact, centered bar — deliberately small so the per-frame alpha blend
-    // can't steal cores from the software decoder (the cause of HUD-on lag).
-    int W = g->width, H = 140;
-    int hw = W - 80 < 1240 ? W - 80 : 1240;
-    int x = (W - hw) / 2, y = g->height - H - 40;
-    panel(g, x, y, hw, H, 22, INK, 200);
-    int pad = 28;
+    // Netflix-style: no panel/scrim blend — just shadowed text and a thin
+    // scrubber laid directly over the video, so it's nearly free to draw.
+    int W = g->width;
+    int barX = 80, barW = W - 160, barH = 6, barY = g->height - 78;
 
-    // now-playing badge + title
-    int bx = x + pad, by = y + 18, bs = 44;
-    panel(g, bx, by, bs, bs, 12, SURF2, 255);
-    if (paused) icon_pause(g, bx + bs / 2, by + bs / 2, 18, ACC_LT);
-    else icon_play(g, bx + bs / 2 + 2, by + bs / 2, 20, ACC_LT);
-
+    // title + status (bottom-left, above the scrubber)
     char title[160];
     basename_of(httpd_last_push(), title, sizeof(title));
-    gtext(g, bx + bs + 18, by, title, 3, TXT, 0);
-    gfx_text(g, bx + bs + 18, by + 28, paused ? "Paused" : player_status(), 2, MUT);
+    stext(g, barX, barY - 96, title, 4, TXT);
+    stext(g, barX, barY - 44, paused ? "Paused" : player_status(), 2, MUT);
 
-    // state pill (top-right)
+    // play/paused state (right, above the scrubber)
     const char *badge = paused ? "PAUSED" : "PLAYING";
-    int pw = gfx_text_w(badge, 2) + 42, px = x + hw - pad - pw, py = by + 4;
-    panel(g, px, py, pw, 32, 16, SURF2, 255);
-    gfx_circle(g, px + 19, py + 16, 5, paused ? FAINT : LIVE);
-    gfx_text(g, px + 32, py + 8, badge, 2, paused ? MUT : LIVE);
+    int bx = barX + barW - gfx_text_w(badge, 2);
+    gfx_circle(g, bx - 18, barY - 36, 5, paused ? WARN : LIVE);
+    stext(g, bx, barY - 44, badge, 2, paused ? WARN : LIVE);
 
-    // progress bar with knob + times
-    char curS[24], durS[24];
-    fmt_time(cur, curS, sizeof(curS));
-    fmt_time(dur, durS, sizeof(durS));
-    int barX = x + pad, barY = y + 88, barW = hw - pad * 2, barH = 8;
-    gfx_round(g, barX, barY, barW, barH, barH / 2, SURF2);
-    float p = dur > 0 ? (float)(cur / dur) : 0; if (p < 0) p = 0; if (p > 1) p = 1;
-    int fw = (int)(barW * p);
-    if (fw > barH) gfx_round(g, barX, barY, fw, barH, barH / 2, ACCENT);
-    gfx_circle(g, barX + fw, barY + barH / 2, 10, TXT);
-    gfx_circle(g, barX + fw, barY + barH / 2, 5, ACCENT);
-    gfx_text(g, barX, barY + 22, curS, 2, MUT);
-    gfx_text(g, barX + barW - gfx_text_w(durS, 2), barY + 22, durS, 2, MUT);
+    if (dur > 0) {
+        // seekable VOD: scrubber + times
+        gfx_round(g, barX, barY, barW, barH, barH / 2, SURF2);
+        float p = (float)(cur / dur); if (p < 0) p = 0; if (p > 1) p = 1;
+        int fw = (int)(barW * p);
+        if (fw > barH) gfx_round(g, barX, barY, fw, barH, barH / 2, ACCENT);
+        gfx_circle(g, barX + fw, barY + barH / 2, 9, TXT);
+        gfx_circle(g, barX + fw, barY + barH / 2, 4, ACCENT);
+        char curS[24], durS[24];
+        fmt_time(cur, curS, sizeof(curS));
+        fmt_time(dur, durS, sizeof(durS));
+        stext(g, barX, barY + 18, curS, 2, MUT);
+        stext(g, barX + barW - gfx_text_w(durS, 2), barY + 18, durS, 2, MUT);
+    } else {
+        // live stream: a thin static accent line + LIVE tag
+        gfx_round(g, barX, barY, barW, barH, barH / 2, SURF2);
+        gfx_round(g, barX, barY, barW, barH, barH / 2, ACCENT);
+        stext(g, barX, barY + 18, "LIVE", 2, LIVE);
+    }
 }
 
 // TV-box-style channel list overlay: a fast, scrollable list of the loaded
@@ -526,36 +529,32 @@ static void draw_channel_overlay(Gfx *g, int sel) {
     gfx_text(g, x + 28, y + H - 34, "Up / Down  change channel      Cross  watch", 2, MUT);
 }
 
-// Lightweight top-right stream telemetry, toggled by the touchpad button. Kept
-// small + text-only so it never competes with software decode (unlike the HUD).
+// Top-right stream telemetry, toggled by the touchpad. Plain shadowed text with
+// NO panel/blend behind it — the cheapest possible overlay, can't affect decode.
 static void draw_stats_overlay(Gfx *g, double netMBs, int fps) {
     PlayerStats s; player_stats(&s);
-    int pw = 446, ph = 250, x = g->width - pw - 40, y = 40;
-    panel(g, x, y, pw, ph, 18, INK, 205);
-
-    int ix = x + 26, iy = y + 24;
-    gfx_circle(g, ix + 4, iy + 7, 5, LIVE);
-    gtext(g, ix + 18, iy, "STREAM", 2, TXT, 1);
+    int lx = g->width - 470, vx = lx + 150, ry = 48, rh = 30;
+    gfx_circle(g, lx + 4, ry + 7, 5, LIVE);
+    stext(g, lx + 18, ry, "STREAM", 2, TXT);
     char ver[16]; snprintf(ver, sizeof(ver), "v%s", APP_VER);
-    gfx_text(g, x + pw - 26 - gfx_text_w(ver, 2), iy, ver, 2, FAINT);
-    gfx_rect_a(g, ix, iy + 26, pw - 52, 1, HAIR, 40);
+    stext(g, g->width - 40 - gfx_text_w(ver, 2), ry, ver, 2, FAINT);
+    ry += 38;
 
-    int lx = ix, vx = ix + 150, ry = iy + 42, rh = 30;
     char b[80];
     snprintf(b, sizeof(b), "%s  %s", s.hw ? "HW" : "SW", s.codec);
-    gfx_text(g, lx, ry, "Decode", 2, FAINT);  gfx_text(g, vx, ry, b, 2, s.hw ? LIVE : ACC_LT);  ry += rh;
-    snprintf(b, sizeof(b), "%dx%d   %d fps", s.w, s.h, fps);
-    gfx_text(g, lx, ry, "Video", 2, FAINT);   gfx_text(g, vx, ry, b, 2, (fps >= 24 || fps == 0) ? TXT : WARN);  ry += rh;
-    snprintf(b, sizeof(b), "%d%%   +%.1fs", s.bufPct, s.aheadSec);
+    stext(g, lx, ry, "Decode", 2, FAINT);  stext(g, vx, ry, b, 2, s.hw ? LIVE : ACC_LT);  ry += rh;
+    snprintf(b, sizeof(b), "%dx%d  %d fps", s.w, s.h, fps);
+    stext(g, lx, ry, "Video", 2, FAINT);   stext(g, vx, ry, b, 2, (fps >= 24 || fps == 0) ? TXT : WARN);  ry += rh;
+    snprintf(b, sizeof(b), "%d%%  +%.1fs", s.bufPct, s.aheadSec);
     GfxColor bc = s.bufPct >= 40 ? LIVE : (s.bufPct >= 15 ? WARN : DANGER);
-    gfx_text(g, lx, ry, "Buffer", 2, FAINT);  gfx_text(g, vx, ry, b, 2, bc);  ry += rh;
+    stext(g, lx, ry, "Buffer", 2, FAINT);  stext(g, vx, ry, b, 2, bc);  ry += rh;
     if (netMBs >= 0.05) snprintf(b, sizeof(b), "%.1f MB/s", netMBs);
     else snprintf(b, sizeof(b), "%.1f Mbps", s.bitrateMbps);
-    gfx_text(g, lx, ry, "Network", 2, FAINT); gfx_text(g, vx, ry, b, 2, TXT);  ry += rh;
-    snprintf(b, sizeof(b), "%s%s", s.hls ? (s.segDemux ? "HLS seg-demux" : "HLS") : "HTTP", s.lan ? "   LAN" : "");
-    gfx_text(g, lx, ry, "Source", 2, FAINT);  gfx_text(g, vx, ry, b, 2, MUT);  ry += rh;
+    stext(g, lx, ry, "Network", 2, FAINT); stext(g, vx, ry, b, 2, TXT);  ry += rh;
+    snprintf(b, sizeof(b), "%s%s", s.hls ? (s.segDemux ? "HLS seg-demux" : "HLS") : "HTTP", s.lan ? "  LAN" : "");
+    stext(g, lx, ry, "Source", 2, FAINT);  stext(g, vx, ry, b, 2, MUT);  ry += rh;
     snprintf(b, sizeof(b), "%ld", s.drops);
-    gfx_text(g, lx, ry, "Dropped", 2, FAINT); gfx_text(g, vx, ry, b, 2, s.drops > 0 ? WARN : MUT);  ry += rh;
+    stext(g, lx, ry, "Dropped", 2, FAINT); stext(g, vx, ry, b, 2, s.drops > 0 ? WARN : MUT);  ry += rh;
 }
 #endif
 
@@ -615,6 +614,9 @@ int main(void) {
     double netMBs = 0;                // sampled download throughput
     uint64_t rxT0 = 0, rxB0 = 0;      // throughput sampling anchor
     int fpsCount = 0, fpsVal = 0; uint64_t fpsT0 = 0;
+    char lastUrl[1024] = "";          // resume: track the currently playing URL
+    int resumePending = 0;            // resume: seek to saved position once dur known
+    uint64_t resumeDeadline = 0, lastResumeSave = 0;
     PadState pad;
     pad_init(&pad);
 
@@ -658,6 +660,31 @@ int main(void) {
             }
             if (fpsT0 == 0) fpsT0 = now;
             else if (now - fpsT0 >= 1000000ULL) { fpsVal = fpsCount; fpsCount = 0; fpsT0 = now; }
+        }
+
+        // ---- resume: remember VOD position; seek back to it on replay --------
+        if (!player_started()) {
+            lastUrl[0] = '\0';
+        } else {
+            const char *lp = httpd_last_push();
+            if (lp && lp[0] && strcmp(lp, lastUrl) != 0) {         // new content started
+                strncpy(lastUrl, lp, sizeof(lastUrl) - 1); lastUrl[sizeof(lastUrl) - 1] = '\0';
+                resumePending = 1; resumeDeadline = now + 10000000ULL;
+            }
+            if (resumePending) {
+                double rc2 = 0, rd = 0; player_progress(&rc2, &rd);
+                if (rd > 30) {                                    // seekable VOD with known length
+                    int rp = httpd_resume_get(lastUrl);
+                    if (rp > 5 && rp < (int)rd - 15) { player_seek((double)rp); notify("Resumed at %d:%02d", rp / 60, rp % 60); }
+                    resumePending = 0;
+                } else if (now > resumeDeadline) {
+                    resumePending = 0;                            // live / no duration -> nothing to resume
+                }
+            } else if (now - lastResumeSave > 10000000ULL) {      // checkpoint every 10s
+                double sc = 0, sd = 0; player_progress(&sc, &sd);
+                if (sd > 0) httpd_resume_save(lastUrl, (int)sc, (int)sd);
+                lastResumeSave = now;
+            }
         }
 
         // Settle-to-tune: switch to the highlighted channel. Hold the current

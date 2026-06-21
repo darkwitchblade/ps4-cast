@@ -18,4 +18,8 @@ int  httpd_chan_current(void);                    // tuned channel index, -1 non
 int  httpd_chan_get(int i, char *name, int nameCap, char *url, int urlCap);
 void httpd_chan_set_current(int i);
 
+// Per-URL resume positions (VOD): remember where playback stopped.
+void httpd_resume_save(const char *url, int pos, int dur);
+int  httpd_resume_get(const char *url);
+
 #endif

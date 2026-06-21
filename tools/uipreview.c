@@ -53,6 +53,10 @@ static void ctext(Gfx *g, int cy, const char *s, int sc, GfxColor c, int tr) {
     int w = gfx_text_tr_w(s, sc, tr);
     gtext(g, (g->width - w) / 2, cy, s, sc, c, tr);
 }
+static void stext(Gfx *g, int x, int y, const char *s, int sc, GfxColor c) {
+    gfx_text(g, x + 2, y + 2, s, sc, INK);
+    gfx_text(g, x, y, s, sc, c);
+}
 // soft shadow under a rounded panel for depth
 static void panel(Gfx *g, int x, int y, int w, int h, int r, GfxColor c, int a) {
     gfx_round_a(g, x, y, w, h, r, c, a);
@@ -204,50 +208,31 @@ static void fmt_time(double sec, char *out, int cap) {
     else snprintf(out, cap, "%d:%02d", m, s);
 }
 static void draw_hud(Gfx *g, const char *title, const char *status, double cur, double dur, int paused) {
-    int W = g->width, H = 224, y = g->height - H - 36, x = 40, w = W - 80;
-    panel(g, x, y, w, H, 24, INK, 200);
-
-    int pad = 34;
-    // now-playing badge
-    int bx = x + pad, by = y + 26, bs = 56;
-    panel(g, bx, by, bs, bs, 14, SURF2, 255);
-    if (paused) icon_pause(g, bx + bs / 2, by + bs / 2, 22, ACC_LT);
-    else icon_play(g, bx + bs / 2 + 2, by + bs / 2, 24, ACC_LT);
-
-    gtext(g, bx + bs + 20, by + 2, title, 3, TXT, 0);
-    char sub[200];
-    snprintf(sub, sizeof(sub), "%s", paused ? "Paused" : status);
-    gfx_text(g, bx + bs + 20, by + 32, sub, 2, MUT);
-
-    // live/state pill at right
+    int W = g->width;
+    int barX = 80, barW = W - 160, barH = 6, barY = g->height - 78;
+    stext(g, barX, barY - 96, title, 4, TXT);
+    stext(g, barX, barY - 44, paused ? "Paused" : status, 2, MUT);
     const char *badge = paused ? "PAUSED" : "PLAYING";
-    int pw = gfx_text_w(badge, 2) + 44, px = x + w - pad - pw, py = by + 8;
-    panel(g, px, py, pw, 34, 17, SURF2, 255);
-    gfx_circle(g, px + 20, py + 17, 5, paused ? FAINT : LIVE);
-    gfx_text(g, px + 34, py + 9, badge, 2, paused ? MUT : LIVE);
-
-    // progress bar with knob
-    char curS[24], durS[24];
-    fmt_time(cur, curS, sizeof(curS));
-    fmt_time(dur, durS, sizeof(durS));
-    int barX = x + pad, barY = y + 118, barW = w - pad * 2, barH = 8;
-    gfx_round(g, barX, barY, barW, barH, barH / 2, SURF2);
-    float p = dur > 0 ? (float)(cur / dur) : 0; if (p < 0) p = 0; if (p > 1) p = 1;
-    int fw = (int)(barW * p);
-    if (fw > barH) {
-        // accent fill (two-tone)
-        gfx_round(g, barX, barY, fw, barH, barH / 2, ACCENT);
+    int bx = barX + barW - gfx_text_w(badge, 2);
+    gfx_circle(g, bx - 18, barY - 36, 5, paused ? WARN : LIVE);
+    stext(g, bx, barY - 44, badge, 2, paused ? WARN : LIVE);
+    if (dur > 0) {
+        gfx_round(g, barX, barY, barW, barH, barH / 2, SURF2);
+        float p = (float)(cur / dur); if (p < 0) p = 0; if (p > 1) p = 1;
+        int fw = (int)(barW * p);
+        if (fw > barH) gfx_round(g, barX, barY, fw, barH, barH / 2, ACCENT);
+        gfx_circle(g, barX + fw, barY + barH / 2, 9, TXT);
+        gfx_circle(g, barX + fw, barY + barH / 2, 4, ACCENT);
+        char curS[24], durS[24];
+        fmt_time(cur, curS, sizeof(curS));
+        fmt_time(dur, durS, sizeof(durS));
+        stext(g, barX, barY + 18, curS, 2, MUT);
+        stext(g, barX + barW - gfx_text_w(durS, 2), barY + 18, durS, 2, MUT);
+    } else {
+        gfx_round(g, barX, barY, barW, barH, barH / 2, SURF2);
+        gfx_round(g, barX, barY, barW, barH, barH / 2, ACCENT);
+        stext(g, barX, barY + 18, "LIVE", 2, LIVE);
     }
-    gfx_circle(g, barX + fw, barY + barH / 2, 11, TXT);
-    gfx_circle(g, barX + fw, barY + barH / 2, 5, ACCENT);
-
-    gfx_text(g, barX, barY + 24, curS, 2, MUT);
-    gfx_text(g, barX + barW - gfx_text_w(durS, 2), barY + 24, durS, 2, MUT);
-
-    // legend
-    struct { int k; const char *l; } items[] = { {0,"Pause"},{1,"Stop"},{3,"Seek"},{2,"Exit"} };
-    int lx = barX, ly = y + H - 30;
-    for (int i = 0; i < 4; i++) lx += legend(g, lx, ly, items[i].k, items[i].l);
 }
 
 // ---- channel overlay (mirrors main.c draw_channel_overlay) ---------------
@@ -307,31 +292,27 @@ static void draw_channel_overlay(Gfx *g, int sel) {
 
 static void draw_stats_overlay(Gfx *g, double netMBs, int fps) {
     PlayerStats s; player_stats(&s);
-    int pw = 446, ph = 250, x = g->width - pw - 40, y = 40;
-    panel(g, x, y, pw, ph, 18, INK, 205);
-    int ix = x + 26, iy = y + 24;
-    gfx_circle(g, ix + 4, iy + 7, 5, LIVE);
-    gtext(g, ix + 18, iy, "STREAM", 2, TXT, 1);
+    int lx = g->width - 470, vx = lx + 150, ry = 48, rh = 30;
+    gfx_circle(g, lx + 4, ry + 7, 5, LIVE);
+    stext(g, lx + 18, ry, "STREAM", 2, TXT);
     char ver[16]; snprintf(ver, sizeof(ver), "v%s", APP_VER);
-    gfx_text(g, x + pw - 26 - gfx_text_w(ver, 2), iy, ver, 2, FAINT);
-    gfx_rect_a(g, ix, iy + 26, pw - 52, 1, HAIR, 40);
-    int lx = ix, vx = ix + 150, ry = iy + 42, rh = 30;
+    stext(g, g->width - 40 - gfx_text_w(ver, 2), ry, ver, 2, FAINT);
+    ry += 38;
     char b[80];
     snprintf(b, sizeof(b), "%s  %s", s.hw ? "HW" : "SW", s.codec);
-    gfx_text(g, lx, ry, "Decode", 2, FAINT);  gfx_text(g, vx, ry, b, 2, s.hw ? LIVE : ACC_LT);  ry += rh;
-    snprintf(b, sizeof(b), "%dx%d   %d fps", s.w, s.h, fps);
-    gfx_text(g, lx, ry, "Video", 2, FAINT);   gfx_text(g, vx, ry, b, 2, (fps >= 24 || fps == 0) ? TXT : WARN);  ry += rh;
-    snprintf(b, sizeof(b), "%d%%   +%.1fs", s.bufPct, s.aheadSec);
+    stext(g, lx, ry, "Decode", 2, FAINT);  stext(g, vx, ry, b, 2, s.hw ? LIVE : ACC_LT);  ry += rh;
+    snprintf(b, sizeof(b), "%dx%d  %d fps", s.w, s.h, fps);
+    stext(g, lx, ry, "Video", 2, FAINT);   stext(g, vx, ry, b, 2, (fps >= 24 || fps == 0) ? TXT : WARN);  ry += rh;
+    snprintf(b, sizeof(b), "%d%%  +%.1fs", s.bufPct, s.aheadSec);
     GfxColor bc = s.bufPct >= 40 ? LIVE : (s.bufPct >= 15 ? WARN : DANGER);
-    gfx_text(g, lx, ry, "Buffer", 2, FAINT);  gfx_text(g, vx, ry, b, 2, bc);  ry += rh;
+    stext(g, lx, ry, "Buffer", 2, FAINT);  stext(g, vx, ry, b, 2, bc);  ry += rh;
     if (netMBs >= 0.05) snprintf(b, sizeof(b), "%.1f MB/s", netMBs);
     else snprintf(b, sizeof(b), "%.1f Mbps", s.bitrateMbps);
-    gfx_text(g, lx, ry, "Network", 2, FAINT); gfx_text(g, vx, ry, b, 2, TXT);  ry += rh;
-    snprintf(b, sizeof(b), "%s%s", s.hls ? (s.segDemux ? "HLS seg-demux" : "HLS") : "HTTP", s.lan ? "   LAN" : "");
-    gfx_text(g, lx, ry, "Source", 2, FAINT);  gfx_text(g, vx, ry, b, 2, MUT);  ry += rh;
+    stext(g, lx, ry, "Network", 2, FAINT); stext(g, vx, ry, b, 2, TXT);  ry += rh;
+    snprintf(b, sizeof(b), "%s%s", s.hls ? (s.segDemux ? "HLS seg-demux" : "HLS") : "HTTP", s.lan ? "  LAN" : "");
+    stext(g, lx, ry, "Source", 2, FAINT);  stext(g, vx, ry, b, 2, MUT);  ry += rh;
     snprintf(b, sizeof(b), "%ld", s.drops);
-    gfx_text(g, lx, ry, "Dropped", 2, FAINT); gfx_text(g, vx, ry, b, 2, s.drops > 0 ? WARN : MUT);  ry += rh;
-    gfx_text(g, ix, y + ph - 30, "Touchpad  hide", 1, FAINT);
+    stext(g, lx, ry, "Dropped", 2, FAINT); stext(g, vx, ry, b, 2, s.drops > 0 ? WARN : MUT);  ry += rh;
 }
 
 // ---- harness -------------------------------------------------------------
