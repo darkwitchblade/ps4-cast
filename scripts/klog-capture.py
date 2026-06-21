@@ -36,35 +36,41 @@ def main() -> int:
     args = ap.parse_args()
 
     deadline = (time.time() + args.seconds) if args.seconds > 0 else None
-    try:
-        s = socket.create_connection((args.ps4, args.port), timeout=6)
-    except OSError as e:
-        print(f"klog connect failed: {e}", file=sys.stderr)
-        return 2
-    s.settimeout(2.0)
     nfault = 0
     with open(args.out, "a", buffering=1) as f:
-        f.write(f"==== klog capture start {time.strftime('%H:%M:%S')} ps4={args.ps4} ====\n")
-        buf = b""
+        # Auto-reconnect loop: the GoldHEN klog server resets the connection around
+        # crashes/reboots — exactly when we most need the log — so reconnect forever.
         while deadline is None or time.time() < deadline:
             try:
-                d = s.recv(8192)
-                if not d:
-                    f.write("==== klog socket closed ====\n"); break
-                buf += d
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    txt = line.decode("utf-8", "replace").rstrip("\r")
-                    ts = time.strftime("%H:%M:%S")
-                    f.write(f"[{ts}] {txt}\n")
-                    if FAULT_RE.search(txt):
-                        nfault += 1
-                        print(f"!! FAULT [{ts}] {txt}")
-            except socket.timeout:
-                continue
+                s = socket.create_connection((args.ps4, args.port), timeout=6)
             except OSError as e:
-                f.write(f"==== klog recv error: {e} ====\n"); break
-    s.close()
+                f.write(f"==== klog connect retry: {e} ====\n")
+                time.sleep(2)
+                continue
+            s.settimeout(2.0)
+            f.write(f"==== klog connected {time.strftime('%H:%M:%S')} ps4={args.ps4} ====\n")
+            buf = b""
+            while deadline is None or time.time() < deadline:
+                try:
+                    d = s.recv(8192)
+                    if not d:
+                        f.write("==== klog socket closed; reconnecting ====\n"); break
+                    buf += d
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        txt = line.decode("utf-8", "replace").rstrip("\r")
+                        ts = time.strftime("%H:%M:%S")
+                        f.write(f"[{ts}] {txt}\n")
+                        if FAULT_RE.search(txt):
+                            nfault += 1
+                            print(f"!! FAULT [{ts}] {txt}", flush=True)
+                except socket.timeout:
+                    continue
+                except OSError as e:
+                    f.write(f"==== klog recv error: {e}; reconnecting ====\n"); break
+            try: s.close()
+            except OSError: pass
+            time.sleep(1)
     print(f"klog capture ended; faults flagged: {nfault}; log: {args.out}")
     return 0
 

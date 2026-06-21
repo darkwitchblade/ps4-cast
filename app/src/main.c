@@ -504,6 +504,12 @@ int main(void) {
     }
     player_stop();
     audio_shutdown();
+    // Clean close: returning from main / _exit can be read by the system as an
+    // abnormal termination and pop the "application closed" crash dialog. LoadExec
+    // ("exit") is the recognized normal app-exit path → returns to the home menu
+    // with no dialog. Fall back to _exit only if it somehow returns.
+    sceSystemServiceLoadExec("exit", NULL);
+    _exit(0);
 #endif
     return 0;
 }
