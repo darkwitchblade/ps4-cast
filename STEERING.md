@@ -25,7 +25,12 @@ After recovery (user re-armed :9090), retested: **VOD HLS plays fine end-to-end*
 - **Lesson stands:** casting in tight automated loops + flaky :9090 = risk of unrecoverable downtime. Keep heavy soak tests for when the user is present.
 - **Lesson for unattended loops:** casting untested content types can crash the app, and when `:9090` is unarmed I can't recover it autonomously. Keep risky content-compat probes for when you're present / `:9090` is reliably armed.
 
-## Ready to deploy when you're present: v03.00 (telemetry + ring budget)
+## v03.00 DEPLOYED + verified; dmem leak DISPROVEN; live test stream DEAD
+- v03.00 is live (user deployed). `dmem=<KB>` telemetry works: idle=0, mp4 HW play=35952KB, **steady across 4 cast cycles** → `vdec_hw_close` releases cleanly, **no direct-memory leak**. 8-cycle HLS↔mp4 soak: no crash, app responsive throughout. The earlier "resource-accumulation hang" is NOT a dmem leak — it remains a rare unreproduced transient; deprioritized.
+- **The live test stream `s3.../cdnb102/hls/0/stream_1280x720_3300k.m3u8` is permanently dead** (`AllAccessDisabled`). App handles it gracefully ("hls fetch failed", no crash). **Need a NEW live, single-media-playlist, MPEG-TS HLS source** to re-verify the live seg-demux + read-ahead path (most public live HLS are master playlists, which use the SW AVIO path, not seg-demux — see master-playlist item).
+- SEG_RING 24MB byte budget shipped in v03.00; behavior unchanged for normal ~1MB segments (3 slots ≪ 24MB), so no runtime re-verify needed; the live read-ahead itself was verified on v02.99.
+
+## (superseded) Ready to deploy when you're present: v03.00 (telemetry + ring budget)
 Built + committed, NOT yet deployed (deployed app is still 02.99; :9090 flaky so I held the deploy). Two changes:
 1. **dmem telemetry** — `/status` now reports `dmem=<KB>` (outstanding HW direct memory). After each cast it should return to the same baseline; growth across cast cycles = the suspected leak, finally observable.
 2. **Read-ahead byte budget** — SEG_RING bounded by 24MB as well as 3 slots (caps RAM on large-segment streams; small segments unchanged).
