@@ -12,7 +12,10 @@ Things the autonomous loop can't decide or do alone. Revisit these together.
 
 ## Open investigations
 - **`SceShellUI` crashed once with `SYSTEM_VM_RUNTIME` (0xa0028401)** during repeated m3u8 crash+relaunch cycles — a GPU/video-memory runtime fault in the *system UI*, likely GPU/direct-memory not fully released across our app's crash cycles. Shell auto-recovered. Watch for recurrence; may need stricter GPU/dmem release on teardown.
-- **The m3u8 ~9s crash** — our clean-exit handler hides the fault; v02.94 added `/crashlog` (signal+addr persisted on crash) to capture it on the next on-device repro. **Do this first when the console is back:** cast the m3u8, let it crash, `curl /crashlog`.
+
+### RESOLVED
+- **The m3u8 ~9s crash** — FIXED (v02.95, confirmed 3+ min no crash). Root cause was `build_scaled` reusing a stale `g_sws` across a discontinuity resolution change → `sws_scale` over-read. Now rebuilds on source-dim/format change.
+- **Audio causes buffering on live HLS** — FIXED (v02.97). Root cause found via `/trace`: `av_find_best_stream(AUDIO)` returned `AVERROR_STREAM_NOT_FOUND` (-1381258232) on most per-segment TS demuxes (mid-stream AAC not classified within the 1s analyze window), so audio decoded for only ~1 in 4 segments → bursty `wr`, ~180 underruns/sec → audible buffering. Fix: fall back to a manual `codec_type` scan, then to a cached last-known-good stream index (`g_segVideoIdx`/`g_segAudioIdx`), reset on `player_play`. *(player_ff.c decode_segment_thread_main)*
 
 ### Code-review crash candidates (from offline audit — confirm with /crashlog before fixing)
 The stream is live muxed TS with `EXT-X-DISCONTINUITY-SEQUENCE`; crash hits ~9s (first discontinuity). Ranked:

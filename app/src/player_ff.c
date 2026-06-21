@@ -66,6 +66,10 @@ static AVFrame          *g_aframe;
 static int16_t          *g_abuf;      // resampled S16 stereo scratch
 static int               g_abufCap;   // in stereo frames
 static int               g_haveAudio = 0;
+// Stream layout is constant within an HLS rendition, but av_find_best_stream
+// can transiently fail on a fresh per-segment TS. Cache the last-known-good
+// indices so audio/video never drop out between segments.
+static int               g_segVideoIdx = -1, g_segAudioIdx = -1;
 
 // Separate-audio path (HLS rendition where audio is its own playlist). A second
 // demuxer reads the audio segment stream via hls_audio_read on its own AVIO, and
@@ -352,6 +356,7 @@ int player_play(const char *url) {
     // (usually absent) muxed audio and drive the dedicated audio path instead.
     int useSep = (g_isHls && hls_has_audio());
     g_haveAudio = 0;
+    g_segVideoIdx = -1; g_segAudioIdx = -1;
     if (useSep && g_astream >= 0) {
         g_fmt->streams[g_astream]->discard = AVDISCARD_ALL;
         g_astream = -1;
@@ -1145,6 +1150,23 @@ static void *decode_segment_thread_main(void *arg) {
 
         int sv = av_find_best_stream(sfmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
         int sa = g_haveAudio ? av_find_best_stream(sfmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0) : -1;
+        // av_find_best_stream needs a fully-classified decodable codec. On live
+        // TS segments the AAC stream is sometimes not classified within the
+        // analyze window and it returns STREAM_NOT_FOUND even though the PMT
+        // lists an audio stream -> audio drops out for that segment. Fall back
+        // to a manual codec_type scan, then to the last-known-good index.
+        if (sv < 0) {
+            for (unsigned i = 0; i < sfmt->nb_streams; i++)
+                if (sfmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { sv = (int)i; break; }
+        }
+        if (g_haveAudio && sa < 0) {
+            for (unsigned i = 0; i < sfmt->nb_streams; i++)
+                if (sfmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) { sa = (int)i; break; }
+        }
+        if (sv >= 0) g_segVideoIdx = sv;
+        else if (g_segVideoIdx >= 0 && g_segVideoIdx < (int)sfmt->nb_streams) sv = g_segVideoIdx;
+        if (sa >= 0) g_segAudioIdx = sa;
+        else if (g_haveAudio && g_segAudioIdx >= 0 && g_segAudioIdx < (int)sfmt->nb_streams) sa = g_segAudioIdx;
         trace_mark("segdemux streams v=%d a=%d", sv, sa);
         AVRational vtb = (sv >= 0) ? sfmt->streams[sv]->time_base : (AVRational){1, 90000};
         AVRational atb = (sa >= 0) ? sfmt->streams[sa]->time_base : (AVRational){1, 90000};
