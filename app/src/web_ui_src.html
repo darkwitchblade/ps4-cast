@@ -109,6 +109,11 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
  padding:10px 6px;border-radius:10px;cursor:pointer;transition:.16s}
 .tabs button.on{background:var(--surf2);color:var(--txt);box-shadow:0 2px 8px rgba(0,0,0,.3)}
 .tabs .cnt{font-size:11px;color:var(--faint);margin-left:5px}
+.chips{display:flex;gap:7px;overflow-x:auto;-webkit-overflow-scrolling:touch;padding:2px 0 10px;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chipf{flex:none;border:1px solid var(--line);background:var(--surf);color:var(--mut);font-family:inherit;
+ font-size:12px;font-weight:600;padding:7px 13px;border-radius:999px;cursor:pointer;white-space:nowrap}
+.chipf.on{background:linear-gradient(160deg,var(--acc),var(--acc2));color:#fff;border-color:transparent}
 /* list rows */
 .pane{display:flex;flex-direction:column;gap:8px;min-height:8px}
 .empty{text-align:center;color:var(--faint);font-size:13px;padding:26px 10px;line-height:1.6}
@@ -248,7 +253,7 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
 
 <script>
 var $=function(i){return document.getElementById(i)};
-var drag=false,dur=0,hw=1,dbg=0,curTab='pl',plData=[],chanCur=-1;
+var drag=false,dur=0,hw=1,dbg=0,curTab='pl',plData=[],chanCur=-1,curGroup='';
 function busy(b){$('spin').style.display=b?'inline-block':'none'}
 function msg(t){$('msg').textContent=t}
 function fmt(s){s=Math.max(0,s|0);var h=(s/3600)|0,m=((s/60)|0)%60,x=s%60,p=function(n){return(n<10?'0':'')+n};return h>0?h+':'+p(m)+':'+p(x):m+':'+p(x)}
@@ -273,7 +278,7 @@ async function paste(){var el=$('u');el.focus();el.select();
 async function loadPlaylist(){var u=$('u').value.trim();if(!u){msg('Paste an M3U / playlist link first');$('u').focus();return}
  busy(true);msg('Loading playlist…');
  try{var r=await fetch('/playlist',{method:'POST',headers:{'Content-Type':'text/plain'},body:u});var a=await r.json();busy(false);
-  plData=a||[];chanCur=-1;renderPane('pl');tab('pl');
+  plData=a||[];chanCur=-1;curGroup='';renderPane('pl');tab('pl');
   if(!plData.length){msg('No channels found in that link')}else{msg(plData.length+' channels — tap one to play')}}
  catch(e){busy(false);msg('Could not load that playlist')}}
 
@@ -289,9 +294,16 @@ function chanRow(i,name,on){return '<div class="row'+(on?' on':'')+'" onclick="c
  '<div class="tx"><div class="n">'+esc(name)+'</div></div>'+
  (on?'<div class="live">LIVE</div>':'<div class="go"><svg viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>')+'</div>'}
 function chanPick(i){if(i<0||i>=plData.length)return;chanCur=i;renderPane('pl');post('/chan',''+i);msg('Tuning '+(plData[i].n||'channel '+(i+1)))}
+function setGroup(g){curGroup=g;renderPane('pl')}
 function renderPane(which){
  if(which=='pl'){if(!plData.length){$('panePl').innerHTML='<div class="empty">Paste an M3U / IPTV link above and tap <b>Load playlist</b> to browse channels here.</div>';$('cPl').textContent='';return}
-  var h='<div class="scrolly">';for(var i=0;i<plData.length;i++){h+=chanRow(i,plData[i].n||nameFromUrl(plData[i].u),i==chanCur)}h+='</div>';
+  var groups=[],seen={};for(var k=0;k<plData.length;k++){var g=plData[k].g||'';if(g&&!seen[g]){seen[g]=1;groups.push(g)}}
+  var h='';
+  if(groups.length>1){h+='<div class="chips"><button class="chipf'+(curGroup===''?' on':'')+'" onclick="setGroup(\'\')">All</button>';
+   for(var gi=0;gi<groups.length;gi++){h+='<button class="chipf'+(curGroup===groups[gi]?' on':'')+'" onclick="setGroup(\''+esc(groups[gi]).replace(/\x27/g,"&#39;")+'\')">'+esc(groups[gi])+'</button>'}h+='</div>'}
+  h+='<div class="scrolly">';var shown=0;
+  for(var i=0;i<plData.length;i++){if(curGroup&&(plData[i].g||'')!==curGroup)continue;h+=chanRow(i,plData[i].n||nameFromUrl(plData[i].u),i==chanCur);shown++}
+  h+='</div>';if(!shown)h+='<div class="empty">No channels in this group.</div>';
   $('panePl').innerHTML=h;$('cPl').textContent=plData.length}
 }
 function listPane(id,cntId,arr,icon,emptyMsg,rm){

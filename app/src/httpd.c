@@ -55,8 +55,10 @@ static char g_fav[MAX_FAV][URL_MAX];       static int g_favN = 0;
 // Loaded M3U/IPTV channel list, shared between the web UI and the on-screen
 // (D-pad) channel zapper. g_chanCur is the channel currently tuned, -1 if none.
 #define CHAN_NAME_MAX 96
+#define CHAN_GRP_MAX  48
 #define MAX_CHAN      256
 static char g_chanName[MAX_CHAN][CHAN_NAME_MAX];
+static char g_chanGroup[MAX_CHAN][CHAN_GRP_MAX];
 static char g_chanUrl[MAX_CHAN][URL_MAX];
 static int  g_chanN = 0;
 static int  g_chanCur = -1;
@@ -213,9 +215,9 @@ int httpd_resume_get(const char *url) {
 static void chan_save_file(void) {
     int fd = sceKernelOpen(CHAN_PATH, 0x0201 | 0x0400, 0666);
     if (fd < 0) return;
-    char line[URL_MAX + CHAN_NAME_MAX + 8];
+    char line[URL_MAX + CHAN_NAME_MAX + CHAN_GRP_MAX + 8];
     for (int i = 0; i < g_chanN; i++) {
-        int n = snprintf(line, sizeof(line), "%s\t%s\n", g_chanName[i], g_chanUrl[i]);
+        int n = snprintf(line, sizeof(line), "%s\t%s\t%s\n", g_chanName[i], g_chanGroup[i], g_chanUrl[i]);
         sceKernelWrite(fd, line, n);
     }
     sceKernelClose(fd);
@@ -223,7 +225,7 @@ static void chan_save_file(void) {
 static void chan_load_file(void) {
     int fd = sceKernelOpen(CHAN_PATH, 0, 0);
     if (fd < 0) return;
-    static char buf[MAX_CHAN * (URL_MAX + CHAN_NAME_MAX + 8)];
+    static char buf[MAX_CHAN * (URL_MAX + CHAN_NAME_MAX + CHAN_GRP_MAX + 8)];
     int n = (int)sceKernelRead(fd, buf, sizeof(buf) - 1);
     sceKernelClose(fd);
     if (n <= 0) return;
@@ -231,10 +233,12 @@ static void chan_load_file(void) {
     g_chanN = 0; g_chanCur = -1;
     char *save = NULL;
     for (char *ln = strtok_r(buf, "\n", &save); ln && g_chanN < MAX_CHAN; ln = strtok_r(NULL, "\n", &save)) {
-        char *tab = strchr(ln, '\t'); if (!tab) continue; *tab = '\0';
-        const char *url = tab + 1; if (!url[0]) continue;
-        strncpy(g_chanName[g_chanN], ln, CHAN_NAME_MAX - 1); g_chanName[g_chanN][CHAN_NAME_MAX - 1] = '\0';
-        strncpy(g_chanUrl[g_chanN], url, URL_MAX - 1); g_chanUrl[g_chanN][URL_MAX - 1] = '\0';
+        char *t1 = strchr(ln, '\t'); if (!t1) continue; *t1 = '\0';
+        char *t2 = strchr(t1 + 1, '\t'); if (!t2) continue; *t2 = '\0';
+        const char *grp = t1 + 1, *url = t2 + 1; if (!url[0]) continue;
+        strncpy(g_chanName[g_chanN], ln, CHAN_NAME_MAX - 1);   g_chanName[g_chanN][CHAN_NAME_MAX - 1] = '\0';
+        strncpy(g_chanGroup[g_chanN], grp, CHAN_GRP_MAX - 1);  g_chanGroup[g_chanN][CHAN_GRP_MAX - 1] = '\0';
+        strncpy(g_chanUrl[g_chanN], url, URL_MAX - 1);         g_chanUrl[g_chanN][URL_MAX - 1] = '\0';
         g_chanN++;
     }
 }
@@ -300,11 +304,23 @@ static void name_from_url(const char *url, char *out, int cap) {
     memcpy(out, slash, n); out[n] = '\0';
 }
 
-static void chan_add(const char *name, const char *url) {
+static void chan_add(const char *name, const char *group, const char *url) {
     if (g_chanN >= MAX_CHAN) return;
-    strncpy(g_chanName[g_chanN], name, CHAN_NAME_MAX - 1); g_chanName[g_chanN][CHAN_NAME_MAX - 1] = '\0';
-    strncpy(g_chanUrl[g_chanN], url, URL_MAX - 1);         g_chanUrl[g_chanN][URL_MAX - 1] = '\0';
+    strncpy(g_chanName[g_chanN], name, CHAN_NAME_MAX - 1);  g_chanName[g_chanN][CHAN_NAME_MAX - 1] = '\0';
+    strncpy(g_chanGroup[g_chanN], group ? group : "", CHAN_GRP_MAX - 1); g_chanGroup[g_chanN][CHAN_GRP_MAX - 1] = '\0';
+    strncpy(g_chanUrl[g_chanN], url, URL_MAX - 1);          g_chanUrl[g_chanN][URL_MAX - 1] = '\0';
     g_chanN++;
+}
+
+// Pull a quoted #EXTINF attribute value, e.g. key = "group-title=\"".
+static void extinf_attr(const char *line, const char *key, char *out, int cap) {
+    out[0] = '\0';
+    const char *k = strstr(line, key);
+    if (!k) return;
+    k += strlen(key);
+    int i = 0;
+    while (k[i] && k[i] != '"' && i < cap - 1) { out[i] = k[i]; i++; }
+    out[i] = '\0';
 }
 
 // Parse a fetched M3U/IPTV playlist into the shared channel store (caller holds
@@ -314,10 +330,12 @@ static void playlist_store(const char *text, const char *srcUrl) {
     if (strstr(text, "#EXT-X-STREAM-INF") || strstr(text, "#EXT-X-TARGETDURATION") ||
         strstr(text, "#EXT-X-MEDIA-SEQUENCE") || strstr(text, "#EXT-X-PLAYLIST-TYPE")) {
         char nm[CHAN_NAME_MAX]; name_from_url(srcUrl, nm, sizeof(nm));
-        chan_add(nm, srcUrl);
+        chan_add(nm, "", srcUrl);
         return;
     }
     char pend[256]; pend[0] = '\0';
+    char pendGrp[CHAN_GRP_MAX]; pendGrp[0] = '\0';
+    char sticky[CHAN_GRP_MAX]; sticky[0] = '\0';   // #EXTGRP applies until changed
     for (const char *p = text; *p && g_chanN < MAX_CHAN; ) {
         const char *nl = strchr(p, '\n');
         int len = nl ? (int)(nl - p) : (int)strlen(p);
@@ -339,14 +357,18 @@ static void playlist_store(const char *text, const char *srcUrl) {
                     while (*name == ' ' || *name == '\t') name++;
                     strncpy(pend, name, sizeof(pend) - 1); pend[sizeof(pend) - 1] = '\0';
                 }
+                extinf_attr(s, "group-title=\"", pendGrp, sizeof(pendGrp));
+            } else if (strncmp(s, "#EXTGRP:", 8) == 0) {
+                const char *g = s + 8; while (*g == ' ' || *g == '\t') g++;
+                strncpy(sticky, g, sizeof(sticky) - 1); sticky[sizeof(sticky) - 1] = '\0';
             } else if (s[0] != '#') {
                 char nm[CHAN_NAME_MAX];
                 if (pend[0]) { strncpy(nm, pend, sizeof(nm) - 1); nm[sizeof(nm) - 1] = '\0'; }
                 else name_from_url(s, nm, sizeof(nm));
-                chan_add(nm, s);
-                pend[0] = '\0';
+                chan_add(nm, pendGrp[0] ? pendGrp : sticky, s);
+                pend[0] = '\0'; pendGrp[0] = '\0';
             }
-            // other #directives (#EXTM3U, #EXTGRP, #EXTVLCOPT, ...) are ignored
+            // other #directives (#EXTM3U, #EXTVLCOPT, ...) are ignored
         }
         if (!nl) break;
         p = nl + 1;
@@ -361,6 +383,7 @@ static int chans_to_json(char *out, int cap) {
         if (i) out[o++] = ',';
         out[o++] = '{';
         o += snprintf(out + o, cap - o, "\"n\":"); json_str(out, cap, &o, g_chanName[i], 90);
+        o += snprintf(out + o, cap - o, ",\"g\":"); json_str(out, cap, &o, g_chanGroup[i], 44);
         o += snprintf(out + o, cap - o, ",\"u\":"); json_str(out, cap, &o, g_chanUrl[i], 1000);
         out[o++] = '}';
     }
@@ -382,6 +405,14 @@ int httpd_chan_get(int i, char *name, int nameCap, char *url, int urlCap) {
     }
     scePthreadMutexUnlock(&g_mtx);
     return ok;
+}
+// Copy channel i's group label (empty string if none).
+void httpd_chan_group(int i, char *out, int cap) {
+    if (!out || cap <= 0) return;
+    out[0] = '\0';
+    scePthreadMutexLock(&g_mtx);
+    if (i >= 0 && i < g_chanN) { strncpy(out, g_chanGroup[i], cap - 1); out[cap - 1] = '\0'; }
+    scePthreadMutexUnlock(&g_mtx);
 }
 // Mark channel i as the one now tuned (also updates the HUD title source).
 void httpd_chan_set_current(int i) {

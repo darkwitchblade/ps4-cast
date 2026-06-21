@@ -16,6 +16,7 @@ const char *httpd_last_push(void);                // last cast URL (HUD title)
 int  httpd_chan_count(void);
 int  httpd_chan_current(void);                    // tuned channel index, -1 none
 int  httpd_chan_get(int i, char *name, int nameCap, char *url, int urlCap);
+void httpd_chan_group(int i, char *out, int cap);
 void httpd_chan_set_current(int i);
 
 // Per-URL resume positions (VOD): remember where playback stopped.

@@ -249,6 +249,10 @@ static int httpd_chan_get(int i, char *name, int nameCap, char *url, int urlCap)
     if(name&&nameCap>0){ strncpy(name,MOCKCH[i],nameCap-1); name[nameCap-1]='\0'; }
     (void)url;(void)urlCap; return 1;
 }
+static void httpd_chan_group(int i, char *o, int c){
+    const char *g = (i<3)?"News":(i<6)?"Documentary":(i<9)?"Sports":"Entertainment";
+    strncpy(o,(i>=0&&i<MOCKN)?g:"",c-1); o[c-1]='\0';
+}
 static void draw_channel_overlay(Gfx *g, int sel) {
     int n = httpd_chan_count();
     if (n <= 0) return;
@@ -264,6 +268,8 @@ static void draw_channel_overlay(Gfx *g, int sel) {
     gtext(g, x + 46, y + 24, "CHANNELS", 3, TXT, 1);
     char cnt[24]; snprintf(cnt, sizeof(cnt), "%d", n);
     gfx_text(g, x + W - 28 - gfx_text_w(cnt, 2), y + 30, cnt, 2, FAINT);
+    char grp[48]; httpd_chan_group(sel, grp, sizeof(grp));
+    if (grp[0]) { int gw = gfx_text_w(grp, 2); gfx_text(g, x + W - 28 - gfx_text_w(cnt, 2) - 26 - gw, y + 30, grp, 2, ACC_LT); }
     gfx_rect_a(g, x + 24, y + headH - 12, W - 48, 1, HAIR, 30);
     int start = sel - K / 2;
     if (start > n - K) start = n - K;
@@ -287,7 +293,7 @@ static void draw_channel_overlay(Gfx *g, int sel) {
             gfx_text(g, dx + 14, rowY + rowH / 2 - 8, "LIVE", 1, seld ? INK : LIVE);
         }
     }
-    gfx_text(g, x + 28, y + H - 34, "Up / Down  change channel      Cross  watch", 2, MUT);
+    gfx_text(g, x + 28, y + H - 34, "Up/Down channel   Left/Right group   Cross watch", 2, MUT);
 }
 
 static void draw_stats_overlay(Gfx *g, double netMBs, int fps) {

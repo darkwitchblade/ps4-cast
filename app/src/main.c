@@ -479,6 +479,35 @@ static void draw_hud(Gfx *g) {
     }
 }
 
+// Jump to the first channel of the next (dir +1) or previous (dir -1) IPTV
+// group relative to `sel`, for fast Left/Right group navigation in the zapper.
+static int chan_group_jump(int sel, int dir) {
+    int n = httpd_chan_count();
+    if (n <= 0) return sel;
+    if (sel < 0) sel = 0;
+    char g0[48]; httpd_chan_group(sel, g0, sizeof(g0));
+    if (dir > 0) {
+        for (int k = 1; k <= n; k++) {
+            int i = (sel + k) % n; char g[48]; httpd_chan_group(i, g, sizeof(g));
+            if (strcmp(g, g0) != 0) return i;            // first of the next group
+        }
+        return sel;
+    }
+    int start = sel;                                     // back up to start of current group
+    for (int k = 1; k < n; k++) {
+        int i = (sel - k + n) % n; char g[48]; httpd_chan_group(i, g, sizeof(g));
+        if (strcmp(g, g0) != 0) break; start = i;
+    }
+    int last = (start - 1 + n) % n;                      // last of the previous group
+    char gp[48]; httpd_chan_group(last, gp, sizeof(gp));
+    int pstart = last;
+    for (int k = 1; k < n; k++) {
+        int i = (last - k + n) % n; char g[48]; httpd_chan_group(i, g, sizeof(g));
+        if (strcmp(g, gp) != 0) break; pstart = i;
+    }
+    return pstart;                                       // first of the previous group
+}
+
 // TV-box-style channel list overlay: a fast, scrollable list of the loaded
 // playlist with the highlighted selection and a live marker on the tuned one.
 static void draw_channel_overlay(Gfx *g, int sel) {
@@ -494,11 +523,16 @@ static void draw_channel_overlay(Gfx *g, int sel) {
     int x = 56, y = (g->height - H) / 2;
     panel(g, x, y, W, H, 24, INK, 226);
 
-    // header: accent tick + title + count
+    // header: accent tick + title + count (+ current group, if any)
     gfx_round(g, x + 28, y + 26, 6, 28, 3, ACCENT);
     gtext(g, x + 46, y + 24, "CHANNELS", 3, TXT, 1);
     char cnt[24]; snprintf(cnt, sizeof(cnt), "%d", n);
     gfx_text(g, x + W - 28 - gfx_text_w(cnt, 2), y + 30, cnt, 2, FAINT);
+    char grp[48]; httpd_chan_group(sel, grp, sizeof(grp));
+    if (grp[0]) {
+        int gw = gfx_text_w(grp, 2);
+        gfx_text(g, x + W - 28 - gfx_text_w(cnt, 2) - 26 - gw, y + 30, grp, 2, ACC_LT);
+    }
     gfx_rect_a(g, x + 24, y + headH - 12, W - 48, 1, HAIR, 30);
 
     int start = sel - K / 2;
@@ -526,7 +560,7 @@ static void draw_channel_overlay(Gfx *g, int sel) {
             gfx_text(g, dx + 14, rowY + rowH / 2 - 8, "LIVE", 1, seld ? INK : LIVE);
         }
     }
-    gfx_text(g, x + 28, y + H - 34, "Up / Down  change channel      Cross  watch", 2, MUT);
+    gfx_text(g, x + 28, y + H - 34, "Up/Down channel   Left/Right group   Cross watch", 2, MUT);
 }
 
 // Top-right stream telemetry, toggled by the touchpad. Plain shadowed text with
@@ -639,6 +673,16 @@ int main(void) {
             chanTuneAt = now + 450000ULL;              // tune shortly after you settle
             hudUntil = now + 5000000ULL;
             pressed &= ~(ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN);  // don't also seek
+        }
+        // While the overlay is up, Left/Right jump between IPTV groups (fast
+        // navigation of big playlists); only then — otherwise they seek.
+        if (nch > 0 && now < chanUntil && (pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT))) {
+            if (navSel < 0) { navSel = httpd_chan_current(); if (navSel < 0) navSel = 0; }
+            navSel = chan_group_jump(navSel, (pressed & ORBIS_PAD_BUTTON_RIGHT) ? 1 : -1);
+            chanUntil = now + 6000000ULL;
+            chanTuneAt = now + 450000ULL;
+            hudUntil = now + 5000000ULL;
+            pressed &= ~(ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT);
         }
         // Cross while the overlay is up = watch the highlighted channel now.
         if (nch > 0 && now < chanUntil && (pressed & ORBIS_PAD_BUTTON_CROSS)) {
