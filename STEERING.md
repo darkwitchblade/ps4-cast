@@ -65,6 +65,15 @@ The stream is live muxed TS with `EXT-X-DISCONTINUITY-SEQUENCE`; crash hits ~9s 
 
 **Already fixed (safe, build-verified, no device test needed):** the `g_sws` over-read — it now rebuilds when the SOURCE resolution/format changes, not just the output size (player_ff.c build_scaled). This is a real memory-safety bug independent of the above.
 
+## Visibility + reproduction harness (NEW) — for the intermittent "system software error" crash
+The user reports an intermittent crash dialog ("An error has occurred in the system software") with the app lingering in the background. `/status` is BLIND to it (decode/HTTP threads stay alive while the display faults). Tooling built to see + reproduce it:
+- **`scripts/klog-capture.py`** — streams the PS4 kernel log (:3232), flags faults. CONFIRMED it captures the crash dialog: `CrashReportSuggestActionScene`/`CrashReportNavigationScene` = the dialog loading/unloading. Run it in the background during any test.
+- **`scripts/fake-live-hls.py`** — local LIVE HLS simulator (sliding-window playlist over ffmpeg TS segments) → drives the real live seg-demux + read-ahead + HW path (the public test stream is dead). `ffmpeg ... -f segment -segment_time 2 -segment_format mpegts seg_%03d.ts` into /tmp/livesim, then cast `http://<host>:8010/live.m3u8`.
+- **`scripts/auto-recover.sh`** — kill+relaunch via :9090 (validated 3×).
+
+**Crash characterization (so far):** casting the live path intermittently kills the app with an **EMPTY /crashlog** (NOT a signal — fatal_signal would log; NOT the hang-watchdog — it logs HANG on v03.02) and the app is **absent from the klog FMEM process snapshot** → it's terminated from OUTSIDE by a **GPU/system fault**, which in-process signal/watchdog handlers cannot catch. Reproduced once (~5s in), ran clean the next time → intermittent. In the live HW-decode + triple-buffer flip path.
+**Next leads:** (a) add app-side GPU/flip error logging — check `sceVideoOutSubmitFlip`/`sceGnmSubmitDone` return codes (currently IGNORED in gfx_present) + log to catch the fault precursor before the system kills us; (b) extended live-sim soak with klog to gather crash instances + look for a trigger (discontinuity? a specific segment boundary?); (c) A/B the triple-buffer contribution (user says crash predates it, but aggressive flips may raise its rate).
+
 ## Dev pipeline / crash auto-recovery (v03.02) — IMPLEMENTED
 Goal: tolerate crashes during autonomous test loops without getting stuck.
 - **Capture:** signal crashes write `CRASH v.. sig=.. addr=..` to /data; hangs now write `HANG v.. stale=..ms` (freeze-watchdog) — both readable via GET /crashlog. (Earlier gap: hangs left an empty log; fixed.)
