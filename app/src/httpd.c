@@ -17,12 +17,6 @@
 #include <orbis/Net.h>
 #include <orbis/libkernel.h>
 
-extern int remote_set_enabled(int on);
-extern int remote_is_enabled(void);
-extern const char *remote_status(void);
-extern const char *remote_capture(void);
-extern void remote_capture_clear(void);
-
 // IPv4 sockaddr (16 bytes) — OpenOrbis has no OrbisNetSockaddrIn, so we lay it
 // out by hand (matches FreeBSD / OrbisNetSockaddr size).
 typedef struct {
@@ -122,6 +116,100 @@ static int json_list(char *out, int cap, char arr[][URL_MAX], int n) {
         o += snprintf(out + o, cap - o, "\"");
     }
     o += snprintf(out + o, cap - o, "]");
+    return o;
+}
+
+// ---- M3U / IPTV playlist -------------------------------------------------
+// Fetch an .m3u/.m3u8 playlist URL (via the shared aseg HTTP client) and turn
+// it into JSON [{"n":"name","u":"url"},...] so the web UI can show a channel /
+// movie picker. IPTV channel lists use a "#EXTINF:<dur> <attrs>,<Display Name>"
+// line followed by a media URL. A genuine HLS stream (segment or master
+// playlist, identified by #EXT-X- tags) is NOT a channel list — for those we
+// return a single entry that points at the original URL so it can be cast.
+#define PLAYLIST_MAX_ENTRIES 200
+extern int aseg_fetch(const char *url, uint8_t **buf, int *len);
+
+// Append a JSON-escaped, length-capped string (with surrounding quotes).
+static void json_str(char *out, int cap, int *po, const char *s, int maxchars) {
+    int o = *po, n = 0;
+    if (o < cap - 2) out[o++] = '"';
+    for (const char *p = s; *p && o < cap - 8 && n < maxchars; p++, n++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch == '"' || ch == '\\') { out[o++] = '\\'; out[o++] = ch; }
+        else if (ch < 0x20)          { out[o++] = ' '; }   // strip control chars
+        else                         { out[o++] = ch; }
+    }
+    if (o < cap - 1) out[o++] = '"';
+    *po = o;
+}
+
+// Derive a readable name from a URL: last path segment without the query/hash.
+static void name_from_url(const char *url, char *out, int cap) {
+    const char *q = strpbrk(url, "?#");
+    const char *end = q ? q : url + strlen(url);
+    const char *slash = end;
+    while (slash > url && slash[-1] != '/') slash--;
+    int n = (int)(end - slash);
+    if (n <= 0 || n >= cap) { strncpy(out, "stream", cap - 1); out[cap - 1] = '\0'; return; }
+    memcpy(out, slash, n); out[n] = '\0';
+}
+
+static int playlist_to_json(const char *text, const char *srcUrl, char *out, int cap) {
+    int o = 0;
+    out[o++] = '[';
+    // HLS stream (not a channel list)? -> a single entry pointing at the source.
+    if (strstr(text, "#EXT-X-STREAM-INF") || strstr(text, "#EXT-X-TARGETDURATION") ||
+        strstr(text, "#EXT-X-MEDIA-SEQUENCE") || strstr(text, "#EXT-X-PLAYLIST-TYPE")) {
+        char nm[96]; name_from_url(srcUrl, nm, sizeof(nm));
+        out[o++] = '{';
+        o += snprintf(out + o, cap - o, "\"n\":"); json_str(out, cap, &o, nm, 80);
+        o += snprintf(out + o, cap - o, ",\"u\":"); json_str(out, cap, &o, srcUrl, 1000);
+        out[o++] = '}';
+        out[o++] = ']';
+        return o;
+    }
+    char pend[256]; pend[0] = '\0';
+    int count = 0, first = 1;
+    for (const char *p = text; *p && count < PLAYLIST_MAX_ENTRIES && o < cap - 2400; ) {
+        const char *nl = strchr(p, '\n');
+        int len = nl ? (int)(nl - p) : (int)strlen(p);
+        char line[1100];
+        int ll = len < (int)sizeof(line) - 1 ? len : (int)sizeof(line) - 1;
+        memcpy(line, p, ll); line[ll] = '\0';
+        for (int i = (int)strlen(line) - 1; i >= 0 && (line[i]=='\r'||line[i]==' '||line[i]=='\t'); i--) line[i] = '\0';
+        char *s = line; while (*s == ' ' || *s == '\t') s++;
+        if (*s) {
+            if (strncmp(s, "#EXTINF:", 8) == 0) {
+                // Channel name = text after the first comma that is outside quotes
+                // (attributes like group-title="A,B" may themselves contain commas).
+                const char *cur = s + 8; int inq = 0; const char *name = NULL;
+                for (; *cur; cur++) {
+                    if (*cur == '"') inq = !inq;
+                    else if (*cur == ',' && !inq) { name = cur + 1; break; }
+                }
+                if (name) {
+                    while (*name == ' ' || *name == '\t') name++;
+                    strncpy(pend, name, sizeof(pend) - 1); pend[sizeof(pend) - 1] = '\0';
+                }
+            } else if (s[0] != '#') {
+                char nm[256];
+                if (pend[0]) { strncpy(nm, pend, sizeof(nm) - 1); nm[sizeof(nm) - 1] = '\0'; }
+                else name_from_url(s, nm, sizeof(nm));
+                if (!first) out[o++] = ',';
+                first = 0;
+                out[o++] = '{';
+                o += snprintf(out + o, cap - o, "\"n\":"); json_str(out, cap, &o, nm, 80);
+                o += snprintf(out + o, cap - o, ",\"u\":"); json_str(out, cap, &o, s, 1000);
+                out[o++] = '}';
+                count++;
+                pend[0] = '\0';
+            }
+            // other #directives (#EXTM3U, #EXTGRP, #EXTVLCOPT, ...) are ignored
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    out[o++] = ']';
     return o;
 }
 
@@ -514,10 +602,10 @@ static void handle_client(OrbisNetId c) {
         double cur = 0, dur = 0;
         player_progress(&cur, &dur);
         int j = snprintf(json, sizeof(json),
-                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"native\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"debug\":\"%s\",\"pad\":\"%s\",\"remote\":\"%s\",\"remote_enabled\":%d,\"hw_enabled\":%d}",
+                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"native\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"debug\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d}",
                          APP_VER, jb_result(), goldhen_status(), player_status(), handoff_status(), ssdp_status(),
                          active, player_is_paused(), (int)(cur + 0.5), (int)(dur + 0.5), g_last_push, dbg, pad_diag_get(),
-                         remote_status(), remote_is_enabled(), player_hw_enabled());
+                         player_hw_enabled());
         send_response(c, "200 OK", "application/json", json, j);
         return;
     }
@@ -553,27 +641,6 @@ static void handle_client(OrbisNetId c) {
         int on = (body[0] != '0');
         player_set_hw(on);
         send_response(c, "200 OK", "text/plain", on ? "hw on" : "hw off", on ? 5 : 6);
-        return;
-    }
-
-    // Toggle HDMI-CEC / TV remote SPECIAL-port reader. The reader runs on its
-    // own thread so a blocking CEC path cannot stall the render/control loop.
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/remote") == 0) {
-        int on = (body[0] != '0');
-        remote_set_enabled(on);
-        send_response(c, "200 OK", "text/plain", on ? "remote on" : "remote off", on ? 9 : 10);
-        return;
-    }
-
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/remote/capture") == 0) {
-        const char *r = remote_capture();
-        send_response(c, "200 OK", "text/plain", r, (int)strlen(r));
-        return;
-    }
-
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/remote/clear") == 0) {
-        remote_capture_clear();
-        send_response(c, "200 OK", "text/plain", "remote capture cleared", 22);
         return;
     }
 
@@ -875,6 +942,29 @@ static void handle_client(OrbisNetId c) {
         for (int i = (int)strlen(u) - 1; i >= 0 && (u[i]=='\r'||u[i]=='\n'||u[i]==' '||u[i]=='\t'); i--) u[i] = '\0';
         if (u[0]) { if (path[1] == 'q') queue_push(u); else fav_toggle(u); }
         send_response(c, "200 OK", "text/plain", "ok", 2); return;
+    }
+
+    // Expand an M3U / IPTV playlist link into a JSON channel list. Body = URL.
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/playlist") == 0) {
+        char url[URL_MAX];
+        strncpy(url, body, sizeof(url) - 1); url[sizeof(url) - 1] = '\0';
+        for (int i = (int)strlen(url) - 1; i >= 0 && (url[i]=='\r'||url[i]=='\n'||url[i]==' '||url[i]=='\t'); i--) url[i] = '\0';
+        const int CAP = 512 * 1024;
+        char *out = malloc(CAP);
+        if (!out) { send_response(c, "200 OK", "application/json", "[]", 2); return; }
+        int n = 0;
+        if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) {
+            uint8_t *buf = NULL; int len = 0;
+            if (aseg_fetch(url, &buf, &len) == 0 && buf && len > 0) {
+                uint8_t *txt = realloc(buf, (size_t)len + 1);
+                if (txt) { buf = txt; buf[len] = '\0'; n = playlist_to_json((const char *)buf, url, out, CAP); }
+                free(buf);
+            }
+        }
+        if (n <= 0) { out[0] = '['; out[1] = ']'; n = 2; }
+        send_response(c, "200 OK", "application/json", out, n);
+        free(out);
+        return;
     }
 
     if (strcmp(method, "POST") == 0 && strcmp(path, "/quit") == 0) {

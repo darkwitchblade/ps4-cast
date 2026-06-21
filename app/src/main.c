@@ -243,8 +243,6 @@ typedef struct {
     int ok;
 } PadState;
 
-static void remote_event_append(const char *tag, int idx, int rc, int c, uint32_t buttons, const uint8_t *ext, uint32_t mapped);
-
 static int pad_init(PadState *p) {
     memset(p, 0, sizeof(*p));
     for (int i = 0; i < 8; i++) p->handles[i] = -1;
@@ -260,8 +258,8 @@ static int pad_init(PadState *p) {
     if (user < 0) return -1;
 
     // Keep the render/control loop on standard pads only. Polling SPECIAL ports
-    // and scePadReadStateExt here can block on this console/TV remote path,
-    // leaving the HTTP server alive but the main loop unable to consume casts.
+    // and scePadReadStateExt here can block, leaving the HTTP server alive but
+    // the main loop unable to consume casts.
     for (int type_i = 0; type_i < 1; type_i++) {
         int type = ORBIS_PAD_PORT_TYPE_STANDARD;
         for (int idx = 0; idx < 4 && p->count < 8; idx++) {
@@ -306,8 +304,6 @@ static uint32_t pad_poll(PadState *p) {
         p->extRc[i] = 0;
         uint32_t pbits = p->down[i] & ~p->prev[i];
         pressed |= pbits;
-        if (pbits || p->extChanged[i])
-            remote_event_append("standard", p->index[i], p->readRc[i], p->connected[i], p->down[i], p->ext[i], pbits);
     }
     char diag[240];
     int n = snprintf(diag, sizeof(diag), "pad n=%d", p->count);
@@ -321,178 +317,6 @@ static uint32_t pad_poll(PadState *p) {
     }
     pad_diag_set(diag);
     return pressed;
-}
-
-// ---- HDMI-CEC / TV remote ------------------------------------------------
-// The TV remote (and other SPECIAL-port devices) sit on
-// ORBIS_PAD_PORT_TYPE_SPECIAL and are read via scePadReadStateExt, which can
-// BLOCK — so they must NOT be polled in the render loop (that would stall casts,
-// which is exactly why the original code only polled STANDARD pads). This
-// dedicated thread blocks freely and publishes edge-detected presses into
-// g_remotePressed; the main loop ORs that into its normal pad handling, so every
-// existing control (pause / seek / stop) works from the remote with no new
-// mapping. Remote keys arrive in OrbisPadData.buttons using the same bit set.
-static volatile uint32_t g_remotePressed = 0;
-// Default ON now that the freeze-hardening is verified. The reader is isolated
-// to its own thread and can still be disabled from the web UI via POST /remote 0.
-static volatile int      g_remoteEnabled = 1;
-static volatile int      g_remoteStop = 0;
-static volatile int      g_remoteHandle = -1;   // exposed so a stop path can close it
-static volatile int      g_remoteIndex = -1;
-static volatile int      g_remoteOpen = 0;
-static volatile int      g_remoteReadRc = 0;
-static volatile int      g_remoteConnected = 0;
-static volatile uint32_t g_remoteDown = 0;
-static volatile uint32_t g_remoteLastPress = 0;
-static volatile uint8_t  g_remoteExt0 = 0, g_remoteExt1 = 0, g_remoteExt2 = 0, g_remoteExt3 = 0;
-static char              g_remoteEvents[900];
-
-static void remote_event_append(const char *tag, int idx, int rc, int c, uint32_t buttons, const uint8_t *ext, uint32_t mapped) {
-    char line[180];
-    snprintf(line, sizeof(line), "%s idx=%d rc=%d c=%d b=%08x m=%08x x=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-             tag, idx, rc, c, buttons, mapped,
-             ext ? ext[0] : 0, ext ? ext[1] : 0, ext ? ext[2] : 0, ext ? ext[3] : 0,
-             ext ? ext[4] : 0, ext ? ext[5] : 0, ext ? ext[6] : 0, ext ? ext[7] : 0);
-    int cur = (int)strlen(g_remoteEvents);
-    int ln = (int)strlen(line);
-    if (ln >= (int)sizeof(g_remoteEvents)) return;
-    if (cur + ln >= (int)sizeof(g_remoteEvents)) {
-        int drop = (cur + ln) - ((int)sizeof(g_remoteEvents) - 1);
-        char *nl = memchr(g_remoteEvents + drop, '\n', cur - drop);
-        drop = nl ? (int)(nl - g_remoteEvents) + 1 : drop;
-        memmove(g_remoteEvents, g_remoteEvents + drop, cur - drop + 1);
-        cur -= drop;
-    }
-    memcpy(g_remoteEvents + cur, line, ln + 1);
-}
-
-static uint32_t remote_map_cec_code(uint8_t code) {
-    switch (code) {
-        // HDMI-CEC User Control Pressed command codes. Some TVs expose these
-        // through OrbisPadData.ext[] instead of the normal buttons field.
-        case 0x00: return ORBIS_PAD_BUTTON_CROSS;   // Select
-        case 0x01: return ORBIS_PAD_BUTTON_UP;
-        case 0x02: return ORBIS_PAD_BUTTON_DOWN;
-        case 0x03: return ORBIS_PAD_BUTTON_LEFT;
-        case 0x04: return ORBIS_PAD_BUTTON_RIGHT;
-        case 0x0d: return ORBIS_PAD_BUTTON_CIRCLE;  // Exit
-        case 0x44: return ORBIS_PAD_BUTTON_CROSS;   // Play
-        case 0x45: return ORBIS_PAD_BUTTON_CIRCLE;  // Stop
-        case 0x46: return ORBIS_PAD_BUTTON_CROSS;   // Pause
-        case 0x48: return ORBIS_PAD_BUTTON_LEFT;    // Rewind
-        case 0x49: return ORBIS_PAD_BUTTON_RIGHT;   // Fast forward
-        case 0x4b: return ORBIS_PAD_BUTTON_RIGHT;   // Forward
-        case 0x4c: return ORBIS_PAD_BUTTON_LEFT;    // Backward
-        case 0x60: return ORBIS_PAD_BUTTON_CROSS;   // Play function
-        case 0x61: return ORBIS_PAD_BUTTON_CROSS;   // Pause/play function
-        case 0x64: return ORBIS_PAD_BUTTON_CIRCLE;  // Stop function
-        default:   return 0;
-    }
-}
-
-static uint32_t remote_map_ext_delta(const uint8_t *ext, const uint8_t *prevExt) {
-    uint32_t mapped = 0;
-    for (int i = 0; i < 16; i++) {
-        if (ext[i] != prevExt[i] && ext[i] != 0)
-            mapped |= remote_map_cec_code(ext[i]);
-    }
-    return mapped;
-}
-
-int remote_set_enabled(int on) {
-    g_remoteEnabled = on ? 1 : 0;
-    // Do not close g_remoteHandle from the HTTP thread: the remote reader may
-    // be inside scePadReadStateExt on that same handle. Cross-thread close can
-    // hard-fault the HID path. The reader releases the handle on its own.
-    return g_remoteEnabled;
-}
-
-int remote_is_enabled(void) { return g_remoteEnabled; }
-
-const char *remote_status(void) {
-    static char b[220];
-    snprintf(b, sizeof(b), "remote en=%d open=%d idx=%d h=%d rc=%d c=%d b=%08x last=%08x x=%02x%02x%02x%02x",
-             g_remoteEnabled, g_remoteOpen, g_remoteIndex, g_remoteHandle, g_remoteReadRc,
-             g_remoteConnected, g_remoteDown, g_remoteLastPress,
-             g_remoteExt0, g_remoteExt1, g_remoteExt2, g_remoteExt3);
-    return b;
-}
-
-const char *remote_capture(void) { return g_remoteEvents[0] ? g_remoteEvents : "(no remote events yet)\n"; }
-
-void remote_capture_clear(void) { g_remoteEvents[0] = '\0'; }
-
-static void *remote_thread_main(void *arg) {
-    (void)arg;
-    int user = -1;
-    int h = -1;
-    int idx = 0;
-    int lastOpenFailIdx = -1;
-    int lastOpenFailRc = 0;
-    uint32_t prev = 0;
-    uint8_t prevExt[16];
-    memset(prevExt, 0, sizeof(prevExt));
-    while (!g_remoteStop) {
-        if (!g_remoteEnabled) {                  // dormant: release the port, idle, touch nothing
-            if (h >= 0) { scePadClose(h); h = -1; g_remoteHandle = -1; }
-            g_remoteOpen = 0; g_remoteIndex = -1; g_remoteConnected = 0; g_remoteDown = 0;
-            sceKernelUsleep(1000 * 1000);
-            continue;
-        }
-        if (h < 0) {
-            if (user < 0) sceUserServiceGetInitialUser(&user);
-            h = scePadOpen(user, ORBIS_PAD_PORT_TYPE_SPECIAL, idx, NULL);
-            if (h < 0) {
-                g_remoteIndex = idx;
-                g_remoteOpen = 0;
-                g_remoteReadRc = h;
-                if (idx != lastOpenFailIdx || h != lastOpenFailRc) {
-                    uint8_t z[16] = {0};
-                    remote_event_append("openfail", idx, h, 0, 0, z, 0);
-                    lastOpenFailIdx = idx;
-                    lastOpenFailRc = h;
-                }
-                idx = (idx + 1) & 3;                 // TVs/CEC can land on a nonzero SPECIAL slot
-                sceKernelUsleep(750 * 1000);
-                continue;
-            }
-            lastOpenFailIdx = -1;
-            lastOpenFailRc = 0;
-            g_remoteHandle = h;
-            g_remoteIndex = idx;
-            g_remoteOpen = 1;
-            prev = 0;
-            memset(prevExt, 0, sizeof(prevExt));
-            pad_diag_set("remote: SPECIAL port open");
-        }
-        OrbisPadData d;
-        memset(&d, 0, sizeof(d));
-        int rc = scePadReadStateExt(h, &d);
-        g_remoteReadRc = rc;
-        if (g_remoteStop) break;
-        if (rc != 0) { scePadClose(h); h = -1; g_remoteHandle = -1; g_remoteOpen = 0; sceKernelUsleep(500 * 1000); continue; }
-        g_remoteConnected = d.connected;
-        g_remoteDown = d.buttons;
-        g_remoteExt0 = d.ext[0]; g_remoteExt1 = d.ext[1]; g_remoteExt2 = d.ext[2]; g_remoteExt3 = d.ext[3];
-        if (d.connected || d.buttons || memcmp(prevExt, d.ext, sizeof(d.ext)) != 0) {
-            uint32_t pressed = d.buttons & ~prev;   // rising edges only for normal pad-style bits
-            uint32_t mapped = remote_map_ext_delta(d.ext, prevExt);
-            prev = d.buttons;
-            if (pressed || mapped) {
-                uint32_t out = pressed | mapped;
-                g_remoteLastPress = out;
-                g_remotePressed |= out;
-            }
-            if (pressed || mapped || memcmp(prevExt, d.ext, sizeof(d.ext)) != 0)
-                remote_event_append("special", idx, rc, d.connected, d.buttons, d.ext, mapped);
-            memcpy(prevExt, d.ext, sizeof(prevExt)); // telemetry: raw CEC/media keys if buttons stay zero
-        } else {
-            prev = 0;
-        }
-        sceKernelUsleep(16 * 1000);                  // ~60Hz; blocking-safe on this thread
-    }
-    if (h >= 0) { scePadClose(h); g_remoteHandle = -1; }
-    return NULL;
 }
 
 static void draw_hud(Gfx *g) {
@@ -579,14 +403,10 @@ int main(void) {
     uint64_t hudUntil = 0;
     PadState pad;
     pad_init(&pad);
-    // TV remote (HDMI-CEC) reader on its own thread — see remote_thread_main.
-    OrbisPthread rt;
-    scePthreadCreate(&rt, NULL, remote_thread_main, NULL, "ps4cast_remote");
 
     while (running) {
         g_heartbeat = sceKernelGetProcessTime();   // pet the freeze watchdog each frame
         uint32_t pressed = pad_poll(&pad);
-        uint32_t rp = g_remotePressed; g_remotePressed = 0; pressed |= rp;   // fold in TV-remote presses
         if (player_started() && pressed) {
             double cur = 0, dur = 0;
             player_progress(&cur, &dur);
@@ -699,10 +519,6 @@ int main(void) {
 
         gfx_present(&g, frameID++);
     }
-    // Stop the remote reader and unblock any in-flight scePadReadStateExt by
-    // closing its handle, so a blocked HID syscall can't pin the process at exit.
-    g_remoteStop = 1;
-    if (g_remoteHandle >= 0) scePadClose(g_remoteHandle);
     player_stop();
     audio_shutdown();
     // Clean close: returning from main / _exit can be read by the system as an
