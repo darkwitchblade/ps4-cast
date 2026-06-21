@@ -46,6 +46,7 @@ static int               g_vstream = -1;
 // converted to Annex B by g_bsf and decoded by vdec_hw into NV12 frames that
 // flow through the SAME frame queue / sync / scale path as software frames.
 static int               g_useHw = 0;
+static int               g_interlaced = 0;   // source is interlaced -> bob-deinterlace
 static AVBSFContext     *g_bsf = NULL;
 static AVPacket         *g_hwPkt = NULL;
 // Reorder buffer: the low-delay hardware decoder emits frames in DECODE order,
@@ -302,7 +303,7 @@ void player_stop(void) {
     if (g_isHls) hls_close(); else httpsrc_close();
     g_isHls = 0;
     g_hlsSegDemux = 0;
-    g_vstream = -1; g_active = 0; g_started = 0; g_gotFrame = 0;
+    g_vstream = -1; g_active = 0; g_started = 0; g_gotFrame = 0; g_interlaced = 0;
     g_pos = 0; g_startProc = 0; g_scaledW = g_scaledH = 0;
     g_paused = 0; g_wasPaused = 0; g_seekPending = 0; g_curSec = 0; g_durSec = 0;
     snprintf(g_status, sizeof(g_status), "stopped");
@@ -457,9 +458,10 @@ int player_play(const char *url) {
     // decoder fault hard (uncatchable GPU crash) — force software for those.
     int interlaced = (vpar->field_order == AV_FIELD_TT || vpar->field_order == AV_FIELD_BB ||
                       vpar->field_order == AV_FIELD_TB || vpar->field_order == AV_FIELD_BT);
+    g_interlaced = interlaced;   // -> bob-deinterlace in build_scaled (software path)
     int hwEligible = g_hwEnabled && vpar->codec_id == AV_CODEC_ID_H264 && !interlaced &&
                      (!g_isHls || g_hlsSegDemux);
-    if (interlaced) notify_dbg("PS4 Cast: interlaced -> software decode");
+    if (interlaced) notify_dbg("PS4 Cast: interlaced -> software decode + deinterlace");
     if (hwEligible) {
         int bsfOk = 1;
         if (!g_isHls) {     // MP4/AVCC source -> convert to annex-b for the decoder
@@ -503,7 +505,7 @@ int player_play(const char *url) {
     g_pkt   = av_packet_alloc();
     g_srcW = g_useHw ? vpar->width  : g_vdec->width;
     g_srcH = g_useHw ? vpar->height : g_vdec->height;
-    snprintf(g_codecLabel, sizeof(g_codecLabel), "%s", dec->name ? dec->name : "video");
+    snprintf(g_codecLabel, sizeof(g_codecLabel), "%s%s", dec->name ? dec->name : "video", g_interlaced ? " deint" : "");
     g_durSec = (g_fmt->duration > 0) ? (double)g_fmt->duration / AV_TIME_BASE : 0;
     g_hlsSegGen = g_isHls ? hls_generation() : 0;
     g_hlsResetGen = g_isHls ? hls_reset_generation() : 0;
@@ -722,6 +724,13 @@ static int build_scaled(AVFrame *fr, Gfx *g) {
     if (scaledW < 1) scaledW = 1; if (scaledH < 1) scaledH = 1;
 
     enum AVPixelFormat srcFmt = g_useHw ? AV_PIX_FMT_NV12 : g_vdec->pix_fmt;
+    // Bob-deinterlace: for an interlaced source (1080i broadcast, forced to
+    // software decode) feed sws ONE field — half the lines via doubled strides —
+    // and let it scale that field up to full height. Removes combing on motion;
+    // costs half the vertical resolution, which is invisible after upscaling.
+    int di = g_interlaced ? 1 : 0;
+    int srcH = di ? sh / 2 : sh;
+
     if (scaledW != g_scaledW || scaledH != g_scaledH || !g_scaled) {
         free(g_scaled);
         g_scaled = malloc((size_t)scaledW * scaledH * 4);
@@ -731,23 +740,28 @@ static int build_scaled(AVFrame *fr, Gfx *g) {
     }
     // Rebuild sws if the SOURCE geometry/format changed too (not just the output)
     // — otherwise a discontinuity-driven resolution change reads with wrong strides.
-    if (g_sws && (sw != g_swsSrcW || sh != g_swsSrcH || (int)srcFmt != g_swsSrcFmt)) {
+    if (g_sws && (sw != g_swsSrcW || srcH != g_swsSrcH || (int)srcFmt != g_swsSrcFmt)) {
         sws_freeContext(g_sws); g_sws = NULL;
     }
     if (!g_sws) {
         // FAST_BILINEAR: the software present (HLS path) was dropping frames because
         // the single-threaded 720p->1080p upscale couldn't sustain 30fps. Fast
         // bilinear is materially cheaper at near-identical quality for upscales.
-        g_sws = sws_getContext(sw, sh, srcFmt,
+        g_sws = sws_getContext(sw, srcH, srcFmt,
                                scaledW, scaledH, AV_PIX_FMT_BGRA,
                                SWS_FAST_BILINEAR, NULL, NULL, NULL);
         if (!g_sws) return -1;
-        g_swsSrcW = sw; g_swsSrcH = sh; g_swsSrcFmt = (int)srcFmt;
+        g_swsSrcW = sw; g_swsSrcH = srcH; g_swsSrcFmt = (int)srcFmt;
     }
     uint8_t *dst[4] = { g_scaled, NULL, NULL, NULL };
     int dstStride[4] = { g_scaledW * 4, 0, 0, 0 };
-    sws_scale(g_sws, (const uint8_t * const *)fr->data, fr->linesize,
-              0, sh, dst, dstStride);
+    if (di) {
+        const uint8_t *src[4] = { fr->data[0], fr->data[1], fr->data[2], fr->data[3] };
+        int srcStr[4] = { fr->linesize[0] * 2, fr->linesize[1] * 2, fr->linesize[2] * 2, fr->linesize[3] * 2 };
+        sws_scale(g_sws, src, srcStr, 0, srcH, dst, dstStride);
+    } else {
+        sws_scale(g_sws, (const uint8_t * const *)fr->data, fr->linesize, 0, sh, dst, dstStride);
+    }
     return 0;
 }
 

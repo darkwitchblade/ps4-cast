@@ -651,6 +651,10 @@ int main(void) {
     char lastUrl[1024] = "";          // resume: track the currently playing URL
     int resumePending = 0;            // resume: seek to saved position once dur known
     uint64_t resumeDeadline = 0, lastResumeSave = 0;
+    int liveSource = 0;               // current source has no finite duration (live)
+    int reconnecting = 0, reconnects = 0;   // auto-reconnect a dropped live stream
+    uint64_t reconnectAt = 0, healthySince = 0;
+    const int MAX_RECONNECT = 30;     // ~give up after this many attempts
     PadState pad;
     pad_init(&pad);
 
@@ -745,6 +749,7 @@ int main(void) {
                     if (rc != 0 || !wasPlaying) everDrew = 0;   // only blank on first tune / failure
                     hudUntil = now + 6000000ULL;
                     chanUntil = now + 3500000ULL;
+                    reconnecting = 0; reconnects = 0;
                 }
             }
         }
@@ -767,7 +772,7 @@ int main(void) {
             if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
                 player_stop();
                 handoff_stop();
-                everDrew = 0;
+                everDrew = 0; reconnecting = 0; reconnects = 0;
             }
         }
 
@@ -789,7 +794,7 @@ int main(void) {
         if (httpd_take_stop_request()) {
             player_stop();
             handoff_stop();
-            everDrew = 0;
+            everDrew = 0; reconnecting = 0; reconnects = 0;
         }
         if (httpd_take_play_request(url, sizeof(url))) {
             // Native app/browser handoff is permanently disabled (CE-36329-3),
@@ -797,25 +802,45 @@ int main(void) {
             int wasPlaying = player_started() && everDrew;
             int rc = player_play(url);
             if (rc != 0 || !wasPlaying) everDrew = 0;     // hold old frame across the switch
+            reconnecting = 0; reconnects = 0;
             hudUntil = sceKernelGetProcessTime() + 6000000ULL;
         }
         if (httpd_take_player_request(url, sizeof(url))) {
             int wasPlaying = player_started() && everDrew;
             int rc = player_play(url);
             if (rc != 0 || !wasPlaying) everDrew = 0;     // hold old frame across the switch
+            reconnecting = 0; reconnects = 0;
             hudUntil = sceKernelGetProcessTime() + 6000000ULL;
         }
 
         // Autoplay / EOF cleanup: once the decoder reports inactive, either
         // advance to the queued item or fully tear down the finished playback.
-        if (player_started() && !player_is_active()) {
+        // Playback went inactive (EOF / dropped stream). Advance the queue, or —
+        // for a LIVE source that dropped — begin auto-reconnect instead of dying.
+        if (!reconnecting && player_started() && !player_is_active()) {
+            healthySince = 0;
             if (httpd_take_next(url, sizeof(url))) {
                 player_play(url);
-                everDrew = 0;
+                everDrew = 0; reconnecting = 0; reconnects = 0;
                 hudUntil = sceKernelGetProcessTime() + 6000000ULL;
+            } else if (liveSource && lastUrl[0]) {
+                reconnecting = 1; reconnects = 0; reconnectAt = now + 800000ULL;
             } else {
                 player_stop();
                 everDrew = 0;
+            }
+        }
+        // Reconnect driver: retry the same live URL with capped exponential backoff
+        // until frames resume (clears `reconnecting`) or we exhaust the budget.
+        if (reconnecting) {
+            if (reconnects >= MAX_RECONNECT) {
+                reconnecting = 0; player_stop(); everDrew = 0;
+                notify("Stream lost - tap a channel to retry");
+            } else if (now >= reconnectAt) {
+                reconnects++;
+                player_play(lastUrl);
+                uint64_t s = reconnects < 4 ? (uint64_t)reconnects : 4;   // 1,2,3,4,4.. *2s
+                reconnectAt = now + (s * 2000000ULL);
             }
         }
 
@@ -826,6 +851,11 @@ int main(void) {
             if (drew) {
                 everDrew = 1;
                 fpsCount++;                 // count real presented video frames
+                if (reconnecting) reconnecting = 0;          // recovered
+                if (healthySince == 0) healthySince = now;
+                else if (now - healthySince > 8000000ULL) reconnects = 0;  // stable -> reset budget
+                double pc = 0, pd = 0; player_progress(&pc, &pd);
+                liveSource = (pd <= 0.5);   // no finite duration => live
             } else if (!everDrew) {
                 gfx_vgrad(&g, 0, 0, g.width, g.height, BG_TOP, BG_BOT);
                 int pw = 720, ph = 264, px = (g.width - pw) / 2, py = (g.height - ph) / 2;
@@ -858,14 +888,25 @@ int main(void) {
             int overlay = (sceKernelGetProcessTime() < chanUntil && httpd_chan_count() > 0);
             if (!overlay && (!everDrew || player_is_paused() || sceKernelGetProcessTime() < hudUntil))
                 draw_hud(&g);
-        } else {
+        } else if (!reconnecting) {
             draw_lobby(&g, ip, net_ok);
             everDrew = 0;
         }
+        // (while reconnecting with no live player, the last frame is kept on screen)
 
         // Channel zapper overlay sits on top of whatever is showing.
         if (sceKernelGetProcessTime() < chanUntil && httpd_chan_count() > 0)
             draw_channel_overlay(&g, navSel);
+
+        // Auto-reconnect banner for a dropped live stream.
+        if (reconnecting) {
+            int pw = 580, ph = 160, px = (g.width - pw) / 2, py = (g.height - ph) / 2;
+            panel(&g, px, py, pw, ph, 22, INK, 225);
+            char b[80]; snprintf(b, sizeof(b), "Reconnecting...  (%d)", reconnects);
+            ctext(&g, py + 44, b, 4, TXT, 1);
+            ctext(&g, py + 100, "live stream dropped - retrying", 2, MUT, 0);
+            hudUntil = now + 1500000ULL;
+        }
 
         // Lightweight stream stats (touchpad), top-right, only while playing.
         if (statsOn && player_started())
