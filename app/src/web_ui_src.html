@@ -114,6 +114,11 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
 .chipf{flex:none;border:1px solid var(--line);background:var(--surf);color:var(--mut);font-family:inherit;
  font-size:12px;font-weight:600;padding:7px 13px;border-radius:999px;cursor:pointer;white-space:nowrap}
 .chipf.on{background:linear-gradient(160deg,var(--acc),var(--acc2));color:#fff;border-color:transparent}
+#chTools{margin:10px 0 2px}
+.search{width:100%;padding:11px 14px;border-radius:12px;border:1px solid var(--line2);background:#0c1226;
+ color:#fff;font-size:14px;font-family:inherit;outline:none}
+.search:focus{border-color:var(--acc);box-shadow:0 0 0 4px rgba(91,140,255,.14)}
+.search::placeholder{color:var(--faint)}
 /* list rows */
 .pane{display:flex;flex-direction:column;gap:8px;min-height:8px}
 .empty{text-align:center;color:var(--faint);font-size:13px;padding:26px 10px;line-height:1.6}
@@ -225,6 +230,7 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
   <button data-t="fav" onclick="tab('fav')">Favorites<span class="cnt" id="cFav"></span></button>
   <button data-t="rec" onclick="tab('rec')">Recent<span class="cnt" id="cRec"></span></button>
  </div>
+ <div id="chTools" hidden><input id="chSearch" class="search" type="search" placeholder="Search channels…" autocomplete="off" oninput="onSearch()"></div>
  <section class="pane" id="panePl"><div class="empty">Paste an M3U / IPTV link above and tap <b>Load playlist</b> to browse channels here.</div></section>
  <section class="pane" id="paneFav" hidden></section>
  <section class="pane" id="paneRec" hidden></section>
@@ -253,7 +259,7 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
 
 <script>
 var $=function(i){return document.getElementById(i)};
-var drag=false,dur=0,hw=1,dbg=0,curTab='pl',plData=[],chanCur=-1,curGroup='';
+var drag=false,dur=0,hw=1,dbg=0,curTab='pl',plData=[],chanCur=-1,curGroup='',curSearch='';
 function busy(b){$('spin').style.display=b?'inline-block':'none'}
 function msg(t){$('msg').textContent=t}
 function fmt(s){s=Math.max(0,s|0);var h=(s/3600)|0,m=((s/60)|0)%60,x=s%60,p=function(n){return(n<10?'0':'')+n};return h>0?h+':'+p(m)+':'+p(x):m+':'+p(x)}
@@ -278,7 +284,7 @@ async function paste(){var el=$('u');el.focus();el.select();
 async function loadPlaylist(){var u=$('u').value.trim();if(!u){msg('Paste an M3U / playlist link first');$('u').focus();return}
  busy(true);msg('Loading playlist…');
  try{var r=await fetch('/playlist',{method:'POST',headers:{'Content-Type':'text/plain'},body:u});var a=await r.json();busy(false);
-  plData=a||[];chanCur=-1;curGroup='';renderPane('pl');tab('pl');
+  plData=a||[];chanCur=-1;curGroup='';curSearch='';if($('chSearch'))$('chSearch').value='';renderPane('pl');tab('pl');
   if(!plData.length){msg('No channels found in that link')}else{msg(plData.length+' channels — tap one to play')}}
  catch(e){busy(false);msg('Could not load that playlist')}}
 
@@ -295,6 +301,8 @@ function chanRow(i,name,on){return '<div class="row'+(on?' on':'')+'" onclick="c
  (on?'<div class="live">LIVE</div>':'<div class="go"><svg viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>')+'</div>'}
 function chanPick(i){if(i<0||i>=plData.length)return;chanCur=i;renderPane('pl');post('/chan',''+i);msg('Tuning '+(plData[i].n||'channel '+(i+1)))}
 function setGroup(g){curGroup=g;renderPane('pl')}
+function onSearch(){curSearch=($('chSearch').value||'').trim().toLowerCase();renderPane('pl')}
+function chanName(i){return plData[i].n||nameFromUrl(plData[i].u)}
 function renderPane(which){
  if(which=='pl'){if(!plData.length){$('panePl').innerHTML='<div class="empty">Paste an M3U / IPTV link above and tap <b>Load playlist</b> to browse channels here.</div>';$('cPl').textContent='';return}
   var groups=[],seen={};for(var k=0;k<plData.length;k++){var g=plData[k].g||'';if(g&&!seen[g]){seen[g]=1;groups.push(g)}}
@@ -302,9 +310,13 @@ function renderPane(which){
   if(groups.length>1){h+='<div class="chips"><button class="chipf'+(curGroup===''?' on':'')+'" onclick="setGroup(\'\')">All</button>';
    for(var gi=0;gi<groups.length;gi++){h+='<button class="chipf'+(curGroup===groups[gi]?' on':'')+'" onclick="setGroup(\''+esc(groups[gi]).replace(/\x27/g,"&#39;")+'\')">'+esc(groups[gi])+'</button>'}h+='</div>'}
   h+='<div class="scrolly">';var shown=0;
-  for(var i=0;i<plData.length;i++){if(curGroup&&(plData[i].g||'')!==curGroup)continue;h+=chanRow(i,plData[i].n||nameFromUrl(plData[i].u),i==chanCur);shown++}
-  h+='</div>';if(!shown)h+='<div class="empty">No channels in this group.</div>';
-  $('panePl').innerHTML=h;$('cPl').textContent=plData.length}
+  for(var i=0;i<plData.length;i++){if(curGroup&&(plData[i].g||'')!==curGroup)continue;
+   if(curSearch&&chanName(i).toLowerCase().indexOf(curSearch)<0)continue;
+   h+=chanRow(i,chanName(i),i==chanCur);shown++}
+  h+='</div>';
+  if(!shown)h+='<div class="empty">'+(curSearch?'No channels match “'+esc(curSearch)+'”.':'No channels in this group.')+'</div>';
+  $('panePl').innerHTML=h;
+  $('cPl').textContent=(curGroup||curSearch)?(shown+'/'+plData.length):plData.length}
 }
 function listPane(id,cntId,arr,icon,emptyMsg,rm){
  var el=$(id);$(cntId).textContent=arr&&arr.length?arr.length:'';
@@ -333,6 +345,7 @@ async function loadLists(){var f=await getj('/favs'),r=await getj('/recent');
 
 function tab(t){curTab=t;var ids={pl:'panePl',fav:'paneFav',rec:'paneRec'};
  for(var k in ids){$(ids[k]).hidden=(k!=t)}
+ $('chTools').hidden=!(t=='pl'&&plData.length);
  var b=document.querySelectorAll('.tabs button');for(var i=0;i<b.length;i++){b[i].classList.toggle('on',b[i].dataset.t==t)}
  if(t=='pl')renderPane('pl')}
 
