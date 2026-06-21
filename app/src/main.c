@@ -328,25 +328,40 @@ static uint32_t pad_poll(PadState *p) {
 // existing control (pause / seek / stop) works from the remote with no new
 // mapping. Remote keys arrive in OrbisPadData.buttons using the same bit set.
 static volatile uint32_t g_remotePressed = 0;
+// Default OFF: the SPECIAL-port reader is unproven and the audit flagged it as a
+// freeze risk (scePadReadStateExt can block holding HID; opening the port may
+// disturb the controller bus — see the usb_hid/jackDisconnected klog). Keep it
+// dormant (never touches the SPECIAL port) until the freeze-hardening is verified
+// on-device, then enable it deliberately for a careful test. Flip to 1 (or add a
+// runtime toggle) once proven.
+static volatile int      g_remoteEnabled = 0;
+static volatile int      g_remoteStop = 0;
+static volatile int      g_remoteHandle = -1;   // exposed so a stop path can close it
 
 static void *remote_thread_main(void *arg) {
     (void)arg;
     int user = -1;
     int h = -1;
     uint32_t prev = 0;
-    for (;;) {
+    while (!g_remoteStop) {
+        if (!g_remoteEnabled) {                  // dormant: release the port, idle, touch nothing
+            if (h >= 0) { scePadClose(h); h = -1; g_remoteHandle = -1; }
+            sceKernelUsleep(1000 * 1000);
+            continue;
+        }
         if (h < 0) {
             if (user < 0) sceUserServiceGetInitialUser(&user);
-            for (int idx = 0; idx < 4 && h < 0; idx++)
-                h = scePadOpen(user, ORBIS_PAD_PORT_TYPE_SPECIAL, idx, NULL);
-            if (h < 0) { sceKernelUsleep(1000 * 1000); continue; }   // no remote yet; retry
+            h = scePadOpen(user, ORBIS_PAD_PORT_TYPE_SPECIAL, 0, NULL);  // remote is index 0
+            if (h < 0) { sceKernelUsleep(3000 * 1000); continue; }       // slow retry; low bus churn
+            g_remoteHandle = h;
             prev = 0;
             pad_diag_set("remote: SPECIAL port open");
         }
         OrbisPadData d;
         memset(&d, 0, sizeof(d));
         int rc = scePadReadStateExt(h, &d);
-        if (rc != 0) { scePadClose(h); h = -1; sceKernelUsleep(500 * 1000); continue; }
+        if (g_remoteStop) break;
+        if (rc != 0) { scePadClose(h); h = -1; g_remoteHandle = -1; sceKernelUsleep(500 * 1000); continue; }
         if (d.connected) {
             uint32_t pressed = d.buttons & ~prev;   // rising edges only
             prev = d.buttons;
@@ -356,6 +371,7 @@ static void *remote_thread_main(void *arg) {
         }
         sceKernelUsleep(16 * 1000);                  // ~60Hz; blocking-safe on this thread
     }
+    if (h >= 0) { scePadClose(h); g_remoteHandle = -1; }
     return NULL;
 }
 
@@ -552,6 +568,10 @@ int main(void) {
 
         gfx_present(&g, frameID++);
     }
+    // Stop the remote reader and unblock any in-flight scePadReadStateExt by
+    // closing its handle, so a blocked HID syscall can't pin the process at exit.
+    g_remoteStop = 1;
+    if (g_remoteHandle >= 0) scePadClose(g_remoteHandle);
     player_stop();
     audio_shutdown();
     // Clean close: returning from main / _exit can be read by the system as an

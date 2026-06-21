@@ -9,6 +9,7 @@
 
 #include <orbis/libkernel.h>
 #include <orbis/Sysmodule.h>
+#include <orbis/GnmDriver.h>   // sceGnmSubmitDone — fence GPU compute before freeing its memory
 
 #define SYS_dynlib_load_prx  594
 
@@ -230,6 +231,12 @@ void vdec_hw_reset(void) {
 }
 
 void vdec_hw_close(void) {
+    // Fence outstanding GPU compute work BEFORE deleting the decoder / releasing
+    // the compute queue / freeing garlic+onion memory. Freeing direct memory the
+    // GPU is still DMA-ing into causes an unrecoverable GPU page fault (hung GPU
+    // -> unkillable). It also leaves the compute queue quiesced so the system can
+    // suspend/close the app without CPU_FAULT_SUBMITDONE_TIMEOUT_IN_SUSPEND.
+    sceGnmSubmitDone();
     if (g_decoder && pDelete) pDelete(g_decoder);
     g_decoder = NULL;
     if (g_computeQueue && pReleaseCompute) pReleaseCompute(g_computeQueue);
