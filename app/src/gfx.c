@@ -3,6 +3,8 @@
 
 #include <string.h>
 #include <errno.h>
+#include <stdio.h>
+#include <unistd.h>   // _exit
 
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
@@ -73,8 +75,24 @@ int gfx_init(Gfx *g, int width, int height) {
     return 0;
 }
 
+// Fail-closed: a display/GPU fault surfaces here (flip submit error, or flips
+// stop completing). Rather than let the app limp on as "shadow playback" with a
+// dead display — which the system eventually turns into the "error has occurred"
+// dialog while our CPU threads keep running — record a precise reason and exit
+// cleanly. A clean exit also avoids the system crash dialog.
+static void gfx_fatal(const char *what, int rc) {
+    char b[128];
+    int n = snprintf(b, sizeof(b), "GFX-FAULT v" APP_VER " %s rc=%d\n", what, rc);
+    int fd = sceKernelOpen("/data/ps4cast_crash.log", 0x0201 /*WRONLY|CREAT*/ | 0x0400 /*TRUNC*/, 0666);
+    if (fd >= 0) { sceKernelWrite(fd, b, (size_t)n); sceKernelClose(fd); }
+    _exit(0);
+}
+
 void gfx_present(Gfx *g, int frameID) {
-    sceVideoOutSubmitFlip(g->video, g->activeIdx, ORBIS_VIDEO_OUT_FLIP_VSYNC, frameID);
+    // A failed flip submit means the video-out/GPU rejected the frame — treat it
+    // as a display fault and fail-closed instead of continuing blind.
+    int rc = sceVideoOutSubmitFlip(g->video, g->activeIdx, ORBIS_VIDEO_OUT_FLIP_VSYNC, frameID);
+    if (rc < 0) gfx_fatal("submitflip", rc);   // negative = SCE error: display rejected the flip
     // Signal a clean GPU frame boundary every frame. Without this the system can
     // never find a quiesced point to suspend the app, so closing it from the menu
     // hits CPU_FAULT_SUBMITDONE_TIMEOUT_IN_SUSPEND and crashes instead of quitting.
@@ -87,7 +105,10 @@ void gfx_present(Gfx *g, int frameID) {
     // flip — so no tearing, while CPU convert overlaps scanout for full-rate present.
     g->activeIdx = (g->activeIdx + 1) % GFX_BUFFERS;
 
-    OrbisKernelEqueue q = (OrbisKernelEqueue)(uintptr_t)g->flipQueue;
+    // Poll flip completion with a hard ceiling: if flips stop completing the
+    // display/GPU has hung — fail-closed with a precise reason (faster + clearer
+    // than waiting for the generic freeze-watchdog).
+    uint64_t t0 = sceKernelGetProcessTime();
     for (;;) {
         OrbisVideoOutFlipStatus st;
         sceVideoOutGetFlipStatus(g->video, &st);
@@ -95,10 +116,9 @@ void gfx_present(Gfx *g, int frameID) {
         // the in-flight count has dropped to the buffer budget.
         if (frameID - (int)st.flipArg <= (GFX_BUFFERS - 1))
             break;
-        OrbisKernelEvent ev;
-        int out = 0;
-        if (sceKernelWaitEqueue(q, &ev, 1, &out, 0) != 0)
-            break;
+        if (sceKernelGetProcessTime() - t0 > 3ULL * 1000 * 1000)
+            gfx_fatal("flip-stall", frameID - (int)st.flipArg);
+        sceKernelUsleep(1000);   // 1ms poll; throttle wait is ≤1 vblank in normal use
     }
 }
 
