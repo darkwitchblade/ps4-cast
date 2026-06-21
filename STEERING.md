@@ -74,6 +74,19 @@ The user reports an intermittent crash dialog ("An error has occurred in the sys
 **Crash characterization (so far):** casting the live path intermittently kills the app with an **EMPTY /crashlog** (NOT a signal — fatal_signal would log; NOT the hang-watchdog — it logs HANG on v03.02) and the app is **absent from the klog FMEM process snapshot** → it's terminated from OUTSIDE by a **GPU/system fault**, which in-process signal/watchdog handlers cannot catch. Reproduced once (~5s in), ran clean the next time → intermittent. In the live HW-decode + triple-buffer flip path.
 **Next leads:** (a) add app-side GPU/flip error logging — check `sceVideoOutSubmitFlip`/`sceGnmSubmitDone` return codes (currently IGNORED in gfx_present) + log to catch the fault precursor before the system kills us; (b) extended live-sim soak with klog to gather crash instances + look for a trigger (discontinuity? a specific segment boundary?); (c) A/B the triple-buffer contribution (user says crash predates it, but aggressive flips may raise its rate).
 
+## Clean close (v03.05) — IMPLEMENTED & VERIFIED
+`/quit` (and exit) now call `sceSystemServiceLoadExec("exit", NULL)` → klog shows `GameStopped(PCST00001) ... LoadExec => 0`, NO notifyAppCrash/coredump/CrashReport dialog. Fixes the "fake crash dialog on /quit". (Returning from main/_exit was read as abnormal.) Removed the temporary `/forcecrash` test endpoint.
+
+## Crash dialog dismissal — findings (the system modal can't be closed from our app)
+The "error has occurred in the system software" dialog is a **SceShellUI** (NPXS20001) modal, NOT our app's — confirmed: relaunching our app does NOT dismiss it (foreground focus changes but the modal stays on top). A hard uncaught crash can take down SceShellUI itself (`notifyAppCrash titleId=NPXS20001`). No homebrew API to inject a controller button or close another process's modal. So **dismissal isn't viable; prevention is the path**: clean-close (done) + fail-closed (done) + fix the GPU fault so the dialog never appears. User dismisses a stuck dialog with ✕, or we reboot (`ps4cast-reboot.bin`).
+
+## Autonomous work queue (user directive, in priority order)
+1. **TV remote via HDMI-CEC in-app** — remote works on PS4 system but not in-app. Status JSON has a `pad` field; main.c:256 notes a "console/TV remote path" via scePad. Investigate whether CEC arrives via scePad (maybe a separate handle/type) and wire it to player controls.
+2. **In-app close button** — UI element that triggers the clean close (LoadExec exit). Needs remote/pad to activate → pairs with #1.
+3. **UI/UX overhaul** — web interface (web_ui.h) + in-app HUD: more intuitive, faster, easier.
+4. **Compatibility sweep** — re-test all video configs (mp4/mkv/HLS/various codecs/resolutions/fps) to find remaining no-smooth/crash cases. NOW SAFE to do: fail-closed + clean-close + auto-recover + resilient klog catch/recover issues.
+5. **Extended GFX-FAULT soak** — live-sim + klog over a long run to capture an actual GFX-FAULT and pin the GPU crash root cause.
+
 ## Fail-closed display path (v03.03) — IMPLEMENTED (user's idea)
 On ANY display/GPU anomaly the app now fully exits cleanly with a logged reason, so it never lingers as "shadow playback" on a faulted system and we get a clean cause. `gfx_present` (gfx.c): checks `sceVideoOutSubmitFlip` return (was ignored) → `GFX-FAULT submitflip rc=..` + `_exit(0)`; polls flip completion with a 3s ceiling → `GFX-FAULT flip-stall` + `_exit(0)`. This catches the GPU fault at the flip API BEFORE the system makes the dialog. Verified: deployed, no false-trips, live path clean 60s (drop ~0.2/s). Now ARMED to capture the intermittent fault with a reason next time it fires.
 **Full fail-closed coverage now:** signal crash → `CRASH sig=..` (fatal_signal); freeze/deadlock → `HANG stale=..` (watchdog); display/GPU fault → `GFX-FAULT ..` (gfx_present). All `_exit(0)` (clean, no dialog), all logged to /crashlog.
