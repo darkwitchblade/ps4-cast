@@ -246,6 +246,61 @@ static void draw_hud(Gfx *g, const char *title, const char *status, double cur, 
     for (int i = 0; i < 4; i++) lx += legend(g, lx, ly, items[i].k, items[i].l);
 }
 
+// ---- channel overlay (mirrors main.c draw_channel_overlay) ---------------
+static const char *MOCKCH[] = {
+ "BBC One HD","CNN International","Al Jazeera English","ESPN 1","Discovery Channel",
+ "National Geographic","Cartoon Network","HBO Max 24/7","Sky Sports Main Event",
+ "France 24 English","Bloomberg TV","MTV Live HD","Eurosport 1","Sintel Trailer"
+};
+static int MOCKN = 14, MOCKCUR = 3;
+static int httpd_chan_count(void){ return MOCKN; }
+static int httpd_chan_current(void){ return MOCKCUR; }
+static int httpd_chan_get(int i, char *name, int nameCap, char *url, int urlCap){
+    if(i<0||i>=MOCKN) return 0;
+    if(name&&nameCap>0){ strncpy(name,MOCKCH[i],nameCap-1); name[nameCap-1]='\0'; }
+    (void)url;(void)urlCap; return 1;
+}
+static void draw_channel_overlay(Gfx *g, int sel) {
+    int n = httpd_chan_count();
+    if (n <= 0) return;
+    int cur = httpd_chan_current();
+    if (sel < 0) sel = cur < 0 ? 0 : cur;
+    if (sel >= n) sel = n - 1;
+    int K = 9, rowH = 76, headH = 72, footH = 50;
+    int shown = n < K ? n : K;
+    int W = 660, H = headH + shown * rowH + footH;
+    int x = 56, y = (g->height - H) / 2;
+    panel(g, x, y, W, H, 24, INK, 226);
+    gfx_round(g, x + 28, y + 26, 6, 28, 3, ACCENT);
+    gtext(g, x + 46, y + 24, "CHANNELS", 3, TXT, 1);
+    char cnt[24]; snprintf(cnt, sizeof(cnt), "%d", n);
+    gfx_text(g, x + W - 28 - gfx_text_w(cnt, 2), y + 30, cnt, 2, FAINT);
+    gfx_rect_a(g, x + 24, y + headH - 12, W - 48, 1, HAIR, 30);
+    int start = sel - K / 2;
+    if (start > n - K) start = n - K;
+    if (start < 0) start = 0;
+    for (int r = 0; r < K && start + r < n; r++) {
+        int idx = start + r, rowY = y + headH + r * rowH;
+        int rx = x + 18, rw = W - 36;
+        int seld = (idx == sel);
+        gfx_round_a(g, rx, rowY + 6, rw, rowH - 12, 14, seld ? ACCENT : SURF, seld ? 240 : 130);
+        char name[96];
+        httpd_chan_get(idx, name, sizeof(name), NULL, 0);
+        int maxch = (rw - 170) / 16; if (maxch < 4) maxch = 4;
+        if ((int)strlen(name) > maxch) name[maxch] = '\0';
+        char num[8]; snprintf(num, sizeof(num), "%d", idx + 1);
+        GfxColor numc = seld ? INK : FAINT, nc = seld ? INK : TXT;
+        gfx_text(g, rx + 26, rowY + rowH / 2 - 8, num, 2, numc);
+        gfx_text(g, rx + 104, rowY + rowH / 2 - 8, name, 2, nc);
+        if (idx == cur) {
+            int dx = rx + rw - 40;
+            gfx_circle(g, dx, rowY + rowH / 2, 6, seld ? INK : LIVE);
+            gfx_text(g, dx + 14, rowY + rowH / 2 - 8, "LIVE", 1, seld ? INK : LIVE);
+        }
+    }
+    gfx_text(g, x + 28, y + H - 34, "Up / Down  change channel      Cross  watch", 2, MUT);
+}
+
 // ---- harness -------------------------------------------------------------
 static void write_ppm(const char *path, Gfx *g) {
     FILE *f = fopen(path, "wb");
@@ -296,5 +351,12 @@ int main(void) {
         ctext(&g, py + 140, "Circle  Stop      Left  seek back", 2, MUT, 0);
     }
     write_ppm("/tmp/ui_buffer.ppm", &g);
+
+    // channel zapper overlay over playing video
+    gfx_vgrad(&g, 0, 0, g.width, g.height, v1, v2);
+    gfx_circle_a(&g, 1500, 360, 240, (GfxColor){0x40,0x30,0x70}, 120);
+    draw_hud(&g, "Sky Sports Main Event", "Playing  -  hls live  1920x1080", 0, 0, 0);
+    draw_channel_overlay(&g, 8);   // highlight a row away from the live one
+    write_ppm("/tmp/ui_chan.ppm", &g);
     return 0;
 }

@@ -472,6 +472,56 @@ static void draw_hud(Gfx *g) {
 
     draw_legend_row(g, W / 2, y + H - 30);
 }
+
+// TV-box-style channel list overlay: a fast, scrollable list of the loaded
+// playlist with the highlighted selection and a live marker on the tuned one.
+static void draw_channel_overlay(Gfx *g, int sel) {
+    int n = httpd_chan_count();
+    if (n <= 0) return;
+    int cur = httpd_chan_current();
+    if (sel < 0) sel = cur < 0 ? 0 : cur;
+    if (sel >= n) sel = n - 1;
+
+    int K = 9, rowH = 76, headH = 72, footH = 50;
+    int shown = n < K ? n : K;
+    int W = 660, H = headH + shown * rowH + footH;
+    int x = 56, y = (g->height - H) / 2;
+    panel(g, x, y, W, H, 24, INK, 226);
+
+    // header: accent tick + title + count
+    gfx_round(g, x + 28, y + 26, 6, 28, 3, ACCENT);
+    gtext(g, x + 46, y + 24, "CHANNELS", 3, TXT, 1);
+    char cnt[24]; snprintf(cnt, sizeof(cnt), "%d", n);
+    gfx_text(g, x + W - 28 - gfx_text_w(cnt, 2), y + 30, cnt, 2, FAINT);
+    gfx_rect_a(g, x + 24, y + headH - 12, W - 48, 1, HAIR, 30);
+
+    int start = sel - K / 2;
+    if (start > n - K) start = n - K;
+    if (start < 0) start = 0;
+
+    for (int r = 0; r < K && start + r < n; r++) {
+        int idx = start + r, rowY = y + headH + r * rowH;
+        int rx = x + 18, rw = W - 36;
+        int seld = (idx == sel);
+        gfx_round_a(g, rx, rowY + 6, rw, rowH - 12, 14, seld ? ACCENT : SURF, seld ? 240 : 130);
+
+        char name[96];
+        httpd_chan_get(idx, name, sizeof(name), NULL, 0);
+        int maxch = (rw - 170) / 16; if (maxch < 4) maxch = 4;
+        if ((int)strlen(name) > maxch) name[maxch] = '\0';
+
+        char num[8]; snprintf(num, sizeof(num), "%d", idx + 1);
+        GfxColor numc = seld ? INK : FAINT, nc = seld ? INK : TXT;
+        gfx_text(g, rx + 26, rowY + rowH / 2 - 8, num, 2, numc);
+        gfx_text(g, rx + 104, rowY + rowH / 2 - 8, name, 2, nc);
+        if (idx == cur) {   // live marker on the tuned channel
+            int dx = rx + rw - 40;
+            gfx_circle(g, dx, rowY + rowH / 2, 6, seld ? INK : LIVE);
+            gfx_text(g, dx + 14, rowY + rowH / 2 - 8, "LIVE", 1, seld ? INK : LIVE);
+        }
+    }
+    gfx_text(g, x + 28, y + H - 34, "Up / Down  change channel      Cross  watch", 2, MUT);
+}
 #endif
 
 int main(void) {
@@ -523,12 +573,52 @@ int main(void) {
     int everDrew = 0;
     int running = 1;
     uint64_t hudUntil = 0;
+    int navSel = -1;                  // highlighted channel in the zapper overlay
+    uint64_t chanUntil = 0;           // overlay visible until this time
+    uint64_t chanTuneAt = 0;          // pending tune time (settle-to-tune)
     PadState pad;
     pad_init(&pad);
 
     while (running) {
         g_heartbeat = sceKernelGetProcessTime();   // pet the freeze watchdog each frame
+        uint64_t now = sceKernelGetProcessTime();
         uint32_t pressed = pad_poll(&pad);
+
+        // ---- TV-box channel zapper: D-pad Up/Down browse the loaded playlist ----
+        int nch = httpd_chan_count();
+        if (nch > 0 && (pressed & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN))) {
+            if (navSel < 0 || now > chanUntil) {       // (re)open at the tuned channel
+                navSel = httpd_chan_current(); if (navSel < 0) navSel = 0;
+            } else if (pressed & ORBIS_PAD_BUTTON_UP) {
+                navSel = (navSel - 1 + nch) % nch;
+            } else {
+                navSel = (navSel + 1) % nch;
+            }
+            chanUntil = now + 6000000ULL;
+            chanTuneAt = now + 850000ULL;              // tune once you settle
+            hudUntil = now + 5000000ULL;
+            pressed &= ~(ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN);  // don't also seek
+        }
+        // Cross while the overlay is up = watch the highlighted channel now.
+        if (nch > 0 && now < chanUntil && (pressed & ORBIS_PAD_BUTTON_CROSS)) {
+            chanTuneAt = now;
+            pressed &= ~(ORBIS_PAD_BUTTON_CROSS | ORBIS_PAD_BUTTON_OPTIONS);
+        }
+        // Settle-to-tune: switch to the highlighted channel.
+        if (chanTuneAt && now >= chanTuneAt) {
+            chanTuneAt = 0;
+            if (navSel >= 0 && navSel != httpd_chan_current()) {
+                char curl[1024];
+                if (httpd_chan_get(navSel, NULL, 0, curl, sizeof(curl))) {
+                    httpd_chan_set_current(navSel);
+                    player_play(curl);
+                    everDrew = 0;
+                    hudUntil = now + 6000000ULL;
+                    chanUntil = now + 3500000ULL;
+                }
+            }
+        }
+
         if (player_started() && pressed) {
             double cur = 0, dur = 0;
             player_progress(&cur, &dur);
@@ -630,12 +720,18 @@ int main(void) {
                 hudUntil = sceKernelGetProcessTime() + 2000000ULL;  // keep HUD visible too
             }
 
-            if (!everDrew || player_is_paused() || sceKernelGetProcessTime() < hudUntil)
+            // The channel overlay replaces the HUD while browsing (no clutter).
+            int overlay = (sceKernelGetProcessTime() < chanUntil && httpd_chan_count() > 0);
+            if (!overlay && (!everDrew || player_is_paused() || sceKernelGetProcessTime() < hudUntil))
                 draw_hud(&g);
         } else {
             draw_lobby(&g, ip, net_ok);
             everDrew = 0;
         }
+
+        // Channel zapper overlay sits on top of whatever is showing.
+        if (sceKernelGetProcessTime() < chanUntil && httpd_chan_count() > 0)
+            draw_channel_overlay(&g, navSel);
 
         gfx_present(&g, frameID++);
     }

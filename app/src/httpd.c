@@ -52,6 +52,20 @@ static char g_recent[MAX_RECENT][URL_MAX]; static int g_recentN = 0;
 static char g_queue[MAX_QUEUE][URL_MAX];   static int g_queueHead = 0, g_queueN = 0;
 static char g_fav[MAX_FAV][URL_MAX];       static int g_favN = 0;
 
+// Loaded M3U/IPTV channel list, shared between the web UI and the on-screen
+// (D-pad) channel zapper. g_chanCur is the channel currently tuned, -1 if none.
+#define CHAN_NAME_MAX 96
+#define MAX_CHAN      256
+static char g_chanName[MAX_CHAN][CHAN_NAME_MAX];
+static char g_chanUrl[MAX_CHAN][URL_MAX];
+static int  g_chanN = 0;
+static int  g_chanCur = -1;
+
+// The most recently cast URL (HUD title); declared here so the channel-store
+// helpers above the request handlers can update it.
+static char g_last_push[1024];
+const char *httpd_last_push(void) { return g_last_push; }
+
 static void recent_add(const char *url) {     // most-recent-first, deduped
     scePthreadMutexLock(&g_mtx);
     if (g_recentN == 0 || strcmp(g_recent[0], url) != 0) {
@@ -177,23 +191,25 @@ static void name_from_url(const char *url, char *out, int cap) {
     memcpy(out, slash, n); out[n] = '\0';
 }
 
-static int playlist_to_json(const char *text, const char *srcUrl, char *out, int cap) {
-    int o = 0;
-    out[o++] = '[';
-    // HLS stream (not a channel list)? -> a single entry pointing at the source.
+static void chan_add(const char *name, const char *url) {
+    if (g_chanN >= MAX_CHAN) return;
+    strncpy(g_chanName[g_chanN], name, CHAN_NAME_MAX - 1); g_chanName[g_chanN][CHAN_NAME_MAX - 1] = '\0';
+    strncpy(g_chanUrl[g_chanN], url, URL_MAX - 1);         g_chanUrl[g_chanN][URL_MAX - 1] = '\0';
+    g_chanN++;
+}
+
+// Parse a fetched M3U/IPTV playlist into the shared channel store (caller holds
+// g_mtx). A genuine HLS stream (#EXT-X- tags) is one castable entry, not a list.
+static void playlist_store(const char *text, const char *srcUrl) {
+    g_chanN = 0; g_chanCur = -1;
     if (strstr(text, "#EXT-X-STREAM-INF") || strstr(text, "#EXT-X-TARGETDURATION") ||
         strstr(text, "#EXT-X-MEDIA-SEQUENCE") || strstr(text, "#EXT-X-PLAYLIST-TYPE")) {
-        char nm[96]; name_from_url(srcUrl, nm, sizeof(nm));
-        out[o++] = '{';
-        o += snprintf(out + o, cap - o, "\"n\":"); json_str(out, cap, &o, nm, 80);
-        o += snprintf(out + o, cap - o, ",\"u\":"); json_str(out, cap, &o, srcUrl, 1000);
-        out[o++] = '}';
-        out[o++] = ']';
-        return o;
+        char nm[CHAN_NAME_MAX]; name_from_url(srcUrl, nm, sizeof(nm));
+        chan_add(nm, srcUrl);
+        return;
     }
     char pend[256]; pend[0] = '\0';
-    int count = 0, first = 1;
-    for (const char *p = text; *p && count < PLAYLIST_MAX_ENTRIES && o < cap - 2400; ) {
+    for (const char *p = text; *p && g_chanN < MAX_CHAN; ) {
         const char *nl = strchr(p, '\n');
         int len = nl ? (int)(nl - p) : (int)strlen(p);
         char line[1100];
@@ -203,8 +219,8 @@ static int playlist_to_json(const char *text, const char *srcUrl, char *out, int
         char *s = line; while (*s == ' ' || *s == '\t') s++;
         if (*s) {
             if (strncmp(s, "#EXTINF:", 8) == 0) {
-                // Channel name = text after the first comma that is outside quotes
-                // (attributes like group-title="A,B" may themselves contain commas).
+                // Channel name = text after the first comma outside quotes
+                // (attributes like group-title="A,B" may contain commas).
                 const char *cur = s + 8; int inq = 0; const char *name = NULL;
                 for (; *cur; cur++) {
                     if (*cur == '"') inq = !inq;
@@ -215,16 +231,10 @@ static int playlist_to_json(const char *text, const char *srcUrl, char *out, int
                     strncpy(pend, name, sizeof(pend) - 1); pend[sizeof(pend) - 1] = '\0';
                 }
             } else if (s[0] != '#') {
-                char nm[256];
+                char nm[CHAN_NAME_MAX];
                 if (pend[0]) { strncpy(nm, pend, sizeof(nm) - 1); nm[sizeof(nm) - 1] = '\0'; }
                 else name_from_url(s, nm, sizeof(nm));
-                if (!first) out[o++] = ',';
-                first = 0;
-                out[o++] = '{';
-                o += snprintf(out + o, cap - o, "\"n\":"); json_str(out, cap, &o, nm, 80);
-                o += snprintf(out + o, cap - o, ",\"u\":"); json_str(out, cap, &o, s, 1000);
-                out[o++] = '}';
-                count++;
+                chan_add(nm, s);
                 pend[0] = '\0';
             }
             // other #directives (#EXTM3U, #EXTGRP, #EXTVLCOPT, ...) are ignored
@@ -232,8 +242,46 @@ static int playlist_to_json(const char *text, const char *srcUrl, char *out, int
         if (!nl) break;
         p = nl + 1;
     }
+}
+
+// Serialize the channel store to JSON [{"n":..,"u":..},..] (caller holds g_mtx).
+static int chans_to_json(char *out, int cap) {
+    int o = 0;
+    out[o++] = '[';
+    for (int i = 0; i < g_chanN && o < cap - 2400; i++) {
+        if (i) out[o++] = ',';
+        out[o++] = '{';
+        o += snprintf(out + o, cap - o, "\"n\":"); json_str(out, cap, &o, g_chanName[i], 90);
+        o += snprintf(out + o, cap - o, ",\"u\":"); json_str(out, cap, &o, g_chanUrl[i], 1000);
+        out[o++] = '}';
+    }
     out[o++] = ']';
     return o;
+}
+
+// ---- channel store accessors (for the on-screen D-pad zapper, main.c) -----
+int httpd_chan_count(void) { return g_chanN; }
+int httpd_chan_current(void) { return g_chanCur; }
+// Copy channel i's name/url into caller buffers under lock (safe vs. reloads).
+int httpd_chan_get(int i, char *name, int nameCap, char *url, int urlCap) {
+    int ok = 0;
+    scePthreadMutexLock(&g_mtx);
+    if (i >= 0 && i < g_chanN) {
+        if (name && nameCap > 0) { strncpy(name, g_chanName[i], nameCap - 1); name[nameCap - 1] = '\0'; }
+        if (url && urlCap > 0)   { strncpy(url, g_chanUrl[i], urlCap - 1);   url[urlCap - 1] = '\0'; }
+        ok = 1;
+    }
+    scePthreadMutexUnlock(&g_mtx);
+    return ok;
+}
+// Mark channel i as the one now tuned (also updates the HUD title source).
+void httpd_chan_set_current(int i) {
+    scePthreadMutexLock(&g_mtx);
+    if (i >= -1 && i < g_chanN) {
+        g_chanCur = i;
+        if (i >= 0) { strncpy(g_last_push, g_chanUrl[i], sizeof(g_last_push) - 1); g_last_push[sizeof(g_last_push) - 1] = '\0'; }
+    }
+    scePthreadMutexUnlock(&g_mtx);
 }
 
 // Pop the next queued URL (main loop calls this on playback finish for autoplay).
@@ -445,10 +493,6 @@ static const char CONNECTION_XML[] =
 "</scpd>";
 
 static char g_dlna_uri[1024];
-static char g_last_push[1024];
-
-// The most recently cast URL, for the on-screen HUD title (filename).
-const char *httpd_last_push(void) { return g_last_push; }
 
 static void send_response(OrbisNetId c, const char *status, const char *ctype,
                           const char *body, int bodylen);
@@ -628,10 +672,10 @@ static void handle_client(OrbisNetId c) {
         double cur = 0, dur = 0;
         player_progress(&cur, &dur);
         int j = snprintf(json, sizeof(json),
-                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"native\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"diag\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d,\"debug\":%d}",
+                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"native\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"diag\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d,\"debug\":%d,\"chan_n\":%d,\"chan_cur\":%d}",
                          APP_VER, jb_result(), goldhen_status(), player_status(), handoff_status(), ssdp_status(),
                          active, player_is_paused(), (int)(cur + 0.5), (int)(dur + 0.5), g_last_push, dbg, pad_diag_get(),
-                         player_hw_enabled(), notify_get_debug());
+                         player_hw_enabled(), notify_get_debug(), g_chanN, g_chanCur);
         send_response(c, "200 OK", "application/json", json, j);
         return;
     }
@@ -992,13 +1036,36 @@ static void handle_client(OrbisNetId c) {
             uint8_t *buf = NULL; int len = 0;
             if (aseg_fetch(url, &buf, &len) == 0 && buf && len > 0) {
                 uint8_t *txt = realloc(buf, (size_t)len + 1);
-                if (txt) { buf = txt; buf[len] = '\0'; n = playlist_to_json((const char *)buf, url, out, CAP); }
+                if (txt) {
+                    buf = txt; buf[len] = '\0';
+                    scePthreadMutexLock(&g_mtx);
+                    playlist_store((const char *)buf, url);   // populate shared channel store
+                    n = chans_to_json(out, CAP);
+                    scePthreadMutexUnlock(&g_mtx);
+                }
                 free(buf);
             }
         }
         if (n <= 0) { out[0] = '['; out[1] = ']'; n = 2; }
         send_response(c, "200 OK", "application/json", out, n);
         free(out);
+        return;
+    }
+
+    // Tune a channel from the loaded playlist by index. Body = index. Drives the
+    // in-app player (same path as /avplay) and syncs the shared current-channel.
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/chan") == 0) {
+        int i = atoi(body);
+        char curl[URL_MAX]; curl[0] = '\0';
+        scePthreadMutexLock(&g_mtx);
+        if (i >= 0 && i < g_chanN) {
+            g_chanCur = i;
+            strncpy(curl, g_chanUrl[i], sizeof(curl) - 1); curl[sizeof(curl) - 1] = '\0';
+            strncpy(g_last_push, curl, sizeof(g_last_push) - 1); g_last_push[sizeof(g_last_push) - 1] = '\0';
+        }
+        scePthreadMutexUnlock(&g_mtx);
+        if (curl[0]) { set_pending_player(curl); send_response(c, "200 OK", "text/plain", "ok", 2); }
+        else send_response(c, "400 Bad Request", "text/plain", "bad channel", 11);
         return;
     }
 

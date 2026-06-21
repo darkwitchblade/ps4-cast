@@ -12,4 +12,10 @@ int  httpd_take_quit_request(void);               // 1 if quit was posted
 int  httpd_take_next(char *out, int len);         // 1 if a queued URL (autoplay)
 const char *httpd_last_push(void);                // last cast URL (HUD title)
 
+// Shared M3U/IPTV channel store, for the on-screen D-pad channel zapper.
+int  httpd_chan_count(void);
+int  httpd_chan_current(void);                    // tuned channel index, -1 none
+int  httpd_chan_get(int i, char *name, int nameCap, char *url, int urlCap);
+void httpd_chan_set_current(int i);
+
 #endif
