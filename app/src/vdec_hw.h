@@ -48,4 +48,8 @@ int  vdec_hw_active(void);
 // One-line diagnostic for /status.
 const char *vdec_hw_debug(void);
 
+// Outstanding direct (GPU) memory bytes held by the HW decoder. Should return to
+// the same baseline after each vdec_hw_open/close cycle; growth = a dmem leak.
+long vdec_hw_dmem_outstanding(void);
+
 #endif

@@ -56,6 +56,12 @@ static int g_bound;
 
 typedef struct { off_t off; size_t size; void *va; } DMem;
 
+// Outstanding direct (GPU/onion/garlic) memory currently held by the HW decoder.
+// Exposed via /status so a leak across vdec_hw_open/close cycles is observable
+// (the prime suspect for the resource-accumulation hang after many casts).
+static long g_dmemOutstanding;
+long vdec_hw_dmem_outstanding(void) { return g_dmemOutstanding; }
+
 static int dmem_alloc(DMem *m, size_t size, int memtype) {
     size_t align = 0x4000;
     if (!size) { m->off = 0; m->size = 0; m->va = NULL; return 0; }
@@ -65,11 +71,11 @@ static int dmem_alloc(DMem *m, size_t size, int memtype) {
     if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, align, memtype, &off) < 0) return -1;
     void *va = NULL;
     if (sceKernelMapDirectMemory(&va, size, 0x33, 0, off, align) < 0) { sceKernelReleaseDirectMemory(off, size); return -2; }
-    m->off = off; m->va = va; return 0;
+    m->off = off; m->va = va; g_dmemOutstanding += (long)size; return 0;
 }
 static void dmem_free(DMem *m) {
     if (m->va) { sceKernelMunmap(m->va, m->size); m->va = NULL; }
-    if (m->size) { sceKernelReleaseDirectMemory(m->off, m->size); m->size = 0; }
+    if (m->size) { sceKernelReleaseDirectMemory(m->off, m->size); g_dmemOutstanding -= (long)m->size; m->size = 0; }
 }
 
 // ---- session state --------------------------------------------------------

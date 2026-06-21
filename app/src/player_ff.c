@@ -663,10 +663,10 @@ static void apply_hls_reset(void) {
 void player_debug(char *out, int len) {
     double ahead = (g_bytesPerSec > 0) ? (double)httpsrc_ahead_bytes() / g_bytesPerSec : 0;
     snprintf(out, len,
-             "ff%s%s%s %dx%d | fr=%ld drop=%ld q=%d/%d ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d | as=%d%s%s %s | %s",
+             "ff%s%s%s %dx%d | fr=%ld drop=%ld q=%d/%d ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s",
              g_useHw ? "/HW" : "", g_isHls ? (g_hlsSegDemux ? "/hls-seg" : "/hls") : "", g_threaded ? "/T" : "", g_srcW, g_srcH,
              g_frames, g_drops, g_fqCount, FQ_SLOTS, g_srCount, SEG_RING, g_rebufTotal, ahead,
-             (long long)(g_lastLagUs / 1000), g_lastErr,
+             (long long)(g_lastLagUs / 1000), g_lastErr, vdec_hw_dmem_outstanding() / 1024,
              g_sepAudioMode ? g_aastream : g_astream, g_sepAudioMode ? "/sep" : "",
              (g_sepAudioMode && g_sepAudioEof) ? "/eof" : "",
              audio_debug(),
