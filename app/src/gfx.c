@@ -1,5 +1,6 @@
 #include "gfx.h"
 #include "font8x8.h"
+#include "font_atlas.h"
 
 #include <string.h>
 #include <errno.h>
@@ -306,17 +307,29 @@ int gfx_text_w(const char *s, int scale) {
 }
 
 int gfx_text_tr(Gfx *g, int x, int y, const char *s, int scale, GfxColor c, int track) {
+    // Anti-aliased atlas for scale 2..6 (cell == 8*scale, so the advance and all
+    // existing layout math are unchanged); the 8x8 bitmap covers tiny scale 1.
+    int useAtlas = (scale >= 2 && scale <= FONT_MAXSCALE && FONT_DATA[scale]);
+    int cell = 8 * scale;
+    const unsigned char *atlas = useAtlas ? FONT_DATA[scale] : 0;
     int penX = x;
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
         unsigned char ch = *p;
-        if (ch >= 128) ch = '?';
-        const unsigned char *glyph = font8x8_basic[ch];
-        for (int row = 0; row < 8; row++) {
-            unsigned char bits = glyph[row];
-            for (int col = 0; col < 8; col++) {
-                if (bits & (1 << col)) {   // bit 0 = leftmost pixel
-                    gfx_rect(g, penX + col * scale, y + row * scale, scale, scale, c);
-                }
+        if (useAtlas) {
+            if (ch < FONT_FIRST || ch > FONT_LAST) ch = '?';
+            const unsigned char *gly = atlas + (size_t)(ch - FONT_FIRST) * cell * cell;
+            for (int gy = 0; gy < cell; gy++) {
+                const unsigned char *row = gly + (size_t)gy * cell;
+                for (int gx = 0; gx < cell; gx++)
+                    if (row[gx]) gfx_blend(g, penX + gx, y + gy, c, row[gx]);
+            }
+        } else {
+            if (ch >= 128) ch = '?';
+            const unsigned char *glyph = font8x8_basic[ch];
+            for (int row = 0; row < 8; row++) {
+                unsigned char bits = glyph[row];
+                for (int col = 0; col < 8; col++)
+                    if (bits & (1 << col)) gfx_rect(g, penX + col * scale, y + row * scale, scale, scale, c);
             }
         }
         penX += 8 * scale + track;

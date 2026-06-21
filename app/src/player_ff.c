@@ -453,8 +453,13 @@ int player_play(const char *url) {
     // Hardware H.264: direct MP4 (needs the mp4->annexb bitstream filter) or live
     // HLS via the segment-demux path (MPEG-TS packets are already annex-b, so no
     // bsf). The plain AVIO-concatenated HLS path (no seg-demux) stays software.
-    int hwEligible = g_hwEnabled && vpar->codec_id == AV_CODEC_ID_H264 &&
+    // Interlaced H.264 (1080i broadcast streams) makes the Videodec2 hardware
+    // decoder fault hard (uncatchable GPU crash) — force software for those.
+    int interlaced = (vpar->field_order == AV_FIELD_TT || vpar->field_order == AV_FIELD_BB ||
+                      vpar->field_order == AV_FIELD_TB || vpar->field_order == AV_FIELD_BT);
+    int hwEligible = g_hwEnabled && vpar->codec_id == AV_CODEC_ID_H264 && !interlaced &&
                      (!g_isHls || g_hlsSegDemux);
+    if (interlaced) notify_dbg("PS4 Cast: interlaced -> software decode");
     if (hwEligible) {
         int bsfOk = 1;
         if (!g_isHls) {     // MP4/AVCC source -> convert to annex-b for the decoder

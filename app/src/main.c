@@ -435,43 +435,45 @@ static void draw_hud(Gfx *g) {
     player_progress(&cur, &dur);
     int paused = player_is_paused();
 
-    int W = g->width, H = 224, y = g->height - H - 36, x = 40, w = W - 80;
-    panel(g, x, y, w, H, 24, INK, 200);
-    int pad = 34;
+    // Compact, centered bar — deliberately small so the per-frame alpha blend
+    // can't steal cores from the software decoder (the cause of HUD-on lag).
+    int W = g->width, H = 140;
+    int hw = W - 80 < 1240 ? W - 80 : 1240;
+    int x = (W - hw) / 2, y = g->height - H - 40;
+    panel(g, x, y, hw, H, 22, INK, 200);
+    int pad = 28;
 
     // now-playing badge + title
-    int bx = x + pad, by = y + 26, bs = 56;
-    panel(g, bx, by, bs, bs, 14, SURF2, 255);
-    if (paused) icon_pause(g, bx + bs / 2, by + bs / 2, 22, ACC_LT);
-    else icon_play(g, bx + bs / 2 + 2, by + bs / 2, 24, ACC_LT);
+    int bx = x + pad, by = y + 18, bs = 44;
+    panel(g, bx, by, bs, bs, 12, SURF2, 255);
+    if (paused) icon_pause(g, bx + bs / 2, by + bs / 2, 18, ACC_LT);
+    else icon_play(g, bx + bs / 2 + 2, by + bs / 2, 20, ACC_LT);
 
     char title[160];
     basename_of(httpd_last_push(), title, sizeof(title));
-    gtext(g, bx + bs + 20, by + 2, title, 3, TXT, 0);
-    gfx_text(g, bx + bs + 20, by + 32, paused ? "Paused" : player_status(), 2, MUT);
+    gtext(g, bx + bs + 18, by, title, 3, TXT, 0);
+    gfx_text(g, bx + bs + 18, by + 28, paused ? "Paused" : player_status(), 2, MUT);
 
-    // state pill
+    // state pill (top-right)
     const char *badge = paused ? "PAUSED" : "PLAYING";
-    int pw = gfx_text_w(badge, 2) + 44, px = x + w - pad - pw, py = by + 8;
-    panel(g, px, py, pw, 34, 17, SURF2, 255);
-    gfx_circle(g, px + 20, py + 17, 5, paused ? FAINT : LIVE);
-    gfx_text(g, px + 34, py + 9, badge, 2, paused ? MUT : LIVE);
+    int pw = gfx_text_w(badge, 2) + 42, px = x + hw - pad - pw, py = by + 4;
+    panel(g, px, py, pw, 32, 16, SURF2, 255);
+    gfx_circle(g, px + 19, py + 16, 5, paused ? FAINT : LIVE);
+    gfx_text(g, px + 32, py + 8, badge, 2, paused ? MUT : LIVE);
 
-    // progress bar with knob
+    // progress bar with knob + times
     char curS[24], durS[24];
     fmt_time(cur, curS, sizeof(curS));
     fmt_time(dur, durS, sizeof(durS));
-    int barX = x + pad, barY = y + 118, barW = w - pad * 2, barH = 8;
+    int barX = x + pad, barY = y + 88, barW = hw - pad * 2, barH = 8;
     gfx_round(g, barX, barY, barW, barH, barH / 2, SURF2);
     float p = dur > 0 ? (float)(cur / dur) : 0; if (p < 0) p = 0; if (p > 1) p = 1;
     int fw = (int)(barW * p);
     if (fw > barH) gfx_round(g, barX, barY, fw, barH, barH / 2, ACCENT);
-    gfx_circle(g, barX + fw, barY + barH / 2, 11, TXT);
+    gfx_circle(g, barX + fw, barY + barH / 2, 10, TXT);
     gfx_circle(g, barX + fw, barY + barH / 2, 5, ACCENT);
-    gfx_text(g, barX, barY + 24, curS, 2, MUT);
-    gfx_text(g, barX + barW - gfx_text_w(durS, 2), barY + 24, durS, 2, MUT);
-
-    draw_legend_row(g, W / 2, y + H - 30);
+    gfx_text(g, barX, barY + 22, curS, 2, MUT);
+    gfx_text(g, barX + barW - gfx_text_w(durS, 2), barY + 22, durS, 2, MUT);
 }
 
 // TV-box-style channel list overlay: a fast, scrollable list of the loaded
@@ -632,7 +634,7 @@ int main(void) {
                 navSel = (navSel + 1) % nch;
             }
             chanUntil = now + 6000000ULL;
-            chanTuneAt = now + 850000ULL;              // tune once you settle
+            chanTuneAt = now + 450000ULL;              // tune shortly after you settle
             hudUntil = now + 5000000ULL;
             pressed &= ~(ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN);  // don't also seek
         }
@@ -658,15 +660,18 @@ int main(void) {
             else if (now - fpsT0 >= 1000000ULL) { fpsVal = fpsCount; fpsCount = 0; fpsT0 = now; }
         }
 
-        // Settle-to-tune: switch to the highlighted channel.
+        // Settle-to-tune: switch to the highlighted channel. Hold the current
+        // frame over the switch (no blank "Connecting" / home flash) — the old
+        // picture stays until the new channel produces its first frame.
         if (chanTuneAt && now >= chanTuneAt) {
             chanTuneAt = 0;
             if (navSel >= 0 && navSel != httpd_chan_current()) {
                 char curl[1024];
                 if (httpd_chan_get(navSel, NULL, 0, curl, sizeof(curl))) {
+                    int wasPlaying = player_started() && everDrew;
                     httpd_chan_set_current(navSel);
-                    player_play(curl);
-                    everDrew = 0;
+                    int rc = player_play(curl);
+                    if (rc != 0 || !wasPlaying) everDrew = 0;   // only blank on first tune / failure
                     hudUntil = now + 6000000ULL;
                     chanUntil = now + 3500000ULL;
                 }
@@ -717,13 +722,15 @@ int main(void) {
         if (httpd_take_play_request(url, sizeof(url))) {
             // Native app/browser handoff is permanently disabled (CE-36329-3),
             // so /play now drives the in-app AvPlayer just like /avplay.
-            player_play(url);
-            everDrew = 0;
+            int wasPlaying = player_started() && everDrew;
+            int rc = player_play(url);
+            if (rc != 0 || !wasPlaying) everDrew = 0;     // hold old frame across the switch
             hudUntil = sceKernelGetProcessTime() + 6000000ULL;
         }
         if (httpd_take_player_request(url, sizeof(url))) {
-            player_play(url);
-            everDrew = 0;
+            int wasPlaying = player_started() && everDrew;
+            int rc = player_play(url);
+            if (rc != 0 || !wasPlaying) everDrew = 0;     // hold old frame across the switch
             hudUntil = sceKernelGetProcessTime() + 6000000ULL;
         }
 

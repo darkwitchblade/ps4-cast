@@ -3,6 +3,7 @@
 // real gfx primitives (GFX_HOST_PREVIEW) + qr, then mirrors the draw_* code that
 // ships in main.c. Build: see tools/preview.sh.
 #define GFX_HOST_PREVIEW
+#include "../app/src/font_atlas.c"
 #include "../app/src/gfx.c"
 #include "../app/src/qr.c"
 
