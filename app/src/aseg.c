@@ -226,6 +226,11 @@ static int do_request(int reuse, int *status, char *loc, int loccap,
 }
 
 static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
+    // If an abort was issued (Stop/teardown) in the race window just before this
+    // fetch started, honor it and bail — do NOT clear it and begin a blocking
+    // resolve/connect the abort can no longer interrupt (no socket open yet).
+    // This was the lost-abort path that let a fetch thread wedge at teardown.
+    if (g_abort) { *outBuf = NULL; *outLen = 0; g_abort = 0; return -9; }
     g_abort = 0;
     *outBuf = NULL; *outLen = 0;
 
