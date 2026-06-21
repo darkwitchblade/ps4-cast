@@ -16,6 +16,13 @@ Robust HW+SW decode engine across formats, all tested on-device:
 - **m3u8 / live HLS** — HW decode + segment read-ahead, `rb=0`, audio underruns frozen, no micro-cuts, survives discontinuities. ✓
 - **SW fallback** — gate falls back to software for non-H264 (HEVC/VP9) or if `vdec_hw_open` fails; `/hwdecode` toggles HW at runtime.
 
+## Needs you present (GPU/display risk): live-HLS 40fps→30fps present-drop
+Diagnosed (v02.99): the test stream is genuinely **40fps** (ffprobe: 120 frames / 3.009s, r_frame_rate=40/1). Decode delivers all 40fps (HW), `q=24/24`, `rb=0`, but we present ~30fps and drop ~10/s. Root cause is NOT scale/blit cost — it's the display pipeline: `gfx_present` (gfx.c:70-91) uses **2 framebuffers + a blocking wait-for-flip** (`sceVideoOutGetFlipStatus` loop), which serializes the CPU NV12→BGRA convert with scanout → effective ~30Hz even though `sceVideoOutSetFlipRate(...,0)` allows 60Hz.
+Fix options (each touches the core display path → can GPU-hang/black-screen and need a physical power-cycle, so do these with the user present):
+1. **Triple buffering + pipelined present** — register 3 buffers, submit flip and immediately convert the next frame into the next buffer instead of blocking on flip completion. Lets all 40fps show.
+2. **HW-scaled 720p framebuffer** — render the convert at native 720p and let the video-out compositor upscale to 1080p; cuts per-frame convert cost ~2.2× so render+flip fits one vblank. Also a buffer-attribute change.
+Until then: 40fps→30fps is a minor judder on 40fps sources; everything else is smooth.
+
 ## Open compatibility gap: some HTTPS CDNs read 0 body bytes (httpsrc)
 Direct mp4 AND mkv from `test-videos.co.uk` fail the same way: httpsrc connects, parses the `206` header (gets size), but reads **0 body bytes** (`fill=0KB seek=0 serve=0`) → `avformat_open_input` fails → "stopped". w3schools mp4 and LAN HTTP work fine, so it's server-specific (HTTP/2-only? a TLS/HTTP-read quirk BearSSL/httpsrc mishandles, or index-at-end seek over that server). Pre-existing (unrelated to the HW/read-ahead work). **Next investigation:** klog the httpsrc read loop against a failing CDN; check redirect/HTTP-2/chunked handling in httpsrc.c. *(separate from the HLS aseg path, which works.)*
 
