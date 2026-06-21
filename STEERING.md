@@ -7,13 +7,16 @@ Things the autonomous loop can't decide or do alone. Revisit these together.
 - **My Mac's LAN IP keeps changing** (DHCP: .139 → .160 → .157…). The deploy scripts default to stale IPs; I override with `PS4_IP`/`HOST_IP` each run. Consider a DHCP reservation for both the Mac and PS4 so addresses are stable.
 
 ## Decisions that need you (risk / product calls)
-- **Hardware decode for HLS** (`player_ff.c` line ~404, `!g_isHls` guard): biggest smoothness win + frees the CPU, but it was deliberately disabled — likely because it crashed. You chose "safe fixes first, then attempt HW-for-HLS separately." Pending the safe round being verified stable.
 - **Live HLS buffer is capped at the server's window** (the test stream publishes only ~3 segments ≈ 9s). We can't buffer more than the live edge exposes. ~9s + keep-alive is enough to ride dips; just know true "minutes of headstart" is only possible for VOD playlists, not this live stream.
+
+## Next target: fetch-bound rebuffering (the "headstart buffer" idea)
+With HW decode landed, the residual periodic rebuffering on live HLS is **fetch-bound, not decode-bound**: the frame queue holds only ~0.8s (FQ_SLOTS=24) but each just-in-time segment fetch takes ~1.4s, so the queue drains during the fetch → `rb` climbs ~1/segment. Fix options (next iteration): overlap the next-segment fetch with playback of the current one (single-segment read-ahead — careful, live prefetch was disabled for a live-edge race), and/or enlarge the frame queue so the present rides over the fetch gap (memory cost: 720p NV12 ≈1.4MB/frame). This is the user's "private buffer/headstart" request.
 
 ## Open investigations
 - **`SceShellUI` crashed once with `SYSTEM_VM_RUNTIME` (0xa0028401)** during repeated m3u8 crash+relaunch cycles — a GPU/video-memory runtime fault in the *system UI*, likely GPU/direct-memory not fully released across our app's crash cycles. Shell auto-recovered. Watch for recurrence; may need stricter GPU/dmem release on teardown.
 
 ### RESOLVED
+- **Hardware decode for HLS** — DONE (v02.98). HW H.264 now runs on the live HLS seg-demux path (TS fed annex-b directly, no bsf; PTS→µs; reorder reset on discontinuity). Verified: drops halved (~10/s→~5/s), audio intact, survived a DISCONTINUITY reset with no crash. Toggle via `/hwdecode`. *(player_ff.c gate ~414, decode_video_hw_seg, decode_segment_thread_main)*
 - **The m3u8 ~9s crash** — FIXED (v02.95, confirmed 3+ min no crash). Root cause was `build_scaled` reusing a stale `g_sws` across a discontinuity resolution change → `sws_scale` over-read. Now rebuilds on source-dim/format change.
 - **Audio causes buffering on live HLS** — FIXED (v02.97). Root cause found via `/trace`: `av_find_best_stream(AUDIO)` returned `AVERROR_STREAM_NOT_FOUND` (-1381258232) on most per-segment TS demuxes (mid-stream AAC not classified within the 1s analyze window), so audio decoded for only ~1 in 4 segments → bursty `wr`, ~180 underruns/sec → audible buffering. Fix: fall back to a manual `codec_type` scan, then to a cached last-known-good stream index (`g_segVideoIdx`/`g_segAudioIdx`), reset on `player_play`. *(player_ff.c decode_segment_thread_main)*
 
