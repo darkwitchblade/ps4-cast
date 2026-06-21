@@ -719,6 +719,7 @@ int main(void) {
             if (pressed & ORBIS_PAD_BUTTON_UP)    player_seek(cur + 30.0);
             if (pressed & ORBIS_PAD_BUTTON_L1)    player_seek(cur - 60.0);
             if (pressed & ORBIS_PAD_BUTTON_R1)    player_seek(cur + 60.0);
+            if (pressed & ORBIS_PAD_BUTTON_SQUARE) { player_seek(0); notify("Restarted from the beginning"); }
             if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
                 player_stop();
                 handoff_stop();

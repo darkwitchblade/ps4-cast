@@ -1130,6 +1130,30 @@ static void handle_client(OrbisNetId c) {
         scePthreadMutexUnlock(&g_mtx);
         send_response(c, "200 OK", "application/json", j, o); return;
     }
+    // Remove a Continue-Watching entry (body = URL; empty body clears all).
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/resume/clear") == 0) {
+        char u[URL_MAX]; strncpy(u, body, sizeof(u) - 1); u[sizeof(u) - 1] = '\0';
+        for (int i = (int)strlen(u) - 1; i >= 0 && (u[i]=='\r'||u[i]=='\n'||u[i]==' '||u[i]=='\t'); i--) u[i] = '\0';
+        scePthreadMutexLock(&g_mtx);
+        if (!u[0]) g_resN = 0;
+        else for (int i = 0; i < g_resN; i++) if (strcmp(g_resUrl[i], u) == 0) { res_remove(i); break; }
+        resume_save_file();
+        scePthreadMutexUnlock(&g_mtx);
+        send_response(c, "200 OK", "text/plain", "ok", 2); return;
+    }
+    // Remove a Recent entry (body = URL; empty body clears all).
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/recent/clear") == 0) {
+        char u[URL_MAX]; strncpy(u, body, sizeof(u) - 1); u[sizeof(u) - 1] = '\0';
+        for (int i = (int)strlen(u) - 1; i >= 0 && (u[i]=='\r'||u[i]=='\n'||u[i]==' '||u[i]=='\t'); i--) u[i] = '\0';
+        scePthreadMutexLock(&g_mtx);
+        if (!u[0]) g_recentN = 0;
+        else for (int i = 0; i < g_recentN; i++) if (strcmp(g_recent[i], u) == 0) {
+            for (int k = i; k < g_recentN - 1; k++) strncpy(g_recent[k], g_recent[k+1], URL_MAX - 1);
+            g_recentN--; break;
+        }
+        scePthreadMutexUnlock(&g_mtx);
+        send_response(c, "200 OK", "text/plain", "ok", 2); return;
+    }
     if (strcmp(method, "GET") == 0 && strcmp(path, "/queue") == 0) {
         static char tmp[MAX_QUEUE][URL_MAX]; static char j[MAX_QUEUE * URL_MAX + 64]; int n;
         scePthreadMutexLock(&g_mtx);
