@@ -9,8 +9,15 @@ Things the autonomous loop can't decide or do alone. Revisit these together.
 ## Decisions that need you (risk / product calls)
 - **Live HLS buffer is capped at the server's window** (the test stream publishes only ~3 segments ≈ 9s). We can't buffer more than the live edge exposes. ~9s + keep-alive is enough to ride dips; just know true "minutes of headstart" is only possible for VOD playlists, not this live stream.
 
-## Next target: fetch-bound rebuffering (the "headstart buffer" idea)
-With HW decode landed, the residual periodic rebuffering on live HLS is **fetch-bound, not decode-bound**: the frame queue holds only ~0.8s (FQ_SLOTS=24) but each just-in-time segment fetch takes ~1.4s, so the queue drains during the fetch → `rb` climbs ~1/segment. Fix options (next iteration): overlap the next-segment fetch with playback of the current one (single-segment read-ahead — careful, live prefetch was disabled for a live-edge race), and/or enlarge the frame queue so the present rides over the fetch gap (memory cost: 720p NV12 ≈1.4MB/frame). This is the user's "private buffer/headstart" request.
+## Engine status (verified live, v02.99)
+Robust HW+SW decode engine across formats, all tested on-device:
+- **mp4 (H264)** — HW decode, `drop≈0`, audio OK (w3schools faststart clip). ✓
+- **mkv (H264+AAC)** — HW decode, `drop=0`, audio OK (remuxed clip over LAN HTTP). ✓
+- **m3u8 / live HLS** — HW decode + segment read-ahead, `rb=0`, audio underruns frozen, no micro-cuts, survives discontinuities. ✓
+- **SW fallback** — gate falls back to software for non-H264 (HEVC/VP9) or if `vdec_hw_open` fails; `/hwdecode` toggles HW at runtime.
+
+## Open compatibility gap: some HTTPS CDNs read 0 body bytes (httpsrc)
+Direct mp4 AND mkv from `test-videos.co.uk` fail the same way: httpsrc connects, parses the `206` header (gets size), but reads **0 body bytes** (`fill=0KB seek=0 serve=0`) → `avformat_open_input` fails → "stopped". w3schools mp4 and LAN HTTP work fine, so it's server-specific (HTTP/2-only? a TLS/HTTP-read quirk BearSSL/httpsrc mishandles, or index-at-end seek over that server). Pre-existing (unrelated to the HW/read-ahead work). **Next investigation:** klog the httpsrc read loop against a failing CDN; check redirect/HTTP-2/chunked handling in httpsrc.c. *(separate from the HLS aseg path, which works.)*
 
 ## Open investigations
 - **`SceShellUI` crashed once with `SYSTEM_VM_RUNTIME` (0xa0028401)** during repeated m3u8 crash+relaunch cycles — a GPU/video-memory runtime fault in the *system UI*, likely GPU/direct-memory not fully released across our app's crash cycles. Shell auto-recovered. Watch for recurrence; may need stricter GPU/dmem release on teardown.
