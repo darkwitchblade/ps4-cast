@@ -75,13 +75,19 @@
 #endif
 extern int sigaltstack(const stack_t *, stack_t *);
 
+// Persist a one-line crash/hang note to /data (read back via GET /crashlog).
+// Uses raw syscalls so it's safe from a signal handler.
+static void persist_crash(const char *buf, int n) {
+    int fd = sceKernelOpen("/data/ps4cast_crash.log", 0x0201 /*WRONLY|CREAT*/ | 0x0400 /*TRUNC*/, 0666);
+    if (fd >= 0) { sceKernelWrite(fd, buf, (size_t)n); sceKernelClose(fd); }
+}
+
 static void fatal_signal(int sig, struct __siginfo *info, void *uap) {
     (void)uap;
     char b[160];
     unsigned long a = info ? (unsigned long)info->si_addr : 0;
     int n = snprintf(b, sizeof(b), "CRASH v" APP_VER " sig=%d addr=0x%lx\n", sig, a);
-    int fd = sceKernelOpen("/data/ps4cast_crash.log", 0x0201 /*WRONLY|CREAT*/ | 0x0400 /*TRUNC*/, 0666);
-    if (fd >= 0) { sceKernelWrite(fd, b, (size_t)n); sceKernelClose(fd); }
+    persist_crash(b, n);
     _exit(0);
 }
 static void install_fatal_handlers(void) {
@@ -112,8 +118,13 @@ static void *watchdog_main(void *arg) {
         uint64_t hb = g_heartbeat;
         if (hb == 0) continue;                            // main loop not running yet
         uint64_t now = sceKernelGetProcessTime();
-        if (now > hb && (now - hb) > 15ULL * 1000 * 1000) // ~15s with zero progress = frozen
+        if (now > hb && (now - hb) > 15ULL * 1000 * 1000) { // ~15s with zero progress = frozen
+            char b[96];
+            int n = snprintf(b, sizeof(b), "HANG v" APP_VER " watchdog stale=%llums\n",
+                             (unsigned long long)((now - hb) / 1000));
+            persist_crash(b, n);                          // record the hang for /crashlog
             _exit(0);                                     // force full exit; user just reopens
+        }
     }
     return NULL;
 }
