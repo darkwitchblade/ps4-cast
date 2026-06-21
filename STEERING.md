@@ -25,6 +25,12 @@ After recovery (user re-armed :9090), retested: **VOD HLS plays fine end-to-end*
 - **Lesson stands:** casting in tight automated loops + flaky :9090 = risk of unrecoverable downtime. Keep heavy soak tests for when the user is present.
 - **Lesson for unattended loops:** casting untested content types can crash the app, and when `:9090` is unarmed I can't recover it autonomously. Keep risky content-compat probes for when you're present / `:9090` is reliably armed.
 
+## Ready to deploy when you're present: v03.00 (telemetry + ring budget)
+Built + committed, NOT yet deployed (deployed app is still 02.99; :9090 flaky so I held the deploy). Two changes:
+1. **dmem telemetry** — `/status` now reports `dmem=<KB>` (outstanding HW direct memory). After each cast it should return to the same baseline; growth across cast cycles = the suspected leak, finally observable.
+2. **Read-ahead byte budget** — SEG_RING bounded by 24MB as well as 3 slots (caps RAM on large-segment streams; small segments unchanged).
+**Verification plan (needs you present, :9090 armed):** deploy v03.00 → cast live HLS, confirm `rb=0` + `dmem` steady → run a soak (repeated cast/stop cycles) watching `dmem`: if it climbs and never returns to baseline, that's the resource-accumulation hang root cause → fix `vdec_hw_close` to fully release. Just say "deploy it" when ready.
+
 ## Needs you present (GPU/display risk): live-HLS 40fps→30fps present-drop
 Diagnosed (v02.99): the test stream is genuinely **40fps** (ffprobe: 120 frames / 3.009s, r_frame_rate=40/1). Decode delivers all 40fps (HW), `q=24/24`, `rb=0`, but we present ~30fps and drop ~10/s. Root cause is NOT scale/blit cost — it's the display pipeline: `gfx_present` (gfx.c:70-91) uses **2 framebuffers + a blocking wait-for-flip** (`sceVideoOutGetFlipStatus` loop), which serializes the CPU NV12→BGRA convert with scanout → effective ~30Hz even though `sceVideoOutSetFlipRate(...,0)` allows 60Hz.
 Fix options (each touches the core display path → can GPU-hang/black-screen and need a physical power-cycle, so do these with the user present):
