@@ -23,7 +23,7 @@ typedef struct {
     size_t directMemSize;
     uintptr_t videoMemSP;
     void *videoMem;
-    void *frameBuffers[3];   // triple-buffered: pipeline CPU convert with scanout
+    void *frameBuffers[2];   // double-buffered, fully-blocking present (proven stable)
     void *flipQueue;    // OrbisKernelEqueue (pointer-sized opaque handle)
     char attr[64];      // OrbisVideoOutBufferAttribute storage (over-sized, safe)
 } Gfx;
