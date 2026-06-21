@@ -107,6 +107,7 @@ const char *httpsrc_debug(void) {
     return b;
 }
 uint64_t    httpsrc_size(void)  { return g_total; }
+uint64_t    httpsrc_rx_total(void) { return g_rawPos; }   // bytes fetched from network
 
 // Forward read-ahead in bytes (buffered ahead of the consumer).
 uint64_t httpsrc_ahead_bytes(void) {

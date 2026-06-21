@@ -28,6 +28,7 @@ void     httpsrc_abort(void);
 // Forward read-ahead as a percent of the ring (0 = about to underrun).
 int      httpsrc_fill_pct(void);
 uint64_t httpsrc_ahead_bytes(void);   // forward-buffered bytes
+uint64_t httpsrc_rx_total(void);      // total bytes pulled from the network
 int      httpsrc_is_lan(void);        // 1 if host is a private/LAN address
 
 // One-line human-readable state for /status telemetry.

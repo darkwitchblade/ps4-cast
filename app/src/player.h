@@ -25,4 +25,20 @@ int  player_hw_enabled(void);        // current hardware-decode toggle state
 int  player_buffering(void);         // 1 = playing but waiting on data (stalled)
 int  player_buffer_pct(void);        // read-ahead buffer level, 0-100
 
+// Live playback telemetry for the on-screen stats overlay.
+typedef struct {
+    int    hw;            // 1 = hardware H.264 decode, 0 = software
+    int    hls;           // 1 = HLS source
+    int    segDemux;      // 1 = HLS segment-demux path
+    int    w, h;          // source resolution
+    long   frames;        // decoded video frames
+    long   drops;         // dropped frames
+    double bitrateMbps;   // stream bitrate estimate (Mbps)
+    double aheadSec;      // buffered seconds ahead of playback
+    int    bufPct;        // read-ahead buffer fill, 0-100
+    int    lan;           // source is on the LAN
+    char   codec[24];     // codec / decoder label
+} PlayerStats;
+void player_stats(PlayerStats *s);
+
 #endif

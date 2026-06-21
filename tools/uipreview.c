@@ -30,6 +30,11 @@ static const GfxColor PAPER  = { 0xf4, 0xf7, 0xff };
 static const GfxColor BTN_X  = { 0x86, 0xa9, 0xff };
 static const GfxColor BTN_O  = { 0xff, 0x73, 0x88 };
 static const GfxColor BTN_T  = { 0x44, 0xe0, 0xa6 };
+static const GfxColor WARN   = { 0xff, 0xc4, 0x4a };
+#define APP_VER "03.19"
+typedef struct { int hw,hls,segDemux,w,h; long frames,drops; double bitrateMbps,aheadSec; int bufPct,lan; char codec[24]; } PlayerStats;
+static void player_stats(PlayerStats *s){ memset(s,0,sizeof(*s)); s->hw=1; s->w=1920; s->h=1080; s->drops=2;
+ s->bitrateMbps=6.4; s->aheadSec=4.1; s->bufPct=92; s->hls=1; s->segDemux=1; s->lan=0; snprintf(s->codec,sizeof(s->codec),"h264"); }
 
 // ---- shared draw helpers (ported verbatim into main.c) -------------------
 static void thick_line(Gfx *g, float x0, float y0, float x1, float y1, float th, GfxColor c) {
@@ -49,10 +54,8 @@ static void ctext(Gfx *g, int cy, const char *s, int sc, GfxColor c, int tr) {
 }
 // soft shadow under a rounded panel for depth
 static void panel(Gfx *g, int x, int y, int w, int h, int r, GfxColor c, int a) {
-    gfx_round_a(g, x, y + 6, w, h, r, INK, 60);     // shadow
     gfx_round_a(g, x, y, w, h, r, c, a);
-    // top hairline highlight
-    gfx_rect_a(g, x + r, y, w - 2 * r, 1, HAIR, 36);
+    gfx_rect_a(g, x + r, y, w - 2 * r, 1, HAIR, 36);   // top hairline highlight
 }
 
 // ---- icons ---------------------------------------------------------------
@@ -301,6 +304,35 @@ static void draw_channel_overlay(Gfx *g, int sel) {
     gfx_text(g, x + 28, y + H - 34, "Up / Down  change channel      Cross  watch", 2, MUT);
 }
 
+static void draw_stats_overlay(Gfx *g, double netMBs, int fps) {
+    PlayerStats s; player_stats(&s);
+    int pw = 446, ph = 250, x = g->width - pw - 40, y = 40;
+    panel(g, x, y, pw, ph, 18, INK, 205);
+    int ix = x + 26, iy = y + 24;
+    gfx_circle(g, ix + 4, iy + 7, 5, LIVE);
+    gtext(g, ix + 18, iy, "STREAM", 2, TXT, 1);
+    char ver[16]; snprintf(ver, sizeof(ver), "v%s", APP_VER);
+    gfx_text(g, x + pw - 26 - gfx_text_w(ver, 2), iy, ver, 2, FAINT);
+    gfx_rect_a(g, ix, iy + 26, pw - 52, 1, HAIR, 40);
+    int lx = ix, vx = ix + 150, ry = iy + 42, rh = 30;
+    char b[80];
+    snprintf(b, sizeof(b), "%s  %s", s.hw ? "HW" : "SW", s.codec);
+    gfx_text(g, lx, ry, "Decode", 2, FAINT);  gfx_text(g, vx, ry, b, 2, s.hw ? LIVE : ACC_LT);  ry += rh;
+    snprintf(b, sizeof(b), "%dx%d   %d fps", s.w, s.h, fps);
+    gfx_text(g, lx, ry, "Video", 2, FAINT);   gfx_text(g, vx, ry, b, 2, (fps >= 24 || fps == 0) ? TXT : WARN);  ry += rh;
+    snprintf(b, sizeof(b), "%d%%   +%.1fs", s.bufPct, s.aheadSec);
+    GfxColor bc = s.bufPct >= 40 ? LIVE : (s.bufPct >= 15 ? WARN : DANGER);
+    gfx_text(g, lx, ry, "Buffer", 2, FAINT);  gfx_text(g, vx, ry, b, 2, bc);  ry += rh;
+    if (netMBs >= 0.05) snprintf(b, sizeof(b), "%.1f MB/s", netMBs);
+    else snprintf(b, sizeof(b), "%.1f Mbps", s.bitrateMbps);
+    gfx_text(g, lx, ry, "Network", 2, FAINT); gfx_text(g, vx, ry, b, 2, TXT);  ry += rh;
+    snprintf(b, sizeof(b), "%s%s", s.hls ? (s.segDemux ? "HLS seg-demux" : "HLS") : "HTTP", s.lan ? "   LAN" : "");
+    gfx_text(g, lx, ry, "Source", 2, FAINT);  gfx_text(g, vx, ry, b, 2, MUT);  ry += rh;
+    snprintf(b, sizeof(b), "%ld", s.drops);
+    gfx_text(g, lx, ry, "Dropped", 2, FAINT); gfx_text(g, vx, ry, b, 2, s.drops > 0 ? WARN : MUT);  ry += rh;
+    gfx_text(g, ix, y + ph - 30, "Touchpad  hide", 1, FAINT);
+}
+
 // ---- harness -------------------------------------------------------------
 static void write_ppm(const char *path, Gfx *g) {
     FILE *f = fopen(path, "wb");
@@ -358,5 +390,12 @@ int main(void) {
     draw_hud(&g, "Sky Sports Main Event", "Playing  -  hls live  1920x1080", 0, 0, 0);
     draw_channel_overlay(&g, 8);   // highlight a row away from the live one
     write_ppm("/tmp/ui_chan.ppm", &g);
+
+    // stats overlay over playing video (HUD also up, to check they don't clash)
+    gfx_vgrad(&g, 0, 0, g.width, g.height, v1, v2);
+    gfx_circle_a(&g, 700, 360, 240, (GfxColor){0x40,0x30,0x70}, 120);
+    draw_hud(&g, "Sky Sports Main Event", "Playing  -  hls live  1920x1080", 71, 215, 0);
+    draw_stats_overlay(&g, 3.4, 50);
+    write_ppm("/tmp/ui_stats.ppm", &g);
     return 0;
 }

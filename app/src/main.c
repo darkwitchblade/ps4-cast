@@ -13,6 +13,7 @@
 #include "netutil.h"
 #include "httpd.h"
 #include "player.h"
+#include "httpsrc.h"
 #include "escalate.h"
 #include "launcher.h"
 #include "ssdp.h"
@@ -151,6 +152,7 @@ static const GfxColor ACCENT = { 0x5b, 0x8c, 0xff };
 static const GfxColor ACC_LT = { 0x9d, 0xb8, 0xff };
 static const GfxColor LIVE   = { 0x2e, 0xe6, 0xa6 };
 static const GfxColor DANGER = { 0xff, 0x5d, 0x7a };
+static const GfxColor WARN   = { 0xff, 0xc4, 0x4a };
 static const GfxColor TXT    = { 0xf3, 0xf6, 0xff };
 static const GfxColor MUT    = { 0x9a, 0xa4, 0xc8 };
 static const GfxColor FAINT  = { 0x6b, 0x73, 0x98 };
@@ -206,9 +208,8 @@ static void ctext(Gfx *g, int cy, const char *s, int sc, GfxColor c, int tr) {
     gtext(g, (g->width - w) / 2, cy, s, sc, c, tr);
 }
 static void panel(Gfx *g, int x, int y, int w, int h, int r, GfxColor c, int a) {
-    gfx_round_a(g, x, y + 6, w, h, r, INK, 60);
     gfx_round_a(g, x, y, w, h, r, c, a);
-    gfx_rect_a(g, x + r, y, w - 2 * r, 1, HAIR, 36);
+    gfx_rect_a(g, x + r, y, w - 2 * r, 1, HAIR, 36);   // top hairline highlight
 }
 static void icon_play(Gfx *g, int cx, int cy, int s, GfxColor c) {
     gfx_tri(g, cx - (int)(s * 0.28f), cy - (int)(s * 0.5f),
@@ -522,6 +523,38 @@ static void draw_channel_overlay(Gfx *g, int sel) {
     }
     gfx_text(g, x + 28, y + H - 34, "Up / Down  change channel      Cross  watch", 2, MUT);
 }
+
+// Lightweight top-right stream telemetry, toggled by the touchpad button. Kept
+// small + text-only so it never competes with software decode (unlike the HUD).
+static void draw_stats_overlay(Gfx *g, double netMBs, int fps) {
+    PlayerStats s; player_stats(&s);
+    int pw = 446, ph = 250, x = g->width - pw - 40, y = 40;
+    panel(g, x, y, pw, ph, 18, INK, 205);
+
+    int ix = x + 26, iy = y + 24;
+    gfx_circle(g, ix + 4, iy + 7, 5, LIVE);
+    gtext(g, ix + 18, iy, "STREAM", 2, TXT, 1);
+    char ver[16]; snprintf(ver, sizeof(ver), "v%s", APP_VER);
+    gfx_text(g, x + pw - 26 - gfx_text_w(ver, 2), iy, ver, 2, FAINT);
+    gfx_rect_a(g, ix, iy + 26, pw - 52, 1, HAIR, 40);
+
+    int lx = ix, vx = ix + 150, ry = iy + 42, rh = 30;
+    char b[80];
+    snprintf(b, sizeof(b), "%s  %s", s.hw ? "HW" : "SW", s.codec);
+    gfx_text(g, lx, ry, "Decode", 2, FAINT);  gfx_text(g, vx, ry, b, 2, s.hw ? LIVE : ACC_LT);  ry += rh;
+    snprintf(b, sizeof(b), "%dx%d   %d fps", s.w, s.h, fps);
+    gfx_text(g, lx, ry, "Video", 2, FAINT);   gfx_text(g, vx, ry, b, 2, (fps >= 24 || fps == 0) ? TXT : WARN);  ry += rh;
+    snprintf(b, sizeof(b), "%d%%   +%.1fs", s.bufPct, s.aheadSec);
+    GfxColor bc = s.bufPct >= 40 ? LIVE : (s.bufPct >= 15 ? WARN : DANGER);
+    gfx_text(g, lx, ry, "Buffer", 2, FAINT);  gfx_text(g, vx, ry, b, 2, bc);  ry += rh;
+    if (netMBs >= 0.05) snprintf(b, sizeof(b), "%.1f MB/s", netMBs);
+    else snprintf(b, sizeof(b), "%.1f Mbps", s.bitrateMbps);
+    gfx_text(g, lx, ry, "Network", 2, FAINT); gfx_text(g, vx, ry, b, 2, TXT);  ry += rh;
+    snprintf(b, sizeof(b), "%s%s", s.hls ? (s.segDemux ? "HLS seg-demux" : "HLS") : "HTTP", s.lan ? "   LAN" : "");
+    gfx_text(g, lx, ry, "Source", 2, FAINT);  gfx_text(g, vx, ry, b, 2, MUT);  ry += rh;
+    snprintf(b, sizeof(b), "%ld", s.drops);
+    gfx_text(g, lx, ry, "Dropped", 2, FAINT); gfx_text(g, vx, ry, b, 2, s.drops > 0 ? WARN : MUT);  ry += rh;
+}
 #endif
 
 int main(void) {
@@ -576,6 +609,10 @@ int main(void) {
     int navSel = -1;                  // highlighted channel in the zapper overlay
     uint64_t chanUntil = 0;           // overlay visible until this time
     uint64_t chanTuneAt = 0;          // pending tune time (settle-to-tune)
+    int statsOn = 0;                  // touchpad-toggled stream stats overlay
+    double netMBs = 0;                // sampled download throughput
+    uint64_t rxT0 = 0, rxB0 = 0;      // throughput sampling anchor
+    int fpsCount = 0, fpsVal = 0; uint64_t fpsT0 = 0;
     PadState pad;
     pad_init(&pad);
 
@@ -604,6 +641,23 @@ int main(void) {
             chanTuneAt = now;
             pressed &= ~(ORBIS_PAD_BUTTON_CROSS | ORBIS_PAD_BUTTON_OPTIONS);
         }
+        // Touchpad toggles the lightweight stream-stats overlay.
+        if (pressed & ORBIS_PAD_BUTTON_TOUCH_PAD) statsOn = !statsOn;
+
+        // Sample download throughput (~2 Hz) and presented-frame rate (1 Hz).
+        {
+            uint64_t rx = httpsrc_rx_total();
+            if (rxT0 == 0) { rxT0 = now; rxB0 = rx; }
+            else if (now - rxT0 >= 500000ULL) {
+                double dt = (double)(now - rxT0) / 1e6;
+                double db = (rx >= rxB0) ? (double)(rx - rxB0) : 0;   // 0 across a new stream
+                netMBs = (db / dt) / 1e6;
+                rxT0 = now; rxB0 = rx;
+            }
+            if (fpsT0 == 0) fpsT0 = now;
+            else if (now - fpsT0 >= 1000000ULL) { fpsVal = fpsCount; fpsCount = 0; fpsT0 = now; }
+        }
+
         // Settle-to-tune: switch to the highlighted channel.
         if (chanTuneAt && now >= chanTuneAt) {
             chanTuneAt = 0;
@@ -692,6 +746,7 @@ int main(void) {
             int drew = player_render(&g);   // always pump frames while started
             if (drew) {
                 everDrew = 1;
+                fpsCount++;                 // count real presented video frames
             } else if (!everDrew) {
                 gfx_vgrad(&g, 0, 0, g.width, g.height, BG_TOP, BG_BOT);
                 int pw = 720, ph = 264, px = (g.width - pw) / 2, py = (g.height - ph) / 2;
@@ -732,6 +787,10 @@ int main(void) {
         // Channel zapper overlay sits on top of whatever is showing.
         if (sceKernelGetProcessTime() < chanUntil && httpd_chan_count() > 0)
             draw_channel_overlay(&g, navSel);
+
+        // Lightweight stream stats (touchpad), top-right, only while playing.
+        if (statsOn && player_started())
+            draw_stats_overlay(&g, netMBs, fpsVal);
 
         gfx_present(&g, frameID++);
     }

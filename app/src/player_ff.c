@@ -125,6 +125,7 @@ static double          g_durSec = 0;   // total duration
 // debug counters
 static long g_pkts = 0, g_frames = 0;
 static long g_drops = 0, g_audioPkts = 0, g_videoPkts = 0;
+static char g_codecLabel[24] = "";
 static int  g_lastErr = 0;
 static int64_t g_lastLagUs = 0;
 static int  g_isHls = 0;   // HLS (m3u8): non-seekable concatenated segments
@@ -497,6 +498,7 @@ int player_play(const char *url) {
     g_pkt   = av_packet_alloc();
     g_srcW = g_useHw ? vpar->width  : g_vdec->width;
     g_srcH = g_useHw ? vpar->height : g_vdec->height;
+    snprintf(g_codecLabel, sizeof(g_codecLabel), "%s", dec->name ? dec->name : "video");
     g_durSec = (g_fmt->duration > 0) ? (double)g_fmt->duration / AV_TIME_BASE : 0;
     g_hlsSegGen = g_isHls ? hls_generation() : 0;
     g_hlsResetGen = g_isHls ? hls_reset_generation() : 0;
@@ -673,6 +675,21 @@ static void apply_hls_reset(void) {
     g_decEof = 0;
     g_lastLagUs = 0;
     snprintf(g_status, sizeof(g_status), "buffering live");
+}
+
+void player_stats(PlayerStats *s) {
+    memset(s, 0, sizeof(*s));
+    s->hw = g_useHw;
+    s->hls = g_isHls;
+    s->segDemux = g_hlsSegDemux;
+    s->w = g_srcW; s->h = g_srcH;
+    s->frames = g_frames;
+    s->drops = g_drops;
+    s->bitrateMbps = g_bytesPerSec * 8.0 / 1e6;
+    s->aheadSec = (g_bytesPerSec > 0) ? (double)httpsrc_ahead_bytes() / g_bytesPerSec : 0;
+    s->bufPct = player_buffer_pct();
+    s->lan = (!g_isHls) ? httpsrc_is_lan() : 0;
+    snprintf(s->codec, sizeof(s->codec), "%s", g_codecLabel[0] ? g_codecLabel : "video");
 }
 
 void player_debug(char *out, int len) {

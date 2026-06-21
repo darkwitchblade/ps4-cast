@@ -187,13 +187,29 @@ void gfx_blend(Gfx *g, int x, int y, GfxColor c, int a) {
     *p = encode(o);
 }
 
+// Translucent fill — the hot path for every panel/HUD/overlay. Kept tight (no
+// per-pixel function call or bounds check, row-pointer walk, integer blend) so
+// it doesn't steal CPU from the software video decode on the same cores.
 void gfx_rect_a(Gfx *g, int x, int y, int w, int h, GfxColor c, int a) {
     if (a >= 255) { gfx_rect(g, x, y, w, h, c); return; }
+    if (a <= 0) return;
     int x1 = x + w, y1 = y + h;
     if (x < 0) x = 0; if (y < 0) y = 0;
     if (x1 > g->width) x1 = g->width; if (y1 > g->height) y1 = g->height;
-    for (int yy = y; yy < y1; yy++)
-        for (int xx = x; xx < x1; xx++) gfx_blend(g, xx, yy, c, a);
+    if (x1 <= x || y1 <= y) return;
+    uint32_t ia = (uint32_t)(255 - a);
+    uint32_t sr = (uint32_t)c.r * a, sg = (uint32_t)c.g * a, sb = (uint32_t)c.b * a;
+    uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
+    for (int yy = y; yy < y1; yy++) {
+        uint32_t *row = fb + (size_t)yy * g->width;
+        for (int xx = x; xx < x1; xx++) {
+            uint32_t e = row[xx];
+            uint32_t r = (sr + ((e >> 16) & 0xff) * ia) / 255;
+            uint32_t gg = (sg + ((e >> 8) & 0xff) * ia) / 255;
+            uint32_t b = (sb + (e & 0xff) * ia) / 255;
+            row[xx] = 0x80000000u | (r << 16) | (gg << 8) | b;
+        }
+    }
 }
 
 void gfx_circle_a(Gfx *g, int cx, int cy, int r, GfxColor c, int a) {
