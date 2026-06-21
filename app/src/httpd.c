@@ -130,19 +130,21 @@ static void cfg_load(void) {
     if (d) notify_set_debug(atoi(d + 6));
 }
 
-// ---- resume positions: remember where each VOD was stopped, resume on replay
+// ---- resume positions: remember where each VOD was stopped, resume on replay.
+// Kept most-recent-first so the web "Continue Watching" row is ordered.
 #define MAX_RESUME  64
 #define RESUME_PATH "/data/ps4cast_resume.txt"
 static char g_resUrl[MAX_RESUME][URL_MAX];
-static int  g_resPos[MAX_RESUME];   // seconds
+static int  g_resPos[MAX_RESUME];   // seconds into the title
+static int  g_resDur[MAX_RESUME];   // title duration (seconds)
 static int  g_resN = 0;
 
 static void resume_save_file(void) {
     int fd = sceKernelOpen(RESUME_PATH, 0x0201 | 0x0400, 0666);
     if (fd < 0) return;
-    char line[URL_MAX + 32];
+    char line[URL_MAX + 48];
     for (int i = 0; i < g_resN; i++) {
-        int n = snprintf(line, sizeof(line), "%d\t%s\n", g_resPos[i], g_resUrl[i]);
+        int n = snprintf(line, sizeof(line), "%d\t%d\t%s\n", g_resPos[i], g_resDur[i], g_resUrl[i]);
         sceKernelWrite(fd, line, n);
     }
     sceKernelClose(fd);
@@ -150,7 +152,7 @@ static void resume_save_file(void) {
 static void resume_load(void) {
     int fd = sceKernelOpen(RESUME_PATH, 0, 0);
     if (fd < 0) return;
-    static char buf[MAX_RESUME * (URL_MAX + 32)];
+    static char buf[MAX_RESUME * (URL_MAX + 48)];
     int n = (int)sceKernelRead(fd, buf, sizeof(buf) - 1);
     sceKernelClose(fd);
     if (n <= 0) return;
@@ -158,15 +160,21 @@ static void resume_load(void) {
     g_resN = 0;
     char *save = NULL;
     for (char *ln = strtok_r(buf, "\n", &save); ln && g_resN < MAX_RESUME; ln = strtok_r(NULL, "\n", &save)) {
-        char *tab = strchr(ln, '\t');
-        if (!tab) continue;
-        *tab = '\0';
-        const char *url = tab + 1;
+        char *t1 = strchr(ln, '\t'); if (!t1) continue; *t1 = '\0';
+        char *t2 = strchr(t1 + 1, '\t'); if (!t2) continue; *t2 = '\0';
+        const char *url = t2 + 1;
         if (!url[0]) continue;
         g_resPos[g_resN] = atoi(ln);
+        g_resDur[g_resN] = atoi(t1 + 1);
         strncpy(g_resUrl[g_resN], url, URL_MAX - 1); g_resUrl[g_resN][URL_MAX - 1] = '\0';
         g_resN++;
     }
+}
+static void res_remove(int idx) {
+    for (int i = idx; i < g_resN - 1; i++) {
+        strcpy(g_resUrl[i], g_resUrl[i+1]); g_resPos[i] = g_resPos[i+1]; g_resDur[i] = g_resDur[i+1];
+    }
+    g_resN--;
 }
 // Record a stop position for a URL (cleared when finished); persists to /data.
 void httpd_resume_save(const char *url, int pos, int dur) {
@@ -174,21 +182,15 @@ void httpd_resume_save(const char *url, int pos, int dur) {
     scePthreadMutexLock(&g_mtx);
     int idx = -1;
     for (int i = 0; i < g_resN; i++) if (strcmp(g_resUrl[i], url) == 0) { idx = i; break; }
-    if (pos >= dur - 15 || pos < 5) {          // finished / negligible -> forget it
-        if (idx >= 0) {
-            for (int i = idx; i < g_resN - 1; i++) { strcpy(g_resUrl[i], g_resUrl[i+1]); g_resPos[i] = g_resPos[i+1]; }
-            g_resN--;
+    if (idx >= 0) res_remove(idx);             // pull it out; re-insert at front (or drop)
+    if (pos >= 5 && pos < dur - 15) {          // meaningful midpoint -> keep, most-recent first
+        if (g_resN >= MAX_RESUME) g_resN = MAX_RESUME - 1;   // drop the oldest
+        for (int i = g_resN; i > 0; i--) {
+            strcpy(g_resUrl[i], g_resUrl[i-1]); g_resPos[i] = g_resPos[i-1]; g_resDur[i] = g_resDur[i-1];
         }
-    } else {
-        if (idx < 0) {
-            if (g_resN >= MAX_RESUME) {         // evict oldest (FIFO)
-                for (int i = 0; i < g_resN - 1; i++) { strcpy(g_resUrl[i], g_resUrl[i+1]); g_resPos[i] = g_resPos[i+1]; }
-                g_resN--;
-            }
-            idx = g_resN++;
-            strncpy(g_resUrl[idx], url, URL_MAX - 1); g_resUrl[idx][URL_MAX - 1] = '\0';
-        }
-        g_resPos[idx] = pos;
+        g_resN++;
+        strncpy(g_resUrl[0], url, URL_MAX - 1); g_resUrl[0][URL_MAX - 1] = '\0';
+        g_resPos[0] = pos; g_resDur[0] = dur;
     }
     resume_save_file();
     scePthreadMutexUnlock(&g_mtx);
@@ -201,6 +203,40 @@ int httpd_resume_get(const char *url) {
     for (int i = 0; i < g_resN; i++) if (strcmp(g_resUrl[i], url) == 0) { pos = g_resPos[i]; break; }
     scePthreadMutexUnlock(&g_mtx);
     return pos;
+}
+
+// ---- channel list persistence: survive an app restart without re-loading ----
+// The console can't type a URL, so re-loading an IPTV playlist from the phone
+// after every relaunch is painful. Persist the parsed channels to /data and
+// restore them on boot (no network needed). Callers hold g_mtx.
+#define CHAN_PATH "/data/ps4cast_channels.txt"
+static void chan_save_file(void) {
+    int fd = sceKernelOpen(CHAN_PATH, 0x0201 | 0x0400, 0666);
+    if (fd < 0) return;
+    char line[URL_MAX + CHAN_NAME_MAX + 8];
+    for (int i = 0; i < g_chanN; i++) {
+        int n = snprintf(line, sizeof(line), "%s\t%s\n", g_chanName[i], g_chanUrl[i]);
+        sceKernelWrite(fd, line, n);
+    }
+    sceKernelClose(fd);
+}
+static void chan_load_file(void) {
+    int fd = sceKernelOpen(CHAN_PATH, 0, 0);
+    if (fd < 0) return;
+    static char buf[MAX_CHAN * (URL_MAX + CHAN_NAME_MAX + 8)];
+    int n = (int)sceKernelRead(fd, buf, sizeof(buf) - 1);
+    sceKernelClose(fd);
+    if (n <= 0) return;
+    buf[n] = '\0';
+    g_chanN = 0; g_chanCur = -1;
+    char *save = NULL;
+    for (char *ln = strtok_r(buf, "\n", &save); ln && g_chanN < MAX_CHAN; ln = strtok_r(NULL, "\n", &save)) {
+        char *tab = strchr(ln, '\t'); if (!tab) continue; *tab = '\0';
+        const char *url = tab + 1; if (!url[0]) continue;
+        strncpy(g_chanName[g_chanN], ln, CHAN_NAME_MAX - 1); g_chanName[g_chanN][CHAN_NAME_MAX - 1] = '\0';
+        strncpy(g_chanUrl[g_chanN], url, URL_MAX - 1); g_chanUrl[g_chanN][URL_MAX - 1] = '\0';
+        g_chanN++;
+    }
 }
 
 static void fav_toggle(const char *url) {
@@ -1080,6 +1116,20 @@ static void handle_client(OrbisNetId c) {
         scePthreadMutexLock(&g_mtx); int n = json_list(j, sizeof(j), g_fav, g_favN); scePthreadMutexUnlock(&g_mtx);
         send_response(c, "200 OK", "application/json", j, n); return;
     }
+    // Continue Watching: saved resume positions [{u,p,d},...], most recent first.
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/resume") == 0) {
+        static char j[MAX_RESUME * (URL_MAX + 32) + 16];
+        scePthreadMutexLock(&g_mtx);
+        int o = 0; j[o++] = '[';
+        for (int i = 0; i < g_resN && o < (int)sizeof(j) - 1200; i++) {
+            if (i) j[o++] = ',';
+            j[o++] = '{'; o += snprintf(j + o, sizeof(j) - o, "\"u\":"); json_str(j, sizeof(j), &o, g_resUrl[i], 1000);
+            o += snprintf(j + o, sizeof(j) - o, ",\"p\":%d,\"d\":%d}", g_resPos[i], g_resDur[i]);
+        }
+        j[o++] = ']';
+        scePthreadMutexUnlock(&g_mtx);
+        send_response(c, "200 OK", "application/json", j, o); return;
+    }
     if (strcmp(method, "GET") == 0 && strcmp(path, "/queue") == 0) {
         static char tmp[MAX_QUEUE][URL_MAX]; static char j[MAX_QUEUE * URL_MAX + 64]; int n;
         scePthreadMutexLock(&g_mtx);
@@ -1113,6 +1163,7 @@ static void handle_client(OrbisNetId c) {
                     buf = txt; buf[len] = '\0';
                     scePthreadMutexLock(&g_mtx);
                     playlist_store((const char *)buf, url);   // populate shared channel store
+                    chan_save_file();                         // persist so it survives a relaunch
                     n = chans_to_json(out, CAP);
                     scePthreadMutexUnlock(&g_mtx);
                 }
@@ -1171,6 +1222,7 @@ int httpd_start(int port) {
     favs_load();    // restore saved favorites from /data
     cfg_load();     // restore persisted settings (debug toasts)
     resume_load();  // restore saved per-URL resume positions
+    chan_load_file(); // restore the last-loaded channel list
 
     g_listen = sceNetSocket("ps4cast", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_STREAM, 0);
     if (g_listen < 0)

@@ -126,6 +126,9 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
 .row.on .ic{background:linear-gradient(160deg,var(--acc),var(--acc2));color:#fff}
 .row .live{flex:none;font-size:10px;font-weight:800;letter-spacing:.6px;color:var(--live);
  border:1px solid rgba(46,230,166,.4);border-radius:999px;padding:3px 8px}
+.pbar{height:4px;border-radius:4px;background:rgba(123,140,200,.22);margin-top:6px;overflow:hidden}
+.pbar span{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2))}
+.row .left{flex:none;font-size:11px;color:var(--faint)}
 .scrolly{max-height:320px;overflow:auto;-webkit-overflow-scrolling:touch;display:flex;flex-direction:column;gap:8px;
  margin:-2px;padding:2px}
 /* status bar */
@@ -204,6 +207,9 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
    <button class="chip wide" style="flex:1" onclick="loadPlaylist()"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h11M4 12h11M4 18h7" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/><path d="M17 12l5 3-5 3z" fill="currentColor"/></svg>Load M3U / IPTV playlist</button>
   </div>
  </section>
+
+ <!-- continue watching (from saved resume positions) -->
+ <div id="cont"></div>
 
  <!-- library tabs -->
  <div class="tabs">
@@ -288,9 +294,20 @@ function listPane(id,cntId,arr,icon,emptyMsg){
  var el=$(id);$(cntId).textContent=arr&&arr.length?arr.length:'';
  if(!arr||!arr.length){el.innerHTML='<div class="empty">'+emptyMsg+'</div>';return}
  var h='<div class="scrolly">';for(var i=0;i<arr.length;i++){h+=rowHtml(nameFromUrl(arr[i]),arr[i],icon)}h+='</div>';el.innerHTML=h}
+function fmtLeft(p,d){var left=Math.max(0,d-p);var m=Math.round(left/60);return m<1?'<1 min left':m+' min left'}
+function renderCont(a){if(!a||!a.length){$('cont').innerHTML='';return}
+ var h='<div class="lbl" style="margin-top:2px">Continue watching</div><div class="scrolly" style="max-height:none">';
+ for(var i=0;i<a.length;i++){var it=a[i],pct=it.d>0?Math.min(100,Math.round(it.p/it.d*100)):0;
+  h+='<div class="row" onclick="pick(\''+encodeURIComponent(it.u)+'\')">'+
+   '<div class="ic"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>'+
+   '<div class="tx"><div class="n">'+esc(nameFromUrl(it.u))+'</div><div class="pbar"><span style="width:'+pct+'%"></span></div></div>'+
+   '<div class="left">'+fmtLeft(it.p,it.d)+'</div></div>'}
+ h+='</div>';$('cont').innerHTML=h}
+async function loadResume(){renderCont(await getj('/resume'))}
 async function loadLists(){var f=await getj('/favs'),r=await getj('/recent');
  listPane('paneFav','cFav',f,IC_STAR,'No favorites yet. Tap the ★ on a link to save it.');
- listPane('paneRec','cRec',r,IC_CLOCK,'Nothing played yet.')}
+ listPane('paneRec','cRec',r,IC_CLOCK,'Nothing played yet.');
+ loadResume()}
 
 function tab(t){curTab=t;var ids={pl:'panePl',fav:'paneFav',rec:'paneRec'};
  for(var k in ids){$(ids[k]).hidden=(k!=t)}
