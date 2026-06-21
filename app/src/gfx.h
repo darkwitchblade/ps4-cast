@@ -17,13 +17,13 @@ typedef struct {
     int height;
     int depth;          // bytes per pixel (4)
     int video;          // sceVideoOut handle
-    int activeIdx;      // 0/1 double buffer
+    int activeIdx;      // current render target (cycles over the buffers)
     int frameBufferSize;
     off_t directMemOff;
     size_t directMemSize;
     uintptr_t videoMemSP;
     void *videoMem;
-    void *frameBuffers[2];
+    void *frameBuffers[3];   // triple-buffered: pipeline CPU convert with scanout
     void *flipQueue;    // OrbisKernelEqueue (pointer-sized opaque handle)
     char attr[64];      // OrbisVideoOutBufferAttribute storage (over-sized, safe)
 } Gfx;

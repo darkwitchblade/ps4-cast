@@ -8,6 +8,12 @@
 #include <orbis/VideoOut.h>
 #include <orbis/GnmDriver.h>
 
+// Triple buffering lets us submit a flip and immediately render the next frame
+// into a third buffer while the previous one is still scanning out, instead of
+// blocking on each flip (which serialized convert+scanout to ~30Hz). Presents at
+// the full 60Hz flip rate.
+#define GFX_BUFFERS 3
+
 // Pixel format used by sceVideoOut here is 32-bit; the proven sample encodes
 // 0x80000000 | (r<<16)|(g<<8)|b into each uint32 of the buffer.
 static inline uint32_t encode(GfxColor c) {
@@ -33,9 +39,9 @@ int gfx_init(Gfx *g, int width, int height) {
     g->flipQueue = (void *)(uintptr_t)q;
     sceVideoOutAddFlipEvent(q, g->video, 0);
 
-    // Allocate direct memory for two frame buffers (aligned to 2MB).
+    // Allocate direct memory for the frame buffers (aligned to 2MB).
     const int alignment = 0x200000;
-    size_t want = (size_t)g->frameBufferSize * 2;
+    size_t want = (size_t)g->frameBufferSize * GFX_BUFFERS;
     g->directMemSize = (want + alignment - 1) / alignment * alignment;
 
     if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(),
@@ -50,7 +56,7 @@ int gfx_init(Gfx *g, int width, int height) {
     }
 
     g->videoMemSP = (uintptr_t)g->videoMem;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < GFX_BUFFERS; i++) {
         g->frameBuffers[i] = (void *)g->videoMemSP;
         g->videoMemSP += g->frameBufferSize;
     }
@@ -59,7 +65,7 @@ int gfx_init(Gfx *g, int width, int height) {
     sceVideoOutSetBufferAttribute((OrbisVideoOutBufferAttribute *)g->attr,
                                   0x80000000, 1, 0, g->width, g->height, g->width);
 
-    if (sceVideoOutRegisterBuffers(g->video, 0, (void * const *)g->frameBuffers, 2,
+    if (sceVideoOutRegisterBuffers(g->video, 0, (void * const *)g->frameBuffers, GFX_BUFFERS,
                                    (OrbisVideoOutBufferAttribute *)g->attr) != 0)
         return -5;
 
@@ -74,20 +80,26 @@ void gfx_present(Gfx *g, int frameID) {
     // hits CPU_FAULT_SUBMITDONE_TIMEOUT_IN_SUSPEND and crashes instead of quitting.
     sceGnmSubmitDone();
 
-    // Wait until this frame is actually on screen.
+    // Advance to the next render target WITHOUT blocking on this flip. Then throttle
+    // only if too many flips are still outstanding: with GFX_BUFFERS buffers we let
+    // up to (GFX_BUFFERS-1) be in flight, which guarantees the buffer we're about to
+    // render into next (last submitted GFX_BUFFERS-1 frames ago) has finished its
+    // flip — so no tearing, while CPU convert overlaps scanout for full-rate present.
+    g->activeIdx = (g->activeIdx + 1) % GFX_BUFFERS;
+
     OrbisKernelEqueue q = (OrbisKernelEqueue)(uintptr_t)g->flipQueue;
     for (;;) {
         OrbisVideoOutFlipStatus st;
         sceVideoOutGetFlipStatus(g->video, &st);
-        if (st.flipArg == frameID)
+        // st.flipArg is the frameID of the last completed flip. Stop waiting once
+        // the in-flight count has dropped to the buffer budget.
+        if (frameID - (int)st.flipArg <= (GFX_BUFFERS - 1))
             break;
         OrbisKernelEvent ev;
         int out = 0;
         if (sceKernelWaitEqueue(q, &ev, 1, &out, 0) != 0)
             break;
     }
-
-    g->activeIdx = (g->activeIdx + 1) % 2;
 }
 
 void gfx_pixel(Gfx *g, int x, int y, GfxColor c) {
