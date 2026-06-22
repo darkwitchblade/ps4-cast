@@ -10,6 +10,7 @@
 #define FONT_MAXSCALE 6
 
 extern const int FONT_CELL[FONT_MAXSCALE + 1];
+extern const unsigned char *const FONT_ADV[FONT_MAXSCALE + 1];
 extern const unsigned char *const FONT_DATA[FONT_MAXSCALE + 1];
 
 #endif

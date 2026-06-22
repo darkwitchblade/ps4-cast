@@ -299,30 +299,30 @@ static void draw_lobby(Gfx *g, const char *ip, int net_ok) {
     int W = g->width;
 
     // brand row, centered: logo tile + wordmark
-    int track = 3, ws = 6;
+    int track = 0, ws = 6;
     const char *wm = "PS4 Cast";
     int ww = gfx_text_tr_w(wm, ws, track);
     int box = 92, group = box + 26 + ww, gx = (W - group) / 2, brandCy = 150;
     icon_cast(g, gx + box / 2, brandCy, box);
     gtext(g, gx + box + 26, brandCy - (ws * 8) / 2, wm, ws, TXT, track);
-    ctext(g, 250, "WIRELESS CAST RECEIVER", 2, FAINT, 6);
+    ctext(g, 250, "Wireless Cast Receiver", 2, FAINT, 0);
 
     if (net_ok) {
         char url[80];
         snprintf(url, sizeof(url), "http://%s:%d", ip, PORT);
         draw_qr_card(g, url, W / 2, 320, 9);
         int below = 320 + ((QR_SIZE + 6) * 9 + 60) + 40;
-        ctext(g, below, "Scan with your phone to open the controls", 3, MUT, 1);
+        ctext(g, below, "Scan with your phone to open the controls", 3, MUT, 0);
 
-        int uw = gfx_text_tr_w(url, 4, 1);
+        int uw = gfx_text_tr_w(url, 4, 0);
         int pw = uw + 64, ph = 64, px = (W - pw) / 2, py = below + 52;
         panel(g, px, py, pw, ph, ph / 2, SURF2, 235);
         gfx_circle(g, px + 30, py + ph / 2, 6, LIVE);
-        gtext(g, px + 52, py + (ph - 32) / 2, url, 4, TXT, 1);
-        ctext(g, py + ph + 34, "or cast from any DLNA / UPnP app on your network", 2, FAINT, 1);
+        gtext(g, px + 52, py + (ph - 32) / 2, url, 4, TXT, 0);
+        ctext(g, py + ph + 34, "or cast from any DLNA / UPnP app on your network", 2, FAINT, 0);
     } else {
-        ctext(g, 470, "No network connection", 5, TXT, 1);
-        ctext(g, 560, "Connect the PS4 to Wi-Fi or LAN, then relaunch.", 3, MUT, 1);
+        ctext(g, 470, "No network connection", 5, TXT, 0);
+        ctext(g, 560, "Connect the PS4 to Wi-Fi or LAN, then relaunch.", 3, MUT, 0);
     }
 
     // status chip
@@ -525,7 +525,7 @@ static void draw_channel_overlay(Gfx *g, int sel) {
 
     // header: accent tick + title + count (+ current group, if any)
     gfx_round(g, x + 28, y + 26, 6, 28, 3, ACCENT);
-    gtext(g, x + 46, y + 24, "CHANNELS", 3, TXT, 1);
+    gtext(g, x + 46, y + 24, "Channels", 3, TXT, 0);
     char cnt[24]; snprintf(cnt, sizeof(cnt), "%d", n);
     gfx_text(g, x + W - 28 - gfx_text_w(cnt, 2), y + 30, cnt, 2, FAINT);
     char grp[48]; httpd_chan_group(sel, grp, sizeof(grp));
@@ -861,7 +861,7 @@ int main(void) {
                 int pw = 720, ph = 264, px = (g.width - pw) / 2, py = (g.height - ph) / 2;
                 panel(&g, px, py, pw, ph, 24, SURF, 235);
                 icon_cast(&g, g.width / 2, py + 84, 96);
-                ctext(&g, py + 156, "Connecting...", 4, TXT, 1);
+                ctext(&g, py + 156, "Connecting...", 4, TXT, 0);
                 char st[200];
                 snprintf(st, sizeof(st), "%s", player_status());
                 ctext(&g, py + 212, st, 2, MUT, 0);
@@ -875,7 +875,7 @@ int main(void) {
                 panel(&g, px, py, pw, ph, 22, INK, 225);
                 char b[80];
                 snprintf(b, sizeof(b), "Buffering  %d%%", player_buffer_pct());
-                ctext(&g, py + 38, b, 4, TXT, 1);
+                ctext(&g, py + 38, b, 4, TXT, 0);
                 int gx = px + 50, gy = py + 106, gw = pw - 100, gh = 10;
                 gfx_round(&g, gx, gy, gw, gh, gh / 2, SURF2);
                 int fillw = gw * player_buffer_pct() / 100; if (fillw < 0) fillw = 0; if (fillw > gw) fillw = gw;
@@ -903,7 +903,7 @@ int main(void) {
             int pw = 580, ph = 160, px = (g.width - pw) / 2, py = (g.height - ph) / 2;
             panel(&g, px, py, pw, ph, 22, INK, 225);
             char b[80]; snprintf(b, sizeof(b), "Reconnecting...  (%d)", reconnects);
-            ctext(&g, py + 44, b, 4, TXT, 1);
+            ctext(&g, py + 44, b, 4, TXT, 0);
             ctext(&g, py + 100, "live stream dropped - retrying", 2, MUT, 0);
             hudUntil = now + 1500000ULL;
         }

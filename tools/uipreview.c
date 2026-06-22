@@ -151,7 +151,7 @@ static void draw_lobby(Gfx *g, const char *ip, int net_ok, const char *status) {
     int W = g->width;
 
     // brand row, centered
-    int track = 3;
+    int track = 0;
     const char *wm = "PS4 Cast";
     int ws = 6;
     int ww = gfx_text_tr_w(wm, ws, track);
@@ -161,7 +161,7 @@ static void draw_lobby(Gfx *g, const char *ip, int net_ok, const char *status) {
     int brandCy = 150;
     icon_cast(g, gx + box / 2, brandCy, box);
     gtext(g, gx + box + 26, brandCy - (ws * 8) / 2, wm, ws, TXT, track);
-    ctext(g, 250, "WIRELESS CAST RECEIVER", 2, FAINT, 6);
+    ctext(g, 250, "Wireless Cast Receiver", 2, FAINT, 0);
 
     if (net_ok) {
         char url[80];
@@ -169,18 +169,18 @@ static void draw_lobby(Gfx *g, const char *ip, int net_ok, const char *status) {
         draw_qr_card(g, url, W / 2, 320, 9);
         int qcard = (QR_SIZE + 6) * 9 + 60;
         int below = 320 + qcard + 40;
-        ctext(g, below, "Scan with your phone to open the controls", 3, MUT, 1);
+        ctext(g, below, "Scan with your phone to open the controls", 3, MUT, 0);
 
         // URL pill
-        int uw = gfx_text_tr_w(url, 4, 1);
+        int uw = gfx_text_tr_w(url, 4, 0);
         int pw = uw + 64, ph = 64, px = (W - pw) / 2, py = below + 52;
         panel(g, px, py, pw, ph, ph / 2, SURF2, 235);
         gfx_circle(g, px + 30, py + ph / 2, 6, LIVE);
-        gtext(g, px + 52, py + (ph - 32) / 2, url, 4, TXT, 1);
-        ctext(g, py + ph + 34, "or cast from any DLNA / UPnP app on your network", 2, FAINT, 1);
+        gtext(g, px + 52, py + (ph - 32) / 2, url, 4, TXT, 0);
+        ctext(g, py + ph + 34, "or cast from any DLNA / UPnP app on your network", 2, FAINT, 0);
     } else {
-        ctext(g, 470, "No network connection", 5, TXT, 1);
-        ctext(g, 560, "Connect the PS4 to Wi-Fi or LAN, then relaunch.", 3, MUT, 1);
+        ctext(g, 470, "No network connection", 5, TXT, 0);
+        ctext(g, 560, "Connect the PS4 to Wi-Fi or LAN, then relaunch.", 3, MUT, 0);
     }
 
     // status chip (centered)
@@ -265,7 +265,7 @@ static void draw_channel_overlay(Gfx *g, int sel) {
     int x = 56, y = (g->height - H) / 2;
     panel(g, x, y, W, H, 24, INK, 226);
     gfx_round(g, x + 28, y + 26, 6, 28, 3, ACCENT);
-    gtext(g, x + 46, y + 24, "CHANNELS", 3, TXT, 1);
+    gtext(g, x + 46, y + 24, "Channels", 3, TXT, 0);
     char cnt[24]; snprintf(cnt, sizeof(cnt), "%d", n);
     gfx_text(g, x + W - 28 - gfx_text_w(cnt, 2), y + 30, cnt, 2, FAINT);
     char grp[48]; httpd_chan_group(sel, grp, sizeof(grp));

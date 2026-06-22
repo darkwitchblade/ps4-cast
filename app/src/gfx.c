@@ -303,26 +303,168 @@ void gfx_arc(Gfx *g, int cx, int cy, int r, int thick, int quad, GfxColor c) {
 }
 
 static int default_track(int scale) {
-    return (scale >= 2 && scale <= FONT_MAXSCALE && FONT_DATA[scale]) ? -1 : 0;
+    (void)scale;
+    return 0;
+}
+
+static uint32_t utf8_next(const unsigned char **pp) {
+    const unsigned char *p = *pp;
+    if (!p || !*p) return 0;
+    unsigned char c = *p++;
+    if (c < 0x80) { *pp = p; return c; }
+    if ((c & 0xe0) == 0xc0 && (p[0] & 0xc0) == 0x80) {
+        uint32_t cp = ((uint32_t)(c & 0x1f) << 6) | (uint32_t)(p[0] & 0x3f);
+        *pp = p + 1;
+        return cp >= 0x80 ? cp : '?';
+    }
+    if ((c & 0xf0) == 0xe0 && (p[0] & 0xc0) == 0x80 && (p[1] & 0xc0) == 0x80) {
+        uint32_t cp = ((uint32_t)(c & 0x0f) << 12) | ((uint32_t)(p[0] & 0x3f) << 6) | (uint32_t)(p[1] & 0x3f);
+        *pp = p + 2;
+        return (cp >= 0x800 && !(cp >= 0xd800 && cp <= 0xdfff)) ? cp : '?';
+    }
+    if ((c & 0xf8) == 0xf0 && (p[0] & 0xc0) == 0x80 && (p[1] & 0xc0) == 0x80 && (p[2] & 0xc0) == 0x80) {
+        uint32_t cp = ((uint32_t)(c & 0x07) << 18) | ((uint32_t)(p[0] & 0x3f) << 12) |
+                      ((uint32_t)(p[1] & 0x3f) << 6) | (uint32_t)(p[2] & 0x3f);
+        *pp = p + 3;
+        return (cp >= 0x10000 && cp <= 0x10ffff) ? cp : '?';
+    }
+    *pp = p;
+    return '?';
+}
+
+static unsigned char fold_cp(uint32_t cp) {
+    if (cp >= FONT_FIRST && cp <= FONT_LAST) return (unsigned char)cp;
+    if (cp == 0x00a0 || cp == 0x2000 || cp == 0x2001 || cp == 0x2002 || cp == 0x2003 ||
+        cp == 0x2004 || cp == 0x2005 || cp == 0x2006 || cp == 0x2007 || cp == 0x2008 ||
+        cp == 0x2009 || cp == 0x200a || cp == 0x202f || cp == 0x205f || cp == 0x3000)
+        return ' ';
+    if (cp == 0x2018 || cp == 0x2019 || cp == 0x201a || cp == 0x201b || cp == 0x2032)
+        return '\'';
+    if (cp == 0x201c || cp == 0x201d || cp == 0x201e || cp == 0x201f || cp == 0x2033)
+        return '"';
+    if (cp == 0x2010 || cp == 0x2011 || cp == 0x2012 || cp == 0x2013 || cp == 0x2014 ||
+        cp == 0x2015 || cp == 0x2212)
+        return '-';
+    if (cp == 0x2026) return '.';
+    if (cp == 0x00d7 || cp == 0x2715 || cp == 0x2716 || cp == 0x274c) return 'x';
+    if (cp == 0x00f7) return '/';
+    if (cp == 0x2044 || cp == 0x2215) return '/';
+    if (cp == 0x00b0 || cp == 0x02da) return 'o';
+    if (cp == 0x00b7 || cp == 0x2022 || cp == 0x2219 || cp == 0x25cf) return '*';
+    if (cp == 0x2190 || cp == 0x2192 || cp == 0x21d0 || cp == 0x21d2) return '>';
+    if (cp == 0x2191 || cp == 0x2193 || cp == 0x21d1 || cp == 0x21d3) return '|';
+    if (cp == 0x00a9) return 'C';
+    if (cp == 0x00ae) return 'R';
+    if (cp == 0x2122) return 'T';
+    if (cp == 0x20ac) return 'E';
+    if (cp == 0x00a3) return 'L';
+    if (cp == 0x00a5) return 'Y';
+
+    if (cp >= 0x0660 && cp <= 0x0669) return (unsigned char)('0' + (cp - 0x0660));
+    if (cp >= 0x06f0 && cp <= 0x06f9) return (unsigned char)('0' + (cp - 0x06f0));
+    if (cp == 0x060c || cp == 0x066b) return ',';
+    if (cp == 0x061b) return ';';
+    if (cp == 0x061f) return '?';
+    if (cp == 0x066a) return '%';
+    if (cp == 0x0640 || (cp >= 0x064b && cp <= 0x065f) || cp == 0x0670 ||
+        (cp >= 0x06d6 && cp <= 0x06ed))
+        return 0;   // Arabic tatweel/diacritics; skip
+
+    // Arabic fallback: real Arabic needs shaping + RTL layout, but a single-byte
+    // transliteration keeps titles safe and recognizable in the current atlas.
+    if (cp == 0x0621) return '\'';
+    if (cp == 0x0622 || cp == 0x0623 || cp == 0x0625 || cp == 0x0627 || cp == 0x0671) return 'a';
+    if (cp == 0x0624 || cp == 0x0648) return 'w';
+    if (cp == 0x0626 || cp == 0x0649 || cp == 0x064a || cp == 0x06cc) return 'y';
+    if (cp == 0x0628) return 'b';
+    if (cp == 0x0629 || cp == 0x062a || cp == 0x0637) return 't';
+    if (cp == 0x062b || cp == 0x0635 || cp == 0x0633 || cp == 0x0634) return 's';
+    if (cp == 0x062c) return 'j';
+    if (cp == 0x062d || cp == 0x0647 || cp == 0x06be || cp == 0x06c1) return 'h';
+    if (cp == 0x062e || cp == 0x0643 || cp == 0x06a9) return 'k';
+    if (cp == 0x062f || cp == 0x0630 || cp == 0x0636) return 'd';
+    if (cp == 0x0631) return 'r';
+    if (cp == 0x0632 || cp == 0x0638) return 'z';
+    if (cp == 0x0639) return 'a';
+    if (cp == 0x063a) return 'g';
+    if (cp == 0x0641) return 'f';
+    if (cp == 0x0642) return 'q';
+    if (cp == 0x0644) return 'l';
+    if (cp == 0x0645) return 'm';
+    if (cp == 0x0646) return 'n';
+    if (cp == 0x067e) return 'p';
+    if (cp == 0x0686) return 'c';
+    if (cp == 0x0698) return 'j';
+    if (cp == 0x06af) return 'g';
+
+    if ((cp >= 0x00c0 && cp <= 0x00c5) || (cp >= 0x0100 && cp <= 0x0105) ||
+        cp == 0x01cd || cp == 0x01ce || cp == 0x0200 || cp == 0x0201 || cp == 0x0226 || cp == 0x0227)
+        return (cp & 1) ? 'a' : 'A';
+    if (cp == 0x00e0 || cp == 0x00e1 || cp == 0x00e2 || cp == 0x00e3 || cp == 0x00e4 || cp == 0x00e5)
+        return 'a';
+    if (cp == 0x00c6) return 'A';
+    if (cp == 0x00e6) return 'a';
+    if (cp == 0x00c7 || cp == 0x0106 || cp == 0x0108 || cp == 0x010a || cp == 0x010c) return 'C';
+    if (cp == 0x00e7 || cp == 0x0107 || cp == 0x0109 || cp == 0x010b || cp == 0x010d) return 'c';
+    if (cp == 0x00d0 || cp == 0x010e || cp == 0x0110) return 'D';
+    if (cp == 0x00f0 || cp == 0x010f || cp == 0x0111) return 'd';
+    if ((cp >= 0x00c8 && cp <= 0x00cb) || cp == 0x0112 || cp == 0x0114 || cp == 0x0116 || cp == 0x0118 || cp == 0x011a) return 'E';
+    if ((cp >= 0x00e8 && cp <= 0x00eb) || cp == 0x0113 || cp == 0x0115 || cp == 0x0117 || cp == 0x0119 || cp == 0x011b) return 'e';
+    if (cp == 0x011c || cp == 0x011e || cp == 0x0120 || cp == 0x0122) return 'G';
+    if (cp == 0x011d || cp == 0x011f || cp == 0x0121 || cp == 0x0123) return 'g';
+    if (cp == 0x0124 || cp == 0x0126) return 'H';
+    if (cp == 0x0125 || cp == 0x0127) return 'h';
+    if ((cp >= 0x00cc && cp <= 0x00cf) || cp == 0x0128 || cp == 0x012a || cp == 0x012c || cp == 0x012e || cp == 0x0130) return 'I';
+    if ((cp >= 0x00ec && cp <= 0x00ef) || cp == 0x0129 || cp == 0x012b || cp == 0x012d || cp == 0x012f || cp == 0x0131) return 'i';
+    if (cp == 0x0134) return 'J';
+    if (cp == 0x0135) return 'j';
+    if (cp == 0x0136) return 'K';
+    if (cp == 0x0137 || cp == 0x0138) return 'k';
+    if (cp == 0x0139 || cp == 0x013b || cp == 0x013d || cp == 0x013f || cp == 0x0141) return 'L';
+    if (cp == 0x013a || cp == 0x013c || cp == 0x013e || cp == 0x0140 || cp == 0x0142) return 'l';
+    if (cp == 0x00d1 || cp == 0x0143 || cp == 0x0145 || cp == 0x0147) return 'N';
+    if (cp == 0x00f1 || cp == 0x0144 || cp == 0x0146 || cp == 0x0148 || cp == 0x0149) return 'n';
+    if ((cp >= 0x00d2 && cp <= 0x00d6) || cp == 0x00d8 || cp == 0x014c || cp == 0x014e || cp == 0x0150) return 'O';
+    if ((cp >= 0x00f2 && cp <= 0x00f6) || cp == 0x00f8 || cp == 0x014d || cp == 0x014f || cp == 0x0151) return 'o';
+    if (cp == 0x0154 || cp == 0x0156 || cp == 0x0158) return 'R';
+    if (cp == 0x0155 || cp == 0x0157 || cp == 0x0159) return 'r';
+    if (cp == 0x015a || cp == 0x015c || cp == 0x015e || cp == 0x0160) return 'S';
+    if (cp == 0x015b || cp == 0x015d || cp == 0x015f || cp == 0x0161 || cp == 0x00df) return 's';
+    if (cp == 0x0162 || cp == 0x0164 || cp == 0x0166) return 'T';
+    if (cp == 0x0163 || cp == 0x0165 || cp == 0x0167) return 't';
+    if ((cp >= 0x00d9 && cp <= 0x00dc) || cp == 0x0168 || cp == 0x016a || cp == 0x016c || cp == 0x016e || cp == 0x0170 || cp == 0x0172) return 'U';
+    if ((cp >= 0x00f9 && cp <= 0x00fc) || cp == 0x0169 || cp == 0x016b || cp == 0x016d || cp == 0x016f || cp == 0x0171 || cp == 0x0173) return 'u';
+    if (cp == 0x00dd || cp == 0x0176 || cp == 0x0178) return 'Y';
+    if (cp == 0x00fd || cp == 0x00ff || cp == 0x0177) return 'y';
+    if (cp == 0x0179 || cp == 0x017b || cp == 0x017d) return 'Z';
+    if (cp == 0x017a || cp == 0x017c || cp == 0x017e) return 'z';
+    if (cp >= 0x0300 && cp <= 0x036f) return 0;   // combining mark; skip
+    return '?';
+}
+
+static int glyph_adv(unsigned char ch, int scale) {
+    int useAtlas = (scale >= 2 && scale <= FONT_MAXSCALE && FONT_DATA[scale] && FONT_ADV[scale]);
+    return useAtlas ? FONT_ADV[scale][ch - FONT_FIRST] : 8 * scale;
 }
 
 int gfx_text_w(const char *s, int scale) {
-    int n = (int)strlen(s);
-    int track = default_track(scale);
-    return n * 8 * scale + (n > 0 ? (n - 1) * track : 0);
+    return gfx_text_tr_w(s, scale, default_track(scale));
 }
 
 int gfx_text_tr(Gfx *g, int x, int y, const char *s, int scale, GfxColor c, int track) {
-    // Anti-aliased atlas for scale 2..6 (cell == 8*scale, so the advance and all
-    // existing layout math are unchanged); the 8x8 bitmap covers tiny scale 1.
-    int useAtlas = (scale >= 2 && scale <= FONT_MAXSCALE && FONT_DATA[scale]);
+    // Anti-aliased proportional atlas for scale 2..6; scale 1 keeps the 8x8
+    // bitmap. UTF-8 titles are folded to safe ASCII so metadata cannot corrupt
+    // layout or walk the atlas out of bounds.
+    int useAtlas = (scale >= 2 && scale <= FONT_MAXSCALE && FONT_DATA[scale] && FONT_ADV[scale]);
     int cell = 8 * scale;
     const unsigned char *atlas = useAtlas ? FONT_DATA[scale] : 0;
-    int penX = x;
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        unsigned char ch = *p;
+    int penX = x, drew = 0;
+    const unsigned char *p = (const unsigned char *)s;
+    while (p && *p) {
+        unsigned char ch = fold_cp(utf8_next(&p));
+        if (!ch) continue;
+        if (ch < FONT_FIRST || ch > FONT_LAST) ch = '?';
         if (useAtlas) {
-            if (ch < FONT_FIRST || ch > FONT_LAST) ch = '?';
             const unsigned char *gly = atlas + (size_t)(ch - FONT_FIRST) * cell * cell;
             for (int gy = 0; gy < cell; gy++) {
                 const unsigned char *row = gly + (size_t)gy * cell;
@@ -330,22 +472,30 @@ int gfx_text_tr(Gfx *g, int x, int y, const char *s, int scale, GfxColor c, int 
                     if (row[gx]) gfx_blend(g, penX + gx, y + gy, c, row[gx]);
             }
         } else {
-            if (ch >= 128) ch = '?';
-            const unsigned char *glyph = font8x8_basic[ch];
+            const unsigned char *glyph = font8x8_basic[ch < 128 ? ch : '?'];
             for (int row = 0; row < 8; row++) {
                 unsigned char bits = glyph[row];
                 for (int col = 0; col < 8; col++)
                     if (bits & (1 << col)) gfx_rect(g, penX + col * scale, y + row * scale, scale, scale, c);
             }
         }
-        penX += 8 * scale + track;
+        penX += glyph_adv(ch, scale) + track;
+        drew = 1;
     }
-    return penX - x - (s[0] ? track : 0);
+    return penX - x - (drew ? track : 0);
 }
 
 int gfx_text_tr_w(const char *s, int scale, int track) {
-    int n = (int)strlen(s);
-    return n * 8 * scale + (n > 0 ? (n - 1) * track : 0);
+    int w = 0, n = 0;
+    const unsigned char *p = (const unsigned char *)s;
+    while (p && *p) {
+        unsigned char ch = fold_cp(utf8_next(&p));
+        if (!ch) continue;
+        if (ch < FONT_FIRST || ch > FONT_LAST) ch = '?';
+        w += glyph_adv(ch, scale);
+        n++;
+    }
+    return w + (n > 0 ? (n - 1) * track : 0);
 }
 
 int gfx_text(Gfx *g, int x, int y, const char *s, int scale, GfxColor c) {
