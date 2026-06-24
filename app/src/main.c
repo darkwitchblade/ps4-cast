@@ -565,7 +565,7 @@ static void draw_channel_overlay(Gfx *g, int sel) {
 
 // Top-right stream telemetry, toggled by the touchpad. Plain shadowed text with
 // NO panel/blend behind it — the cheapest possible overlay, can't affect decode.
-static void draw_stats_overlay(Gfx *g, double netMBs, int fps) {
+static void draw_stats_overlay(Gfx *g, double netBps, int fps) {
     PlayerStats s; player_stats(&s);
     int lx = g->width - 470, vx = lx + 150, ry = 48, rh = 30;
     gfx_circle(g, lx + 4, ry + 7, 5, LIVE);
@@ -579,12 +579,14 @@ static void draw_stats_overlay(Gfx *g, double netMBs, int fps) {
     stext(g, lx, ry, "Decode", 2, FAINT);  stext(g, vx, ry, b, 2, s.hw ? LIVE : ACC_LT);  ry += rh;
     snprintf(b, sizeof(b), "%dx%d  %d fps", s.w, s.h, fps);
     stext(g, lx, ry, "Video", 2, FAINT);   stext(g, vx, ry, b, 2, (fps >= 24 || fps == 0) ? TXT : WARN);  ry += rh;
-    snprintf(b, sizeof(b), "%d%%  +%.1fs", s.bufPct, s.aheadSec);
+    if (s.aheadSec > 0.1) snprintf(b, sizeof(b), "%d%%  +%.1fs", s.bufPct, s.aheadSec);
+    else snprintf(b, sizeof(b), "%d%%", s.bufPct);
     GfxColor bc = s.bufPct >= 40 ? LIVE : (s.bufPct >= 15 ? WARN : DANGER);
     stext(g, lx, ry, "Buffer", 2, FAINT);  stext(g, vx, ry, b, 2, bc);  ry += rh;
-    if (netMBs >= 0.05) snprintf(b, sizeof(b), "%.1f MB/s", netMBs);
-    else snprintf(b, sizeof(b), "%.1f Mbps", s.bitrateMbps);
-    stext(g, lx, ry, "Network", 2, FAINT); stext(g, vx, ry, b, 2, TXT);  ry += rh;
+    if (netBps >= 1e6)      snprintf(b, sizeof(b), "%.1f MB/s", netBps / 1e6);
+    else if (netBps >= 1e3) snprintf(b, sizeof(b), "%.0f KB/s", netBps / 1e3);
+    else                    snprintf(b, sizeof(b), "%.0f B/s", netBps);
+    stext(g, lx, ry, "Network", 2, FAINT); stext(g, vx, ry, b, 2, netBps > 0 ? LIVE : MUT);  ry += rh;
     snprintf(b, sizeof(b), "%s%s", s.hls ? (s.segDemux ? "HLS seg-demux" : "HLS") : "HTTP", s.lan ? "  LAN" : "");
     stext(g, lx, ry, "Source", 2, FAINT);  stext(g, vx, ry, b, 2, MUT);  ry += rh;
     snprintf(b, sizeof(b), "%ld", s.drops);
@@ -645,7 +647,7 @@ int main(void) {
     uint64_t chanUntil = 0;           // overlay visible until this time
     uint64_t chanTuneAt = 0;          // pending tune time (settle-to-tune)
     int statsOn = 0;                  // touchpad-toggled stream stats overlay
-    double netMBs = 0;                // sampled download throughput
+    double netBps = 0;                // sampled download throughput (bytes/sec, smoothed)
     uint64_t rxT0 = 0, rxB0 = 0;      // throughput sampling anchor
     int fpsCount = 0, fpsVal = 0; uint64_t fpsT0 = 0;
     char lastUrl[1024] = "";          // resume: track the currently playing URL
@@ -698,12 +700,13 @@ int main(void) {
 
         // Sample download throughput (~2 Hz) and presented-frame rate (1 Hz).
         {
-            uint64_t rx = httpsrc_rx_total();
+            uint64_t rx = player_rx_total();
             if (rxT0 == 0) { rxT0 = now; rxB0 = rx; }
-            else if (now - rxT0 >= 500000ULL) {
+            else if (now - rxT0 >= 1000000ULL) {              // 1s window: HLS arrives in bursts
                 double dt = (double)(now - rxT0) / 1e6;
                 double db = (rx >= rxB0) ? (double)(rx - rxB0) : 0;   // 0 across a new stream
-                netMBs = (db / dt) / 1e6;
+                double inst = db / dt;                               // bytes/sec this window
+                netBps = netBps > 0 ? (netBps * 0.5 + inst * 0.5) : inst;   // light smoothing
                 rxT0 = now; rxB0 = rx;
             }
             if (fpsT0 == 0) fpsT0 = now;
@@ -909,7 +912,7 @@ int main(void) {
 
         // Lightweight stream stats (touchpad), top-right, only while playing.
         if (statsOn && player_started())
-            draw_stats_overlay(&g, netMBs, fpsVal);
+            draw_stats_overlay(&g, netBps, fpsVal);
 
         gfx_present(&g, frameID++);
     }

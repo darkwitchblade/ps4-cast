@@ -617,7 +617,10 @@ int player_buffering(void) {
     if (g_threaded) return g_rebuffering;
     return 0;   // single-thread path blocks instead of reporting
 }
-int player_buffer_pct(void) { return httpsrc_fill_pct(); }
+int player_buffer_pct(void) { return g_isHls ? hls_buffer_pct() : httpsrc_fill_pct(); }
+// Total bytes pulled from the network on the ACTIVE source (HLS or direct HTTP),
+// so the on-screen network-speed stat works on every stream type.
+uint64_t player_rx_total(void) { return g_isHls ? hls_rx_total() : httpsrc_rx_total(); }
 
 void player_progress(double *cur, double *dur) {
     if (cur) *cur = g_curSec;

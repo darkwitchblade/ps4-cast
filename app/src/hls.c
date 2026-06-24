@@ -54,6 +54,7 @@ static int               g_memSeg = -1;
 static uint8_t          *g_memBuf;
 static int               g_memLen, g_memPos;
 static int               g_liveFetchFailStreak;
+static volatile uint64_t g_hlsRxBytes;   // total bytes fetched (video+audio), for the stats overlay
 static char              g_vLastUrl[96] = "";
 static int               g_vLastRc, g_vLastBytes, g_vLastMs, g_vFailCount;
 static uint64_t          g_vOpenUs;
@@ -207,6 +208,21 @@ int hls_can_segment_demux(void) {
 // VOD playback has consumed every segment -> a clean end-of-stream.
 int hls_at_eof(void) { return g_active && !g_isLive && g_segIdx >= g_segCount; }
 
+// Total bytes fetched from the network (for the on-screen network-speed stat).
+uint64_t hls_rx_total(void) { return g_hlsRxBytes; }
+
+// Read-ahead fill as a percent of the target prefetch depth (the HLS "buffer").
+int hls_buffer_pct(void) {
+    if (!g_active || !g_prefUp) return 0;
+    int cached = 0;
+    scePthreadMutexLock(&g_prefMtx);
+    for (int i = 0; i < HLS_PREFETCH_MAX; i++) if (g_pref[i].ready) cached++;
+    scePthreadMutexUnlock(&g_prefMtx);
+    int depth = g_prefDepth > 0 ? g_prefDepth : 1;
+    int pct = cached * 100 / depth;
+    return pct > 100 ? 100 : pct;
+}
+
 static void free_segs(void) {
     if (g_segs) {
         for (int i = 0; i < g_segCount; i++) free(g_segs[i]);
@@ -314,6 +330,7 @@ static void *prefetch_main(void *arg) {
                 g_pref[slot].buf = buf;
                 g_pref[slot].len = len;
                 g_pref[slot].ready = 1;
+                g_hlsRxBytes += (uint64_t)len;
             } else {
                 if (buf) free(buf);
                 memset(&g_pref[slot], 0, sizeof(g_pref[slot]));
@@ -527,6 +544,7 @@ static int open_mem_segment(const char *u, int seg) {
     g_memSeg = seg;
     g_memBuf = buf;
     g_memLen = len;
+    g_hlsRxBytes += (uint64_t)len;
     g_memPos = 0;
     g_liveFetchFailStreak = 0;
     trace_mark("hls mem_fetch2 ok seg=%d len=%d ms=%d", seg, len, ms);
@@ -990,6 +1008,7 @@ int hls_open(const char *url) {
     g_segGen = 0;
     g_resetGen = 0;
     g_liveFetchFailStreak = 0;
+    g_hlsRxBytes = 0;
     g_open = 0;
     g_active = 1;
     g_lastRefreshUs = sceKernelGetProcessTime();

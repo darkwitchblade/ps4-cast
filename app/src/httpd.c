@@ -812,10 +812,11 @@ static void handle_client(OrbisNetId c) {
         double cur = 0, dur = 0;
         player_progress(&cur, &dur);
         int j = snprintf(json, sizeof(json),
-                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"native\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"diag\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d,\"debug\":%d,\"chan_n\":%d,\"chan_cur\":%d}",
+                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"native\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"diag\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d,\"debug\":%d,\"chan_n\":%d,\"chan_cur\":%d,\"buf\":%d,\"rx\":%llu}",
                          APP_VER, jb_result(), goldhen_status(), player_status(), handoff_status(), ssdp_status(),
                          active, player_is_paused(), (int)(cur + 0.5), (int)(dur + 0.5), g_last_push, dbg, pad_diag_get(),
-                         player_hw_enabled(), notify_get_debug(), g_chanN, g_chanCur);
+                         player_hw_enabled(), notify_get_debug(), g_chanN, g_chanCur,
+                         player_buffer_pct(), (unsigned long long)player_rx_total());
         send_response(c, "200 OK", "application/json", json, j);
         return;
     }
