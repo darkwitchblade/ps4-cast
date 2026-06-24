@@ -18,6 +18,7 @@
 #include "launcher.h"
 #include "ssdp.h"
 #include "pad_diag.h"
+#include "sys_diag.h"
 #include "notify.h"
 #include "audio.h"
 #endif
@@ -657,13 +658,24 @@ int main(void) {
     int reconnecting = 0, reconnects = 0;   // auto-reconnect a dropped live stream
     uint64_t reconnectAt = 0, healthySince = 0;
     const int MAX_RECONNECT = 30;     // ~give up after this many attempts
+    uint64_t noUserSince = 0;         // first time we saw NO valid signed-in user (debounce)
     PadState pad;
     pad_init(&pad);
+    sys_diag_update();                // prime the user/system snapshot before the loop reads it
 
     while (running) {
         g_heartbeat = sceKernelGetProcessTime();   // pet the freeze watchdog each frame
         uint64_t now = sceKernelGetProcessTime();
         uint32_t pressed = pad_poll(&pad);
+
+        // A valid PS4 user must be signed in. With an ANONYMOUS foreground user
+        // (userId=0xffffffff -> sys_fg_user() <= 0) the system's VideoPlayingChecker
+        // crashes SceShellUI (the compositor) -> CE-36329-3 -> our display is
+        // orphaned while we keep running blind. So gate all video activity on it.
+        // sys_fg_user() is refreshed ~1 Hz by sys_diag_update() below.
+        int userOk = (sys_fg_user() > 0);
+        if (userOk) noUserSince = 0;
+        else if (noUserSince == 0) noUserSince = now;
 
         // ---- TV-box channel zapper: D-pad Up/Down browse the loaded playlist ----
         int nch = httpd_chan_count();
@@ -698,19 +710,25 @@ int main(void) {
         // Touchpad toggles the lightweight stream-stats overlay.
         if (pressed & ORBIS_PAD_BUTTON_TOUCH_PAD) statsOn = !statsOn;
 
-        // Sample download throughput (~2 Hz) and presented-frame rate (1 Hz).
+        // Sample download throughput (~2.5 Hz) and presented-frame rate (1 Hz).
+        // Short 400ms window so the on-screen speed updates in near-real-time;
+        // EMA smooths the burstiness of HLS segment fetches without lagging a
+        // whole second behind like the old 1s window did.
         {
             uint64_t rx = player_rx_total();
             if (rxT0 == 0) { rxT0 = now; rxB0 = rx; }
-            else if (now - rxT0 >= 1000000ULL) {              // 1s window: HLS arrives in bursts
+            else if (now - rxT0 >= 400000ULL) {               // 400ms window: live-feel updates
                 double dt = (double)(now - rxT0) / 1e6;
                 double db = (rx >= rxB0) ? (double)(rx - rxB0) : 0;   // 0 across a new stream
                 double inst = db / dt;                               // bytes/sec this window
-                netBps = netBps > 0 ? (netBps * 0.5 + inst * 0.5) : inst;   // light smoothing
+                netBps = netBps > 0 ? (netBps * 0.6 + inst * 0.4) : inst;   // responsive smoothing
                 rxT0 = now; rxB0 = rx;
             }
             if (fpsT0 == 0) fpsT0 = now;
-            else if (now - fpsT0 >= 1000000ULL) { fpsVal = fpsCount; fpsCount = 0; fpsT0 = now; }
+            else if (now - fpsT0 >= 1000000ULL) {
+                fpsVal = fpsCount; fpsCount = 0; fpsT0 = now;
+                sys_diag_update();   // sample system/user state ~1 Hz (SceShellUI-crash probe)
+            }
         }
 
         // ---- resume: remember VOD position; seek back to it on replay --------
@@ -802,18 +820,38 @@ int main(void) {
         if (httpd_take_play_request(url, sizeof(url))) {
             // Native app/browser handoff is permanently disabled (CE-36329-3),
             // so /play now drives the in-app AvPlayer just like /avplay.
-            int wasPlaying = player_started() && everDrew;
-            int rc = player_play(url);
-            if (rc != 0 || !wasPlaying) everDrew = 0;     // hold old frame across the switch
-            reconnecting = 0; reconnects = 0;
-            hudUntil = sceKernelGetProcessTime() + 6000000ULL;
+            if (!userOk) {
+                notify("Sign in a PS4 user to cast");   // playing under ANONYMOUS crashes SceShellUI
+            } else {
+                int wasPlaying = player_started() && everDrew;
+                int rc = player_play(url);
+                if (rc != 0 || !wasPlaying) everDrew = 0; // hold old frame across the switch
+                reconnecting = 0; reconnects = 0;
+                hudUntil = sceKernelGetProcessTime() + 6000000ULL;
+            }
         }
         if (httpd_take_player_request(url, sizeof(url))) {
-            int wasPlaying = player_started() && everDrew;
-            int rc = player_play(url);
-            if (rc != 0 || !wasPlaying) everDrew = 0;     // hold old frame across the switch
-            reconnecting = 0; reconnects = 0;
-            hudUntil = sceKernelGetProcessTime() + 6000000ULL;
+            if (!userOk) {
+                notify("Sign in a PS4 user to cast");
+            } else {
+                int wasPlaying = player_started() && everDrew;
+                int rc = player_play(url);
+                if (rc != 0 || !wasPlaying) everDrew = 0; // hold old frame across the switch
+                reconnecting = 0; reconnects = 0;
+                hudUntil = sceKernelGetProcessTime() + 6000000ULL;
+            }
+        }
+
+        // Fail-closed: if we're trying to show video with NO valid signed-in user
+        // for a sustained window, the compositor (SceShellUI) has almost certainly
+        // crashed on our ANONYMOUS user and our display is orphaned — we'd be
+        // "playing" blind (the false positive). Close cleanly to the home menu via
+        // the LoadExec teardown below instead of zombie-ing in the background. The
+        // 8s debounce clears the brief ANONYMOUS window during the launch user-switch.
+        if (player_started() && !userOk && noUserSince && (now - noUserSince > 8000000ULL)) {
+            player_stop();
+            running = 0;
+            break;
         }
 
         // Autoplay / EOF cleanup: once the decoder reports inactive, either
@@ -847,9 +885,18 @@ int main(void) {
             }
         }
 
+        // Keep the system's inactivity timer at bay EVERY frame, even when idle.
+        // Previously PowerTick ran only while playing, so an idle app stopped
+        // telling the system it was alive -> after the no-input timeout the
+        // system screensavered/suspended it and the homebrew died (the recurring
+        // "idle-death"). Ticking unconditionally keeps the lobby alive too.
+        sceSystemServicePowerTick();
+
         if (player_started()) {
-            sceSystemServiceTickVideoPlayback();
-            sceSystemServicePowerTick();
+            // Only poke the system "video playing" notifier with a VALID user —
+            // ticking it under an ANONYMOUS user is what drives SceShellUI's
+            // VideoPlayingChecker into its Invalid-User-Id crash.
+            if (userOk) sceSystemServiceTickVideoPlayback();
             int drew = player_render(&g);   // always pump frames while started
             if (drew) {
                 everDrew = 1;
@@ -908,6 +955,17 @@ int main(void) {
             ctext(&g, py + 44, b, 4, TXT, 0);
             ctext(&g, py + 100, "live stream dropped - retrying", 2, MUT, 0);
             hudUntil = now + 1500000ULL;
+        }
+
+        // No PS4 user signed in: casting is disabled (it would crash SceShellUI),
+        // so make the reason explicit on the lobby. Debounced past the brief
+        // launch user-switch; only while idle (a playing session that loses its
+        // user is handled by the fail-closed exit above).
+        if (!userOk && noUserSince && (now - noUserSince > 1500000ULL) && !player_started()) {
+            int pw = 780, ph = 200, px = (g.width - pw) / 2, py = (g.height - ph) / 2;
+            panel(&g, px, py, pw, ph, 22, INK, 235);
+            ctext(&g, py + 58, "Sign in a PS4 user", 4, TXT, 0);
+            ctext(&g, py + 120, "Casting stays off until a user is signed in", 2, MUT, 0);
         }
 
         // Lightweight stream stats (touchpad), top-right, only while playing.

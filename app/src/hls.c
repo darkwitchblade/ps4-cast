@@ -198,12 +198,15 @@ int hls_generation(void) { return g_segGen; }
 int hls_reset_generation(void) { return g_resetGen; }
 int hls_is_live(void) { return g_isLive; }
 int hls_can_segment_demux(void) {
-    // Segment-demux enables hardware H.264 decode — but only LIVE here. Enabling
-    // it for VOD routed VOD through the HW decoder, which GPU-faults (CE-36329-3,
-    // uncatchable) after ~30s on large/odd-resolution streams (e.g. 1680x750
-    // tears-of-steel). VOD HLS therefore stays on the generic AVIO software path,
-    // which is stable. fMP4 (EXT-X-MAP) stays on the generic path too.
-    return g_active && g_isLive && !g_initSeg;
+    // Segment-demux feeds TS (Annex-B) media playlists straight to the hardware
+    // H.264 decoder. Enabled for BOTH live and VOD: the "VOD GPU-fault after ~30s"
+    // that this used to be disabled for was actually the SceShellUI crash on an
+    // ANONYMOUS user (CE-36329-3) — NOT a decode/GPU fault — and is fixed
+    // separately (user-guard + PowerTick). fMP4 (EXT-X-MAP) still stays on the
+    // generic software AVIO path; only TS playlists segment-demux.
+    // Runtime escape hatch: POST /hwdecode disables HW globally (-> SW) without a
+    // rebuild if a specific VOD stream ever misbehaves on HW.
+    return g_active && !g_initSeg;
 }
 // VOD playback has consumed every segment -> a clean end-of-stream.
 int hls_at_eof(void) { return g_active && !g_isLive && g_segIdx >= g_segCount; }
