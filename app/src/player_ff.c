@@ -777,6 +777,11 @@ static void blit_scaled(Gfx *g) {
     int dw = g->width, dh = g->height;
     int ox = (dw - g_scaledW) / 2, oy = (dh - g_scaledH) / 2;
     uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
+    // Letterbox: when the video doesn't fill the screen, black out the bars so
+    // the lobby/previous frame doesn't show through (the HW path does the same).
+    if (g_scaledW != dw || g_scaledH != dh) {
+        for (int i = 0, n = dw * dh; i < n; i++) fb[i] = 0x80000000u;
+    }
     // sws already produced BGRA (memory B,G,R,A == framebuffer byte order with A
     // in the top byte). The framebuffer wants the top byte = 0x80, so just force
     // it: one mask+or per pixel instead of byte-by-byte shuffling.
