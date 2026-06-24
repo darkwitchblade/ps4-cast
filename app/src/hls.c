@@ -197,13 +197,15 @@ int hls_generation(void) { return g_segGen; }
 int hls_reset_generation(void) { return g_resetGen; }
 int hls_is_live(void) { return g_isLive; }
 int hls_can_segment_demux(void) {
-    // Segment-demux is safe for live MPEG-TS media playlists. Earlier builds
-    // limited this to simple non-master playlists; master playlists and
-    // separate-audio variants are still just live TS video segments after
-    // variant selection, and the separate audio path has its own demuxer. Keep
-    // fMP4 (EXT-X-MAP/init segment) on the generic AVIO path.
+    // Segment-demux enables hardware H.264 decode — but only LIVE here. Enabling
+    // it for VOD routed VOD through the HW decoder, which GPU-faults (CE-36329-3,
+    // uncatchable) after ~30s on large/odd-resolution streams (e.g. 1680x750
+    // tears-of-steel). VOD HLS therefore stays on the generic AVIO software path,
+    // which is stable. fMP4 (EXT-X-MAP) stays on the generic path too.
     return g_active && g_isLive && !g_initSeg;
 }
+// VOD playback has consumed every segment -> a clean end-of-stream.
+int hls_at_eof(void) { return g_active && !g_isLive && g_segIdx >= g_segCount; }
 
 static void free_segs(void) {
     if (g_segs) {
@@ -1142,6 +1144,7 @@ int hls_next_segment(uint8_t **outBuf, int *outLen, int *outResetGen) {
 
     for (;;) {
         if (g_segIdx >= g_segCount) {
+            if (!g_isLive) return -1;            // VOD: all segments played -> EOF
             if (refresh_live_playlist() != 0) {
                 sceKernelUsleep(300 * 1000);
                 continue;

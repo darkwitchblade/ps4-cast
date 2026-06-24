@@ -25,7 +25,8 @@ int  hls_read(uint8_t *buf, uint32_t len);
 int  hls_generation(void);                         // increments at media segment boundaries
 int  hls_reset_generation(void);                   // increments when live HLS jumps/skips
 int  hls_is_live(void);
-int  hls_can_segment_demux(void);                  // plain live TS media playlist
+int  hls_can_segment_demux(void);                  // TS media playlist (live or VOD)
+int  hls_at_eof(void);                             // VOD: all segments consumed
 int  hls_next_segment(uint8_t **outBuf, int *outLen, int *outResetGen);
 
 void hls_close(void);

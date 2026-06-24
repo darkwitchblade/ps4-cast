@@ -854,8 +854,7 @@ int main(void) {
                 if (reconnecting) reconnecting = 0;          // recovered
                 if (healthySince == 0) healthySince = now;
                 else if (now - healthySince > 8000000ULL) reconnects = 0;  // stable -> reset budget
-                double pc = 0, pd = 0; player_progress(&pc, &pd);
-                liveSource = (pd <= 0.5);   // no finite duration => live
+                liveSource = player_is_live();   // only true live streams auto-reconnect
             } else if (!everDrew) {
                 gfx_vgrad(&g, 0, 0, g.width, g.height, BG_TOP, BG_BOT);
                 int pw = 720, ph = 264, px = (g.width - pw) / 2, py = (g.height - ph) / 2;

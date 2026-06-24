@@ -589,6 +589,7 @@ int player_play(const char *url) {
 
 int player_is_active(void) { return g_active; }
 int player_started(void)   { return g_started; }
+int player_is_live(void)   { return g_isHls && hls_is_live(); }   // true live (not VOD)
 
 void player_pause(int paused) {
     g_paused = paused ? 1 : 0;
@@ -1417,7 +1418,11 @@ static void *decode_segment_thread_main(void *arg) {
         if (g_segReadAhead) rc = seg_ring_pop(&segBuf, &segLen, &resetGen);   // fetched ahead
         else                rc = hls_next_segment(&segBuf, &segLen, &resetGen); // inline fallback
         if (g_decStop) { if (segBuf) free(segBuf); break; }
-        if (rc != 0 || !segBuf || segLen <= 0) { if (segBuf) free(segBuf); sceKernelUsleep(100000); continue; }
+        if (rc != 0 || !segBuf || segLen <= 0) {
+            if (segBuf) free(segBuf);
+            if (hls_at_eof()) g_decEof = 1;   // VOD finished: let the render path end playback
+            sceKernelUsleep(100000); continue;
+        }
         if (resetGen != g_hlsResetGen) {
             trace_mark("segdemux reset old=%d new=%d", g_hlsResetGen, resetGen);
             apply_hls_reset();   // flushes g_vdec/g_adec + audio + fq
