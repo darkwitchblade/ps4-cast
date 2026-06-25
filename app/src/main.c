@@ -2,7 +2,7 @@
 //   * brings up the framebuffer + network
 //   * shows a lobby screen with the console's cast URL
 //   * runs an HTTP control server (phone web UI posts a video URL)
-//   * plays the URL fullscreen via libSceAvPlayer (hardware decode)
+//   * plays the URL fullscreen via ffmpeg demux/audio plus hardware H.264 decode
 #include <stdio.h>
 #include <string.h>
 
@@ -15,7 +15,6 @@
 #include "player.h"
 #include "httpsrc.h"
 #include "escalate.h"
-#include "launcher.h"
 #include "ssdp.h"
 #include "pad_diag.h"
 #include "sys_diag.h"
@@ -790,7 +789,6 @@ int main(void) {
             if (pressed & ORBIS_PAD_BUTTON_SQUARE) { player_seek(0); notify("Restarted from the beginning"); }
             if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
                 player_stop();
-                handoff_stop();
                 everDrew = 0; reconnecting = 0; reconnects = 0;
             }
         }
@@ -812,12 +810,9 @@ int main(void) {
         }
         if (httpd_take_stop_request()) {
             player_stop();
-            handoff_stop();
             everDrew = 0; reconnecting = 0; reconnects = 0;
         }
         if (httpd_take_play_request(url, sizeof(url))) {
-            // Native app/browser handoff is permanently disabled (CE-36329-3),
-            // so /play now drives the in-app AvPlayer just like /avplay.
             if (!userOk) {
                 notify("Sign in a PS4 user to cast");   // playing under ANONYMOUS crashes SceShellUI
             } else {

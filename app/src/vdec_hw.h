@@ -1,8 +1,7 @@
 // vdec_hw.h — hardware H.264 decode via libSceVideodec2 (GPU-compute decoder).
 //
-// Proven by the /vdecprobe research path: creates a decoder, decodes Annex B
-// H.264 access units to NV12 frames on the GPU silicon (CPU stays free), ~68fps
-// sustained at 1080p. This wraps that recipe in a small player-facing API.
+// Creates a decoder, decodes Annex B H.264 access units to NV12 frames on the
+// GPU silicon (CPU stays free), and wraps that path in a small player-facing API.
 //
 // IMPORTANT: vdec_hw_decode runs sceVideodec2Decode on the CALLER's thread and
 // that thread MUST have a large stack (>=8MB) — the decoder uses ~31KB frames

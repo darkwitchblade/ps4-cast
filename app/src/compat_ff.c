@@ -1,5 +1,5 @@
 // compat_ff.c — small libc shims for symbols ffmpeg references that the
-// OpenOrbis libc does not provide. Only compiled with USE_FFMPEG.
+// OpenOrbis libc does not provide these libc symbols used by ffmpeg.
 #include <stddef.h>
 
 // Let the libc heap grow without a fixed cap — ffmpeg's decoder/demuxer and our

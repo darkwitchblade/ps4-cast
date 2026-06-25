@@ -1,10 +1,9 @@
-// player_ff.c — ffmpeg-based player backend (software decode).
+// player_ff.c — ffmpeg-based player backend.
 //
-// Drop-in replacement for the libSceAvPlayer player.c (same player.h API),
-// selected with USE_FFMPEG. ffmpeg is built with networking DISABLED, so input
-// is fed through a custom AVIO backed by our sceNet reader (httpsrc) — which is
-// also where TLS/https lives. This avoids the PS4 hardware-decoder entitlement
-// wall that AvPlayer hit: ffmpeg decodes in software on the CPU.
+// ffmpeg is built with networking disabled, so input is fed through a custom
+// AVIO backed by our sceNet reader (httpsrc), which is also where TLS/https
+// lives. H.264 can be routed through the proven sceVideodec2 hardware path;
+// other codecs fall back to ffmpeg software decode.
 #include "player.h"
 #include "httpsrc.h"
 #include "hls.h"

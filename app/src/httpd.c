@@ -1,13 +1,11 @@
 #include "httpd.h"
 #include "web_ui.h"
 #include "player.h"
-#include "launcher.h"
 #include "escalate.h"
 #include "goldhen.h"
 #include "ssdp.h"
 #include "pad_diag.h"
 #include "sys_diag.h"
-#include "vdec_probe.h"
 #include "trace.h"
 #include "notify.h"
 
@@ -480,6 +478,9 @@ static const char DEVICE_XML[] =
 "</device>"
 "</root>";
 
+static void send_response(OrbisNetId c, const char *status, const char *ctype,
+                          const char *body, int bodylen);
+
 static const char AVTRANSPORT_XML[] =
 "<?xml version=\"1.0\"?>"
 "<scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">"
@@ -813,8 +814,8 @@ static void handle_client(OrbisNetId c) {
         double cur = 0, dur = 0;
         player_progress(&cur, &dur);
         int j = snprintf(json, sizeof(json),
-                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"native\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"diag\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d,\"debug\":%d,\"chan_n\":%d,\"chan_cur\":%d,\"buf\":%d,\"rx\":%llu,\"sys\":\"%s\",\"fps\":%d}",
-                         APP_VER, jb_result(), goldhen_status(), player_status(), handoff_status(), ssdp_status(),
+                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"diag\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d,\"debug\":%d,\"chan_n\":%d,\"chan_cur\":%d,\"buf\":%d,\"rx\":%llu,\"sys\":\"%s\",\"fps\":%d}",
+                         APP_VER, jb_result(), goldhen_status(), player_status(), ssdp_status(),
                          active, player_is_paused(), (int)(cur + 0.5), (int)(dur + 0.5), g_last_push, dbg, pad_diag_get(),
                          player_hw_enabled(), notify_get_debug(), g_chanN, g_chanCur,
                          player_buffer_pct(), (unsigned long long)player_rx_total(), sys_diag_get(), sys_get_fps());
@@ -837,16 +838,6 @@ static void handle_client(OrbisNetId c) {
         return;
     }
 
-    // Hardware-decode research probe (isolated from the player). Trigger with
-    // e.g. GET /vdecprobe?sweep=1  or  GET /vdecprobe?codec=1&profile=0 .
-    if (strcmp(method, "GET") == 0 && strncmp(path, "/vdecprobe", 10) == 0) {
-        const char *q = strchr(path, '?');
-        char resp[8192];
-        int rn = vdec_probe_run(q ? q + 1 : "", resp, sizeof(resp));
-        send_response(c, "200 OK", "text/plain", resp, rn);
-        return;
-    }
-
     // Toggle the hardware-decode fast path at runtime (A/B testing vs software).
     // POST /hwdecode body "0"/"1"; takes effect on the next cast.
     if (strcmp(method, "POST") == 0 && strcmp(path, "/hwdecode") == 0) {
@@ -862,20 +853,6 @@ static void handle_client(OrbisNetId c) {
         notify_set_debug(on);
         cfg_save();
         send_response(c, "200 OK", "text/plain", on ? "debug on" : "debug off", on ? 8 : 9);
-        return;
-    }
-
-    // Read back the last probe's pre-decode log persisted on /data (survives an
-    // uncatchable hard crash, so we can see how far it got after a relaunch).
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/vdeclog") == 0) {
-        int fd = sceKernelOpen("/data/ps4cast_vdec.log", 0 /*O_RDONLY*/, 0);
-        if (fd < 0) { send_response(c, "200 OK", "text/plain", "(no vdec log yet)", 17); return; }
-        static char lb[4096];
-        int ln = (int)sceKernelRead(fd, lb, sizeof(lb) - 1);
-        sceKernelClose(fd);
-        if (ln < 0) ln = 0;
-        lb[ln] = '\0';
-        send_response(c, "200 OK", "text/plain", lb, ln);
         return;
     }
 
@@ -1073,59 +1050,6 @@ static void handle_client(OrbisNetId c) {
             resp = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body/></s:Envelope>";
         }
         send_response(c, "200 OK", "text/xml; charset=\"utf-8\"", resp, (int)strlen(resp));
-        return;
-    }
-
-    // Privileged launch by URI (ShellUI). Body = the URI to try. Lets us probe
-    // many URI formats over curl without rebuilding.
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/launch") == 0) {
-        char uri[512];
-        strncpy(uri, body, sizeof(uri) - 1);
-        uri[sizeof(uri) - 1] = '\0';
-        for (int i = (int)strlen(uri) - 1; i >= 0 && (uri[i]=='\r'||uri[i]=='\n'||uri[i]==' '); i--) uri[i]='\0';
-        int r = launch_by_uri(uri);
-        char resp[400];
-        int rn = snprintf(resp, sizeof(resp), "rc=0x%x | %s", (unsigned)r, launch_debug());
-        send_response(c, "200 OK", "text/plain", resp, rn);
-        return;
-    }
-
-    // Native app handoff. Body:
-    //   TITLE_ID\noptional argument/URL
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/launchapp") == 0) {
-        char title[32];
-        char arg[768];
-        memset(title, 0, sizeof(title));
-        memset(arg, 0, sizeof(arg));
-
-        const char *nl = strchr(body, '\n');
-        int title_len = nl ? (int)(nl - body) : (int)strlen(body);
-        if (title_len >= (int)sizeof(title)) title_len = (int)sizeof(title) - 1;
-        memcpy(title, body, title_len);
-        title[title_len] = '\0';
-        for (int i = (int)strlen(title) - 1; i >= 0 && (title[i]=='\r'||title[i]=='\n'||title[i]==' '||title[i]=='\t'); i--) title[i]='\0';
-
-        if (nl) {
-            strncpy(arg, nl + 1, sizeof(arg) - 1);
-            arg[sizeof(arg) - 1] = '\0';
-            for (int i = (int)strlen(arg) - 1; i >= 0 && (arg[i]=='\r'||arg[i]=='\n'||arg[i]==' '||arg[i]=='\t'); i--) arg[i]='\0';
-        }
-
-        if (!title[0]) {
-            send_response(c, "400 Bad Request", "text/plain", "missing title id", 16);
-            return;
-        }
-
-        int r = launch_app(title, arg);
-        char resp[420];
-        int rn = snprintf(resp, sizeof(resp), "rc=0x%x | %s", (unsigned)r, launch_debug());
-        send_response(c, "200 OK", "text/plain", resp, rn);
-        return;
-    }
-
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/browser") == 0) {
-        const char *resp = "browser handoff disabled after CE-36329-3";
-        send_response(c, "409 Conflict", "text/plain", resp, (int)strlen(resp));
         return;
     }
 

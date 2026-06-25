@@ -14,7 +14,7 @@
 
 #define SYS_dynlib_load_prx  594
 
-// ---- sceVideodec2 ABI (same layouts proven by vdec_probe.c) ----------------
+// ---- sceVideodec2 ABI ------------------------------------------------------
 typedef struct {
     uint64_t thisSize; uint32_t resourceType, codecType, profile, maxLevel;
     int32_t maxFrameWidth, maxFrameHeight, maxDpbFrameCount; uint32_t decodePipelineDepth;
