@@ -55,3 +55,7 @@ const char *sys_diag_get(void) { return g_sys_diag; }
 int sys_fg_user(void)     { return g_fg_user; }
 int sys_ui_overlaid(void) { return g_ui_overlaid; }
 int sys_in_background(void){ return g_in_background; }
+
+static volatile int g_fps = 0;
+void sys_set_fps(int fps) { g_fps = fps; }
+int  sys_get_fps(void)    { return g_fps; }

@@ -18,4 +18,10 @@ int sys_fg_user(void);             // foreground user id (-999 if query failed)
 int sys_ui_overlaid(void);         // 1 = a system UI is overlaid on our app
 int sys_in_background(void);       // 1 = our app is in background execution
 
+// Presented-frame-rate readout for the seamless-fps work (it2). The main loop
+// pushes the 1 Hz fps count here; /status exposes it as "fps" so the overlay
+// cost can be measured objectively (toggle HUD/stats and watch fps).
+void sys_set_fps(int fps);
+int  sys_get_fps(void);
+
 #endif

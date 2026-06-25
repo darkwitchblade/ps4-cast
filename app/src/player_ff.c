@@ -1172,8 +1172,22 @@ static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
     int ox = (dw - scaledW) / 2, oy = (dh - scaledH) / 2;
 
     uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
-    if (scaledW != dw || scaledH != dh) {
+    // The black letterbox bars are STATIC — they only change when the video
+    // geometry changes. Clearing all dw*dh (~2M) pixels single-threaded EVERY
+    // frame was the dominant render-rate sink (it capped the loop well under
+    // vsync). Instead, re-paint the bars once per rotating framebuffer whenever
+    // the geometry shifts (countdown across GFX_BUFFERS), then leave them be —
+    // the per-frame NV12 convert overwrites only the video rect, so the bars
+    // persist untouched.
+    enum { FB_CLEAR_PASSES = 4 };   // >= GFX_BUFFERS (3) so every rotating buffer gets re-cleared once
+    static int s_lastSW = -1, s_lastSH = -1, s_lastOX = -1, s_lastOY = -1, s_clearLeft = 0;
+    if (scaledW != s_lastSW || scaledH != s_lastSH || ox != s_lastOX || oy != s_lastOY) {
+        s_lastSW = scaledW; s_lastSH = scaledH; s_lastOX = ox; s_lastOY = oy;
+        s_clearLeft = (scaledW != dw || scaledH != dh) ? FB_CLEAR_PASSES : 0;
+    }
+    if (s_clearLeft > 0) {
         for (int i = 0, n = dw * dh; i < n; i++) fb[i] = 0x80000000u;
+        s_clearLeft--;
     }
 
     PresentJob job = { fr->data[0], fr->data[1], sw, sh, fr->linesize[0], fr->linesize[1],

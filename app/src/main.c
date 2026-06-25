@@ -727,6 +727,7 @@ int main(void) {
             if (fpsT0 == 0) fpsT0 = now;
             else if (now - fpsT0 >= 1000000ULL) {
                 fpsVal = fpsCount; fpsCount = 0; fpsT0 = now;
+                sys_set_fps(fpsVal); // expose presented fps via /status (it2 measurement)
                 sys_diag_update();   // sample system/user state ~1 Hz (SceShellUI-crash probe)
             }
         }
