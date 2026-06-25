@@ -11,6 +11,7 @@ int  player_is_active(void);         // 1 while AvPlayer reports active (post-bu
 int  player_started(void);           // 1 from Start until Stop (drives the pump)
 int  player_is_live(void);           // 1 if the current source is a live stream
 int  player_render(Gfx *g);          // blit newest video frame to g; 1 if drawn
+void player_request_bar_clear(void); // call when an overlay draws over the letterbox bars (prevents ghosting)
 const char *player_status(void);     // short human-readable status line
 void player_debug(char *out, int len); // live AvPlayer debug state (one line)
 

@@ -451,6 +451,37 @@ int gfx_text_w(const char *s, int scale) {
     return gfx_text_tr_w(s, scale, default_track(scale));
 }
 
+// Blit one anti-aliased atlas glyph (cell x cell alpha map) in a single tight,
+// pre-clipped pass. The previous path called gfx_blend() per pixel — a function
+// call plus full bounds check for every one of the cell*cell pixels of every
+// glyph, every frame. Clipping once and inlining the blend here is what makes
+// the HUD/stats overlays nearly free to draw (no fps dip when they're up).
+static void blit_glyph(Gfx *g, const unsigned char *gly, int cell, int dx, int dy, GfxColor c) {
+    int W = g->width, H = g->height;
+    int gx0 = dx < 0 ? -dx : 0, gy0 = dy < 0 ? -dy : 0;
+    int gx1 = dx + cell > W ? W - dx : cell;
+    int gy1 = dy + cell > H ? H - dy : cell;
+    if (gx0 >= gx1 || gy0 >= gy1) return;
+    uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
+    uint32_t enc = encode(c);
+    int cr = c.r, cg = c.g, cb = c.b;
+    for (int gy = gy0; gy < gy1; gy++) {
+        const unsigned char *row = gly + (size_t)gy * cell;
+        uint32_t *drow = fb + (size_t)(dy + gy) * W + dx;
+        for (int gx = gx0; gx < gx1; gx++) {
+            int a = row[gx];
+            if (!a) continue;
+            if (a >= 255) { drow[gx] = enc; continue; }
+            uint32_t e = drow[gx];
+            int ia = 255 - a;
+            uint32_t r = (cr * a + ((e >> 16) & 0xff) * ia) / 255;
+            uint32_t gg = (cg * a + ((e >> 8) & 0xff) * ia) / 255;
+            uint32_t b = (cb * a + (e & 0xff) * ia) / 255;
+            drow[gx] = 0x80000000u | (r << 16) | (gg << 8) | b;
+        }
+    }
+}
+
 int gfx_text_tr(Gfx *g, int x, int y, const char *s, int scale, GfxColor c, int track) {
     // Anti-aliased proportional atlas for scale 2..6; scale 1 keeps the 8x8
     // bitmap. UTF-8 titles are folded to safe ASCII so metadata cannot corrupt
@@ -466,11 +497,7 @@ int gfx_text_tr(Gfx *g, int x, int y, const char *s, int scale, GfxColor c, int 
         if (ch < FONT_FIRST || ch > FONT_LAST) ch = '?';
         if (useAtlas) {
             const unsigned char *gly = atlas + (size_t)(ch - FONT_FIRST) * cell * cell;
-            for (int gy = 0; gy < cell; gy++) {
-                const unsigned char *row = gly + (size_t)gy * cell;
-                for (int gx = 0; gx < cell; gx++)
-                    if (row[gx]) gfx_blend(g, penX + gx, y + gy, c, row[gx]);
-            }
+            blit_glyph(g, gly, cell, penX, y, c);
         } else {
             const unsigned char *glyph = font8x8_basic[ch < 128 ? ch : '?'];
             for (int row = 0; row < 8; row++) {

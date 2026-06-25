@@ -1156,6 +1156,13 @@ static int build_scaled_nv12(AVFrame *fr, Gfx *g) {
     return 0;
 }
 
+// Set by the main loop (player_request_bar_clear) when an overlay is drawing over
+// the letterbox bars, so the next few frames re-clear the bars and the overlay
+// doesn't ghost once dismissed. >0 = clear the bars this frame. The countdown
+// spans all rotating framebuffers.
+static volatile int g_barClearLeft = 0;
+void player_request_bar_clear(void) { g_barClearLeft = 4; }   // >= GFX_BUFFERS
+
 // NV12 -> active framebuffer directly. This fuses color conversion, scaling, and
 // final blit for the hardware path.
 static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
@@ -1172,22 +1179,35 @@ static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
     int ox = (dw - scaledW) / 2, oy = (dh - scaledH) / 2;
 
     uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
-    // The black letterbox bars are STATIC — they only change when the video
-    // geometry changes. Clearing all dw*dh (~2M) pixels single-threaded EVERY
-    // frame was the dominant render-rate sink (it capped the loop well under
-    // vsync). Instead, re-paint the bars once per rotating framebuffer whenever
-    // the geometry shifts (countdown across GFX_BUFFERS), then leave them be —
-    // the per-frame NV12 convert overwrites only the video rect, so the bars
-    // persist untouched.
-    enum { FB_CLEAR_PASSES = 4 };   // >= GFX_BUFFERS (3) so every rotating buffer gets re-cleared once
-    static int s_lastSW = -1, s_lastSH = -1, s_lastOX = -1, s_lastOY = -1, s_clearLeft = 0;
-    if (scaledW != s_lastSW || scaledH != s_lastSH || ox != s_lastOX || oy != s_lastOY) {
-        s_lastSW = scaledW; s_lastSH = scaledH; s_lastOX = ox; s_lastOY = oy;
-        s_clearLeft = (scaledW != dw || scaledH != dh) ? FB_CLEAR_PASSES : 0;
-    }
-    if (s_clearLeft > 0) {
-        for (int i = 0, n = dw * dh; i < n; i++) fb[i] = 0x80000000u;
-        s_clearLeft--;
+    // Clear ONLY the letterbox/pillarbox border (area outside the video rect),
+    // and only when needed: on a geometry change (bars moved) or when the main
+    // loop signalled an overlay is drawing over the bars (player_request_bar_clear
+    // -> g_barClearLeft). Plain fullscreen-ish playback with no overlay skips the
+    // clear entirely and runs at full render rate. The video rect itself never
+    // needs a clear (the NV12 convert below fills it). The countdown spans all
+    // rotating framebuffers so a dismissed overlay is wiped from every buffer.
+    {
+        static int s_lastSW = -1, s_lastSH = -1, s_lastOX = -1, s_lastOY = -1;
+        if (scaledW != s_lastSW || scaledH != s_lastSH || ox != s_lastOX || oy != s_lastOY) {
+            s_lastSW = scaledW; s_lastSH = scaledH; s_lastOX = ox; s_lastOY = oy;
+            g_barClearLeft = 4;
+        }
+        if (g_barClearLeft > 0) {
+            g_barClearLeft--;
+            const uint32_t BAR = 0x80000000u;
+            int vy0 = oy, vy1 = oy + scaledH, vx0 = ox, vx1 = ox + scaledW;
+            if (vy0 < 0) vy0 = 0; if (vy1 > dh) vy1 = dh;
+            if (vx0 < 0) vx0 = 0; if (vx1 > dw) vx1 = dw;
+            for (int yy = 0; yy < vy0; yy++)                   // top bar (full width)
+                { uint32_t *r = fb + (size_t)yy * dw; for (int xx = 0; xx < dw; xx++) r[xx] = BAR; }
+            for (int yy = vy1; yy < dh; yy++)                  // bottom bar (full width)
+                { uint32_t *r = fb + (size_t)yy * dw; for (int xx = 0; xx < dw; xx++) r[xx] = BAR; }
+            for (int yy = vy0; yy < vy1; yy++) {               // left + right pillars
+                uint32_t *r = fb + (size_t)yy * dw;
+                for (int xx = 0; xx < vx0; xx++)  r[xx] = BAR;
+                for (int xx = vx1; xx < dw; xx++) r[xx] = BAR;
+            }
+        }
     }
 
     PresentJob job = { fr->data[0], fr->data[1], sw, sh, fr->linesize[0], fr->linesize[1],

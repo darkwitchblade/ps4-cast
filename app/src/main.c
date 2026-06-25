@@ -936,8 +936,10 @@ int main(void) {
 
             // The channel overlay replaces the HUD while browsing (no clutter).
             int overlay = (sceKernelGetProcessTime() < chanUntil && httpd_chan_count() > 0);
-            if (!overlay && (!everDrew || player_is_paused() || sceKernelGetProcessTime() < hudUntil))
+            if (!overlay && (!everDrew || player_is_paused() || sceKernelGetProcessTime() < hudUntil)) {
                 draw_hud(&g);
+                player_request_bar_clear();   // HUD scrubber/times sit on the bottom bar
+            }
         } else if (!reconnecting) {
             draw_lobby(&g, ip, net_ok);
             everDrew = 0;
@@ -945,8 +947,10 @@ int main(void) {
         // (while reconnecting with no live player, the last frame is kept on screen)
 
         // Channel zapper overlay sits on top of whatever is showing.
-        if (sceKernelGetProcessTime() < chanUntil && httpd_chan_count() > 0)
+        if (sceKernelGetProcessTime() < chanUntil && httpd_chan_count() > 0) {
             draw_channel_overlay(&g, navSel);
+            player_request_bar_clear();
+        }
 
         // Auto-reconnect banner for a dropped live stream.
         if (reconnecting) {
@@ -970,8 +974,10 @@ int main(void) {
         }
 
         // Lightweight stream stats (touchpad), top-right, only while playing.
-        if (statsOn && player_started())
+        if (statsOn && player_started()) {
             draw_stats_overlay(&g, netBps, fpsVal);
+            player_request_bar_clear();   // stats top rows sit on the top bar
+        }
 
         gfx_present(&g, frameID++);
     }
