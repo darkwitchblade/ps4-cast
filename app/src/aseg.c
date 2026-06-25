@@ -119,26 +119,38 @@ static int resolve_host(void) {
     return 0;
 }
 
+#define ORBIS_NET_SO_NBIO 0x1200   // non-blocking I/O socket option
+
 static int tcp_connect(void) {
-    if (g_abort) return -1;                  // already tearing down: don't begin a fresh blocking connect
+    if (g_abort) return -1;                  // already tearing down: don't begin a fresh connect
     int s = sceNetSocket("ps4cast_aseg", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_STREAM, 0);
     if (s < 0) return s;
-    int tmo = 3 * 1000 * 1000;   // 3s (was 8s): a stalled segment read fails fast so a channel switch's player_stop teardown isn't blocked waiting out a long socket timeout
+    int tmo = 3 * 1000 * 1000;
     sceNetSetsockopt(s, ORBIS_NET_SOL_SOCKET, ORBIS_NET_SO_RCVTIMEO, &tmo, sizeof(tmo));
     sceNetSetsockopt(s, ORBIS_NET_SOL_SOCKET, ORBIS_NET_SO_SNDTIMEO, &tmo, sizeof(tmo));
     ps4_sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.len = sizeof(sa); sa.family = ORBIS_NET_AF_INET;
     sa.port = sceNetHtons(g_port); sa.addr = g_addr;
-    // Publish the socket BEFORE the blocking connect so aseg_abort()'s
-    // sceNetSocketAbort(g_sock) can interrupt a slow connect during teardown
-    // (otherwise the connecting socket is invisible to the aborter and a dead
-    // segment server wedges player_stop for ~13s).
+
+    // Non-blocking connect with a bounded budget. A blocking connect to a slow/dead
+    // segment server can't be aborted (sceNetSocketAbort doesn't interrupt it), so it
+    // wedged a channel switch's player_stop for ~13s. Here we start the connect
+    // non-blocking, then poll a zero-length send (writable == connected) up to ~4s,
+    // bailing immediately on teardown (g_abort), then restore blocking I/O.
+    int nb = 1; sceNetSetsockopt(s, ORBIS_NET_SOL_SOCKET, ORBIS_NET_SO_NBIO, &nb, sizeof(nb));
     g_sock = s;
-    if (sceNetConnect(s, (const OrbisNetSockaddr *)&sa, sizeof(sa)) < 0) {
-        sceNetSocketClose(s); g_sock = -1;
-        return -1;
+    sceNetConnect(s, (const OrbisNetSockaddr *)&sa, sizeof(sa));   // returns in-progress
+    int connected = 0;
+    uint64_t t0 = sceKernelGetProcessTime();
+    sceKernelUsleep(15000);                                        // let the handshake start before probing
+    while (sceKernelGetProcessTime() - t0 < 4ULL * 1000 * 1000) {
+        if (g_abort) break;
+        if (sceNetSend(s, "", 0, 0) >= 0) { connected = 1; break; } // writable -> connected
+        sceKernelUsleep(20000);
     }
+    nb = 0; sceNetSetsockopt(s, ORBIS_NET_SOL_SOCKET, ORBIS_NET_SO_NBIO, &nb, sizeof(nb)); // restore blocking for request/read
+    if (!connected) { sceNetSocketClose(s); g_sock = -1; return -1; }
     return s;
 }
 
