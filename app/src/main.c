@@ -568,30 +568,27 @@ static void draw_channel_overlay(Gfx *g, int sel) {
 // NO panel/blend behind it — the cheapest possible overlay, can't affect decode.
 static void draw_stats_overlay(Gfx *g, double netBps, int fps) {
     PlayerStats s; player_stats(&s);
-    int lx = g->width - 470, vx = lx + 150, ry = 48, rh = 30;
-    gfx_circle(g, lx + 4, ry + 7, 5, LIVE);
-    stext(g, lx + 18, ry, "STREAM", 2, TXT);
-    char ver[16]; snprintf(ver, sizeof(ver), "v%s", APP_VER);
-    stext(g, g->width - 40 - gfx_text_w(ver, 2), ry, ver, 2, FAINT);
-    ry += 38;
-
-    char b[80];
-    snprintf(b, sizeof(b), "%s  %s", s.hw ? "HW" : "SW", s.codec);
-    stext(g, lx, ry, "Decode", 2, FAINT);  stext(g, vx, ry, b, 2, s.hw ? LIVE : ACC_LT);  ry += rh;
+    // Dead simple, like the GoldHEN counters: plain white text in the top-right
+    // corner — no panel, no background, no drop-shadow. Each line is right-aligned
+    // to the same right margin. Minimal compositing so showing it barely touches
+    // fps. Lines are blanked elsewhere via the bar-clear / video overwrite.
+    int rh = 26, ry = 30, rx = g->width - 34;
+    char b[96];
+    snprintf(b, sizeof(b), "%s %s", s.hw ? "HW" : "SW", s.codec);
+    gfx_text(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh;
     snprintf(b, sizeof(b), "%dx%d  %d fps", s.w, s.h, fps);
-    stext(g, lx, ry, "Video", 2, FAINT);   stext(g, vx, ry, b, 2, (fps >= 24 || fps == 0) ? TXT : WARN);  ry += rh;
-    if (s.aheadSec > 0.1) snprintf(b, sizeof(b), "%d%%  +%.1fs", s.bufPct, s.aheadSec);
-    else snprintf(b, sizeof(b), "%d%%", s.bufPct);
-    GfxColor bc = s.bufPct >= 40 ? LIVE : (s.bufPct >= 15 ? WARN : DANGER);
-    stext(g, lx, ry, "Buffer", 2, FAINT);  stext(g, vx, ry, b, 2, bc);  ry += rh;
+    gfx_text(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh;
+    if (s.aheadSec > 0.1) snprintf(b, sizeof(b), "buffer %d%%  +%.1fs", s.bufPct, s.aheadSec);
+    else                  snprintf(b, sizeof(b), "buffer %d%%", s.bufPct);
+    gfx_text(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh;
     if (netBps >= 1e6)      snprintf(b, sizeof(b), "%.1f MB/s", netBps / 1e6);
     else if (netBps >= 1e3) snprintf(b, sizeof(b), "%.0f KB/s", netBps / 1e3);
     else                    snprintf(b, sizeof(b), "%.0f B/s", netBps);
-    stext(g, lx, ry, "Network", 2, FAINT); stext(g, vx, ry, b, 2, netBps > 0 ? LIVE : MUT);  ry += rh;
-    snprintf(b, sizeof(b), "%s%s", s.hls ? (s.segDemux ? "HLS seg-demux" : "HLS") : "HTTP", s.lan ? "  LAN" : "");
-    stext(g, lx, ry, "Source", 2, FAINT);  stext(g, vx, ry, b, 2, MUT);  ry += rh;
-    snprintf(b, sizeof(b), "%ld", s.drops);
-    stext(g, lx, ry, "Dropped", 2, FAINT); stext(g, vx, ry, b, 2, s.drops > 0 ? WARN : MUT);  ry += rh;
+    gfx_text(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh;
+    snprintf(b, sizeof(b), "%s%s", s.hls ? (s.segDemux ? "HLS seg" : "HLS") : "HTTP", s.lan ? " LAN" : "");
+    gfx_text(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh;
+    snprintf(b, sizeof(b), "drops %ld", s.drops);
+    gfx_text(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh;
 }
 #endif
 
