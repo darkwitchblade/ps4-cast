@@ -151,15 +151,18 @@ wait_up() {  # poll /status up to ~90s for VER; on success check the initial use
   return 1
 }
 
-if [ "${PS4CAST_ICON_LAUNCH:-0}" = "1" ]; then
-  echo "    PS4CAST_ICON_LAUNCH=1 -> open PS4 Cast from the home-screen ICON now."
-  echo "    waiting up to 90s for it to come up on v$VER…"
-  wait_up && exit 0
-  echo "    not up yet — open PS4 Cast on the console (icon), it is installed as v$VER"
-else
-  echo "    payload launch (binds signed-in user, clean)…"
+# Payload launch is OPT-IN: the login-user binding is unreliable in practice
+# (sometimes still ANONYMOUS -> SceShellUI crash), so the ICON launch (always
+# clean) is the default. Set PS4CAST_PAYLOAD_LAUNCH=1 to attempt the payload.
+if [ "${PS4CAST_PAYLOAD_LAUNCH:-0}" = "1" ]; then
+  echo "    payload launch (may bind anon -> crash)…"
   send_payload build/ps4cast-launch.bin || true
   wait_up && exit 0
   echo "    payload launch didn't come up — open PS4 Cast on the console (icon)"
+else
+  echo "    >> Open PS4 Cast from the home-screen ICON now (clean launch)."
+  echo "    waiting up to 90s for it to come up on v$VER…"
+  wait_up && exit 0
+  echo "    not up yet — open PS4 Cast on the console (icon), it is installed as v$VER"
 fi
 exit 0

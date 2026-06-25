@@ -5,13 +5,13 @@ PS4=${PS4_IP:-192.168.1.253}
 VER=${1:-}
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# The launch payload now binds the signed-in user (login-user list), so a payload
-# launch is clean (valid initial user, no SceShellUI CE-36329-3). Payload launch is
-# the default. Set PS4CAST_ICON_LAUNCH=1 to skip it and open from the icon manually.
-if [ "${PS4CAST_ICON_LAUNCH:-0}" = "1" ]; then
-  echo ">> Open PS4 Cast from the home-screen ICON. Waiting for it to come up…" >&2
-else
+# Payload launch is OPT-IN (its user binding is unreliable -> can bind anon and
+# crash SceShellUI). ICON launch is the clean default. PS4CAST_PAYLOAD_LAUNCH=1
+# attempts the payload.
+if [ "${PS4CAST_PAYLOAD_LAUNCH:-0}" = "1" ]; then
   python3 "$ROOT/scripts/send-goldhen-payload.py" "$ROOT/payloads/ps4cast-control/build/ps4cast-launch.bin" --ps4 "$PS4"
+else
+  echo ">> Open PS4 Cast from the home-screen ICON (clean launch). Waiting for it to come up…" >&2
 fi
 
 for _ in $(seq 1 80); do
