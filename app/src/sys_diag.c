@@ -11,6 +11,8 @@
 // system symbols either way.
 extern int32_t sceUserServiceGetForegroundUser(int32_t *userId);
 extern int32_t sceUserServiceGetInitialUser(int32_t *userId);
+typedef struct { int32_t userId[4]; } LoginUserIdList;   // OrbisUserServiceLoginUserIdList
+extern int32_t sceUserServiceGetLoginUserIdList(LoginUserIdList *list);
 
 // Real SceSystemServiceStatus layout (eventNum + a handful of bool flags). The
 // generous reserved tail guards against the kernel writing a larger struct than
@@ -40,15 +42,17 @@ void sys_diag_update(void) {
     memset(&st, 0, sizeof(st));
     int rs = (int)sceSystemServiceGetStatus(&st);
 
+    LoginUserIdList ll; ll.userId[0] = ll.userId[1] = ll.userId[2] = ll.userId[3] = -1;
+    int rll = (int)sceUserServiceGetLoginUserIdList(&ll);
+
     g_fg_user = (rfg == 0) ? (int)fg : -999;
     g_ui_overlaid  = (rs == 0) ? (st.isSystemUiOverlaid ? 1 : 0) : -1;
     g_in_background = (rs == 0) ? (st.isInBackgroundExecution ? 1 : 0) : -1;
 
     snprintf(g_sys_diag, sizeof(g_sys_diag),
-             "fg=0x%x(r%d) iu=0x%x(r%d) st(r%d) ev=%d ui=%d bg=%d live=%d",
-             (unsigned)fg, rfg, (unsigned)iu, riu, rs,
-             st.eventNum, st.isSystemUiOverlaid, st.isInBackgroundExecution,
-             st.isGameLiveStreamingOnAir);
+             "fg=0x%x(r%d) iu=0x%x(r%d) login=0x%x(r%d) ui=%d bg=%d",
+             (unsigned)fg, rfg, (unsigned)iu, riu, (unsigned)ll.userId[0], rll,
+             st.isSystemUiOverlaid, st.isInBackgroundExecution);
 }
 
 const char *sys_diag_get(void) { return g_sys_diag; }

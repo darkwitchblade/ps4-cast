@@ -125,13 +125,12 @@ done
 [ -z "$ok" ] && { echo "INSTALL FAILED (:9090 not accepting). pkg is hosted; install via Remote Pkg Installer: http://$HOST:8000/PS4-Cast-v$VER.pkg"; (cd dist && python3 -m http.server 8000 --bind "$HOST" >/tmp/h.log 2>&1 &); exit 1; }
 
 echo "[5/5] launch"
-# IMPORTANT: the GoldHEN :9090 payload launcher (build/ps4cast-launch.bin ->
-# sceLncUtilLaunchApp) binds the app's INITIAL user to ANONYMOUS (0xffffffff)
-# even when a user is signed in, which makes SceShellUI's VideoPlayingChecker
-# crash (CE-36329-3) ~1-in-3 launches and leaves a dialog on the TV. Launching
-# from the home-screen ICON binds the real signed-in user (iu valid) and never
-# crashes. So by DEFAULT we do NOT payload-launch — we ask for an icon launch and
-# wait for it. Set PS4CAST_PAYLOAD_LAUNCH=1 to force the old (crash-prone) path.
+# The launch payload now binds the SIGNED-IN user via the system-wide login-user
+# list (sceUserServiceGetLoginUserIdList), so a payload launch comes up with a
+# valid initial user and no longer crashes SceShellUI (CE-36329-3). Payload launch
+# is therefore the DEFAULT again (hands-off deploy). It still verifies the initial
+# user below and warns if it somehow came up ANONYMOUS (e.g. no user signed in).
+# Set PS4CAST_ICON_LAUNCH=1 to skip the payload and ask for a manual icon launch.
 sleep 4
 (cd dist && python3 -m http.server 8000 --bind "$HOST" >/tmp/h.log 2>&1 &)
 
@@ -152,15 +151,15 @@ wait_up() {  # poll /status up to ~90s for VER; on success check the initial use
   return 1
 }
 
-if [ "${PS4CAST_PAYLOAD_LAUNCH:-0}" = "1" ]; then
-  echo "    PS4CAST_PAYLOAD_LAUNCH=1 -> payload launch (crash-prone, anon user)"
-  send_payload build/ps4cast-launch.bin || true
-  wait_up && exit 0
-  echo "    payload launch didn't come up"
-else
-  echo "    >> Open PS4 Cast from the home-screen ICON now (clean launch, no CE-36329-3)."
+if [ "${PS4CAST_ICON_LAUNCH:-0}" = "1" ]; then
+  echo "    PS4CAST_ICON_LAUNCH=1 -> open PS4 Cast from the home-screen ICON now."
   echo "    waiting up to 90s for it to come up on v$VER…"
   wait_up && exit 0
   echo "    not up yet — open PS4 Cast on the console (icon), it is installed as v$VER"
+else
+  echo "    payload launch (binds signed-in user, clean)…"
+  send_payload build/ps4cast-launch.bin || true
+  wait_up && exit 0
+  echo "    payload launch didn't come up — open PS4 Cast on the console (icon)"
 fi
 exit 0

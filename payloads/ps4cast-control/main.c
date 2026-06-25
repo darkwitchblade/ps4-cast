@@ -422,14 +422,20 @@ int main(void)
     void *usersrv = dlopen("/system/common/lib/libSceUserService.sprx", 0);
     int (*user_init)(OrbisUserServiceInitializeParams *) = dlsym(usersrv, "sceUserServiceInitialize");
     int (*foreground_user)(int *) = dlsym(usersrv, "sceUserServiceGetForegroundUser");
+    int (*login_list)(int *) = dlsym(usersrv, "sceUserServiceGetLoginUserIdList"); // -> { int userId[4]; }
     int (*user_term)(void) = dlsym(usersrv, "sceUserServiceTerminate");
-    int uid = 0;
-    if (user_init && foreground_user && user_term) {
+    int uid = -1;
+    if (user_init && user_term) {
         OrbisUserServiceInitializeParams params = { .priority = ORBIS_KERNEL_PRIO_FIFO_NORMAL };
         user_init(&params);
-        foreground_user(&uid);
+        // Prefer the system-wide LOGIN-user list: it returns the signed-in user even
+        // in this injected payload context, where GetForegroundUser comes back
+        // ANONYMOUS (0xffffffff) -> the launched app then crashed SceShellUI.
+        if (login_list) { int ll[4] = { -1, -1, -1, -1 }; login_list(ll); uid = ll[0]; }
+        if (uid < 0 && foreground_user) foreground_user(&uid);   // fallback
         user_term();
     }
+    if (uid < 0) uid = 0;
 
 #if defined(CONTROL_LAUNCH)
     void *lnc = dlopen("/system/common/lib/libSceLncUtil.sprx", 0);
