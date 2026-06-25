@@ -124,26 +124,43 @@ for i in $(seq 1 12); do
 done
 [ -z "$ok" ] && { echo "INSTALL FAILED (:9090 not accepting). pkg is hosted; install via Remote Pkg Installer: http://$HOST:8000/PS4-Cast-v$VER.pkg"; (cd dist && python3 -m http.server 8000 --bind "$HOST" >/tmp/h.log 2>&1 &); exit 1; }
 
-echo "[5/5] launch after BGFT settle"
-# push-goldhen-dpi.py now returns only after serving the final package byte.
-# Give the shell a short promotion/indexing moment, then launch once. If the
-# title is still settling, the late retry below catches it without payload spam.
+echo "[5/5] launch"
+# IMPORTANT: the GoldHEN :9090 payload launcher (build/ps4cast-launch.bin ->
+# sceLncUtilLaunchApp) binds the app's INITIAL user to ANONYMOUS (0xffffffff)
+# even when a user is signed in, which makes SceShellUI's VideoPlayingChecker
+# crash (CE-36329-3) ~1-in-3 launches and leaves a dialog on the TV. Launching
+# from the home-screen ICON binds the real signed-in user (iu valid) and never
+# crashes. So by DEFAULT we do NOT payload-launch — we ask for an icon launch and
+# wait for it. Set PS4CAST_PAYLOAD_LAUNCH=1 to force the old (crash-prone) path.
 sleep 4
+(cd dist && python3 -m http.server 8000 --bind "$HOST" >/tmp/h.log 2>&1 &)
 
-for round in 1 2; do
-  echo "    launch attempt $round; waiting for ready toast (/status)…"
-  send_payload build/ps4cast-launch.bin || true
+wait_up() {  # poll /status up to ~90s for VER; on success check the initial user
   for j in $(seq 1 30); do
     s=$(curl -sS -m3 "http://$PS4:8080/status" 2>/dev/null)
     if echo "$s" | grep -q "\"ver\":\"$VER\""; then
-      echo "    READY — app open on v$VER"
-      (cd dist && python3 -m http.server 8000 --bind "$HOST" >/tmp/h.log 2>&1 &); echo "DEPLOY OK"; exit 0
+      iu=$(printf '%s' "$s" | sed -n 's/.*iu=0x\([0-9a-fA-F]*\).*/\1/p')
+      if [ "$iu" = "ffffffff" ] || [ -z "$iu" ]; then
+        echo "    READY on v$VER  —  WARNING: initial user is ANONYMOUS (iu=0x${iu:-?}); SceShellUI may have crashed. Prefer an ICON launch."
+      else
+        echo "    READY on v$VER  (iu=0x$iu, clean launch)"
+      fi
+      echo "DEPLOY OK"; return 0
     fi
     sleep 3
   done
-  echo "    not ready yet; waiting for BGFT settle before one retry"
-  sleep 20
-done
-echo "installed but auto-launch didn't take — open PS4 Cast on the console (then it's v$VER)"
-(cd dist && python3 -m http.server 8000 --bind "$HOST" >/tmp/h.log 2>&1 &)
+  return 1
+}
+
+if [ "${PS4CAST_PAYLOAD_LAUNCH:-0}" = "1" ]; then
+  echo "    PS4CAST_PAYLOAD_LAUNCH=1 -> payload launch (crash-prone, anon user)"
+  send_payload build/ps4cast-launch.bin || true
+  wait_up && exit 0
+  echo "    payload launch didn't come up"
+else
+  echo "    >> Open PS4 Cast from the home-screen ICON now (clean launch, no CE-36329-3)."
+  echo "    waiting up to 90s for it to come up on v$VER…"
+  wait_up && exit 0
+  echo "    not up yet — open PS4 Cast on the console (icon), it is installed as v$VER"
+fi
 exit 0
