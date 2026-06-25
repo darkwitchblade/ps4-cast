@@ -46,6 +46,8 @@ static int               g_vstream = -1;
 // flow through the SAME frame queue / sync / scale path as software frames.
 static int               g_useHw = 0;
 static int               g_interlaced = 0;   // source is interlaced -> bob-deinterlace
+static char              g_swDiag[80] = "";   // last channel-switch stage timing (stop/open/probe ms)
+static char              g_stopDiag[64] = ""; // last player_stop breakdown (decode-join / fetch-join / audio-join ms)
 static AVBSFContext     *g_bsf = NULL;
 static AVPacket         *g_hwPkt = NULL;
 // Reorder buffer: the low-delay hardware decoder emits frames in DECODE order,
@@ -140,7 +142,7 @@ static int  g_hlsSegDemux = 0;
 // the single-thread decode-and-present path (the known-good 02.19 behaviour).
 #define PLAYER_DECODE_THREAD 1
 #define FQ_SLOTS 24
-#define HLS_START_FRAMES 16
+#define HLS_START_FRAMES 8     // show the first frame after fewer buffered frames -> faster channel start
 
 typedef struct { AVFrame *frame; } FrameSlot;   // ref-counted clone, presented then freed
 static FrameSlot         g_fq[FQ_SLOTS];
@@ -195,8 +197,17 @@ static int   setup_separate_audio(void);
 static void *audio_thread_main(void *arg);
 
 // ---- custom AVIO: plain file/stream via httpsrc, or HLS via hls ------------
+extern void watchdog_kick(void);       // main.c: pet the freeze watchdog from the main-thread probe
+extern void watchdog_set_busy(int on); // main.c: longer watchdog grace during a slow channel switch
+
 static int avio_read_cb(void *o, uint8_t *buf, int size) {
     (void)o;
+    // During player_play's synchronous demux probe (runs on the main thread,
+    // g_started==0), a slow channel switch can read for many seconds. Pet the
+    // freeze watchdog on each read so a progressing switch isn't killed as a
+    // freeze. Not kicked during playback (g_started==1) so a real main-loop
+    // freeze is still caught.
+    if (!g_started) watchdog_kick();
     int n;
     if (g_isHls) {
         n = hls_read(buf, (uint32_t)size);   // hls tracks its own position
@@ -241,6 +252,7 @@ const char *player_status(void) { return g_status; }
 int player_init(void) { return 0; } // nothing global to set up for ffmpeg
 
 void player_stop(void) {
+    uint64_t st0 = sceKernelGetProcessTime(), stDec = st0, stFetch = st0;
 #if PLAYER_DECODE_THREAD
     if (g_threaded) {
         g_decStop = 1;
@@ -258,7 +270,12 @@ void player_stop(void) {
         scePthreadCondSignal(&g_fqNotEmpty);
         scePthreadMutexUnlock(&g_fqMtx);
         scePthreadJoin(g_decThread, NULL);
+        stDec = sceKernelGetProcessTime();
         seg_readahead_stop();           // join fetch thread, free buffered segs, destroy ring
+        stFetch = sceKernelGetProcessTime();
+        snprintf(g_stopDiag, sizeof(g_stopDiag), "stop dec=%llu fetch=%llu ms",
+                 (unsigned long long)((stDec - st0) / 1000),
+                 (unsigned long long)((stFetch - stDec) / 1000));
         fq_flush();
         scePthreadCondDestroy(&g_fqNotFull);
         scePthreadCondDestroy(&g_fqNotEmpty);
@@ -331,9 +348,13 @@ static int open_sw_video(const AVCodec *dec) {
 }
 
 int player_play(const char *url) {
+    watchdog_set_busy(1);   // teardown + open + probe can run many seconds (esp. off a 1080i SW channel); don't let the freeze watchdog kill the switch
+    uint64_t swt0 = sceKernelGetProcessTime();   // channel-switch stage timing (-> g_swDiag, shown in /status)
     char startUrl[2048];
     snprintf(startUrl, sizeof(startUrl), "%s", url ? url : "");
     player_stop();
+    hls_set_seg_stop_flag(&g_segFetchStop);   // so hls_next_segment's retry loop bails instantly on the next teardown (no more ~30s player_stop)
+    uint64_t swtStop = sceKernelGetProcessTime();
     strncpy(g_playUrl, startUrl, sizeof(g_playUrl) - 1);
     g_playUrl[sizeof(g_playUrl) - 1] = '\0';
     g_pkts = g_frames = g_drops = g_audioPkts = g_videoPkts = 0; g_lastErr = 0; g_lastLagUs = 0;
@@ -343,6 +364,7 @@ int player_play(const char *url) {
     // everything else (mp4/mov/mkv/avi/ts/... over http/https) via httpsrc.
     g_isHls = hls_is_url(startUrl);
     int orc = g_isHls ? hls_open(startUrl) : httpsrc_open(startUrl);
+    uint64_t swtOpen = sceKernelGetProcessTime();
     if (orc != 0) {
         snprintf(g_status, sizeof(g_status), "source: %s", g_isHls ? hls_debug() : httpsrc_debug());
         g_isHls = 0;
@@ -362,8 +384,11 @@ int player_play(const char *url) {
     // Probe further so the audio stream in a concatenated MPEG-TS (HLS) is
     // reliably detected — the default probe can stop before the audio PID and
     // leave HLS playing silently.
-    g_fmt->probesize = 8 * 1024 * 1024;
-    g_fmt->max_analyze_duration = 6 * (int64_t)AV_TIME_BASE;
+    // Keep the demux probe SMALL so channel switching is fast: reading 8MB off a
+    // slow IPTV server meant 15-25s per switch (it fetches several segments). 1MB
+    // / 1.5s still finds the TS video+audio PIDs on normal streams.
+    g_fmt->probesize = 1 * 1024 * 1024;
+    g_fmt->max_analyze_duration = 1500 * (int64_t)(AV_TIME_BASE / 1000);
 
     int rc = avformat_open_input(&g_fmt, "stream", NULL, NULL);
     if (rc < 0) {
@@ -373,6 +398,13 @@ int player_play(const char *url) {
     if (avformat_find_stream_info(g_fmt, NULL) < 0) {
         snprintf(g_status, sizeof(g_status), "no stream info");
         player_stop(); return -3;
+    }
+    {
+        uint64_t swtInfo = sceKernelGetProcessTime();
+        snprintf(g_swDiag, sizeof(g_swDiag), "sw stop=%llu open=%llu info=%llu ms",
+                 (unsigned long long)((swtStop - swt0) / 1000),
+                 (unsigned long long)((swtOpen - swtStop) / 1000),
+                 (unsigned long long)((swtInfo - swtOpen) / 1000));
     }
 
     const AVCodec *dec = NULL;
@@ -458,9 +490,13 @@ int player_play(const char *url) {
     int interlaced = (vpar->field_order == AV_FIELD_TT || vpar->field_order == AV_FIELD_BB ||
                       vpar->field_order == AV_FIELD_TB || vpar->field_order == AV_FIELD_BT);
     g_interlaced = interlaced;   // -> bob-deinterlace in build_scaled (software path)
-    int hwEligible = g_hwEnabled && vpar->codec_id == AV_CODEC_ID_H264 && !interlaced &&
+    // Interlaced H.264 is now hardware-decoded too (sceVideodec2 is not locked to
+    // progressive — optimizeProgressiveVideo=0), and bob-deinterlaced when the NV12
+    // is presented. This keeps heavy 1080i (IPTV) off the CPU-bound software path,
+    // which is what made switching off a 1080i channel slow and watchdog-killable.
+    int hwEligible = g_hwEnabled && vpar->codec_id == AV_CODEC_ID_H264 &&
                      (!g_isHls || g_hlsSegDemux);
-    if (interlaced) notify_dbg("PS4 Cast: interlaced -> software decode + deinterlace");
+    if (interlaced) notify_dbg("PS4 Cast: interlaced -> %s + bob-deinterlace", hwEligible ? "hardware" : "software");
     if (hwEligible) {
         int bsfOk = 1;
         if (!g_isHls) {     // MP4/AVCC source -> convert to annex-b for the decoder
@@ -616,7 +652,13 @@ int player_buffering(void) {
     if (g_threaded) return g_rebuffering;
     return 0;   // single-thread path blocks instead of reporting
 }
-int player_buffer_pct(void) { return g_isHls ? hls_buffer_pct() : httpsrc_fill_pct(); }
+int player_buffer_pct(void) {
+    // On the decode-thread path (HLS seg-demux / live) the real read-ahead is the
+    // decoded-frame queue, not the prefetch ring (which is idle there) — so report
+    // that, otherwise live channels always showed buffer 0%.
+    if (g_threaded) { int p = g_fqCount * 100 / FQ_SLOTS; return p > 100 ? 100 : p; }
+    return g_isHls ? hls_buffer_pct() : httpsrc_fill_pct();
+}
 // Total bytes pulled from the network on the ACTIVE source (HLS or direct HTTP),
 // so the on-screen network-speed stat works on every stream type.
 uint64_t player_rx_total(void) { return g_isHls ? hls_rx_total() : httpsrc_rx_total(); }
@@ -705,14 +747,15 @@ void player_stats(PlayerStats *s) {
 void player_debug(char *out, int len) {
     double ahead = (g_bytesPerSec > 0) ? (double)httpsrc_ahead_bytes() / g_bytesPerSec : 0;
     snprintf(out, len,
-             "ff%s%s%s %dx%d | fr=%ld drop=%ld q=%d/%d ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s",
+             "ff%s%s%s %dx%d | fr=%ld drop=%ld q=%d/%d ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s | %s | %s",
              g_useHw ? "/HW" : "", g_isHls ? (g_hlsSegDemux ? "/hls-seg" : "/hls") : "", g_threaded ? "/T" : "", g_srcW, g_srcH,
              g_frames, g_drops, g_fqCount, FQ_SLOTS, g_srCount, SEG_RING, g_rebufTotal, ahead,
              (long long)(g_lastLagUs / 1000), g_lastErr, vdec_hw_dmem_outstanding() / 1024,
              g_sepAudioMode ? g_aastream : g_astream, g_sepAudioMode ? "/sep" : "",
              (g_sepAudioMode && g_sepAudioEof) ? "/eof" : "",
              audio_debug(),
-             g_isHls ? hls_debug() : httpsrc_debug());
+             g_isHls ? hls_debug() : httpsrc_debug(),
+             g_swDiag, g_stopDiag);
 }
 
 // Convert+scale a decoded frame into g_scaled (BGRA), fitting the display with
@@ -1209,7 +1252,13 @@ static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
         }
     }
 
-    PresentJob job = { fr->data[0], fr->data[1], sw, sh, fr->linesize[0], fr->linesize[1],
+    // Bob-deinterlace the HW decoder's woven interlaced output: feed the scaler
+    // only the TOP field (every other source line, via half height + doubled
+    // pitch) and let it stretch back to full height. scaledW/scaledH were derived
+    // from the FULL frame above, so the aspect ratio is preserved.
+    int jsh = sh, jyp = fr->linesize[0], juvp = fr->linesize[1];
+    if (g_interlaced) { jsh = sh / 2; jyp *= 2; juvp *= 2; }
+    PresentJob job = { fr->data[0], fr->data[1], sw, jsh, jyp, juvp,
                        fb, dw, ox, oy, scaledW, scaledH };
     if (g_pwUp) {
         scePthreadMutexLock(&g_pwMtx);

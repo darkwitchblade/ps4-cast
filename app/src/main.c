@@ -113,6 +113,11 @@ static void install_fatal_handlers(void) {
 // loop stamps a heartbeat each frame; this independent thread force-exits if the
 // heartbeat goes stale, turning an indefinite freeze into an auto clean-close.
 static volatile uint64_t g_heartbeat = 0;
+// Set while a known-slow main-thread operation is running (player_play: tearing
+// down the old pipeline + opening/probing the new stream — esp. switching off a
+// 1080i software/deinterlace channel). The watchdog grants a longer grace then,
+// so a slow-but-progressing channel switch isn't killed as a freeze (CE-34878).
+static volatile int g_wdBusy = 0;
 static void *watchdog_main(void *arg) {
     (void)arg;
     for (;;) {
@@ -120,7 +125,9 @@ static void *watchdog_main(void *arg) {
         uint64_t hb = g_heartbeat;
         if (hb == 0) continue;                            // main loop not running yet
         uint64_t now = sceKernelGetProcessTime();
-        if (now > hb && (now - hb) > 15ULL * 1000 * 1000) { // ~15s with zero progress = frozen
+        uint64_t lim = g_wdBusy ? 35ULL * 1000 * 1000     // mid channel-switch: generous
+                                : 15ULL * 1000 * 1000;    // normal: ~15s with zero progress = frozen
+        if (now > hb && (now - hb) > lim) {
             // Release the display/GPU FIRST so the exit is reclaimable (not
             // unkillable) — do this before the crash-log write, which could
             // itself stall on a frozen /data mount and gate the recovery.
@@ -133,6 +140,22 @@ static void *watchdog_main(void *arg) {
         }
     }
     return NULL;
+}
+
+// Pet the freeze watchdog from a long, legitimately-progressing blocking call on
+// the main thread (e.g. player_play's demux probe while switching channels),
+// so a slow-but-alive stream switch isn't mistaken for a freeze and killed
+// (that was the CE-34878 on channel switching). Only kicks once the loop is
+// running; safe to call from anywhere.
+void watchdog_kick(void) {
+    if (g_heartbeat) g_heartbeat = sceKernelGetProcessTime();
+}
+
+// player_play() calls this(1) at entry; the main loop clears it (0) the moment it
+// resumes, so the longer grace covers exactly the blocking switch and nothing more.
+void watchdog_set_busy(int on) {
+    g_wdBusy = on ? 1 : 0;
+    if (on && g_heartbeat) g_heartbeat = sceKernelGetProcessTime();
 }
 
 #define FB_W 1920
@@ -446,17 +469,18 @@ static void draw_hud(Gfx *g) {
     int W = g->width;
     int barX = 80, barW = W - 160, barH = 6, barY = g->height - 78;
 
-    // title + status (bottom-left, above the scrubber)
+    // title + status (bottom-left, above the scrubber). Bigger + brighter than
+    // before so the status/time read cleanly from the couch.
     char title[160];
     basename_of(httpd_last_push(), title, sizeof(title));
-    stext(g, barX, barY - 96, title, 4, TXT);
-    stext(g, barX, barY - 44, paused ? "Paused" : player_status(), 2, MUT);
+    stext(g, barX, barY - 100, title, 4, TXT);
+    stext(g, barX, barY - 46, paused ? "Paused" : player_status(), 3, TXT);
 
     // play/paused state (right, above the scrubber)
     const char *badge = paused ? "PAUSED" : "PLAYING";
-    int bx = barX + barW - gfx_text_w(badge, 2);
-    gfx_circle(g, bx - 18, barY - 36, 5, paused ? WARN : LIVE);
-    stext(g, bx, barY - 44, badge, 2, paused ? WARN : LIVE);
+    int bx = barX + barW - gfx_text_w(badge, 3);
+    gfx_circle(g, bx - 22, barY - 34, 6, paused ? WARN : LIVE);
+    stext(g, bx, barY - 46, badge, 3, paused ? WARN : LIVE);
 
     if (dur > 0) {
         // seekable VOD: scrubber + times
@@ -469,13 +493,13 @@ static void draw_hud(Gfx *g) {
         char curS[24], durS[24];
         fmt_time(cur, curS, sizeof(curS));
         fmt_time(dur, durS, sizeof(durS));
-        stext(g, barX, barY + 18, curS, 2, MUT);
-        stext(g, barX + barW - gfx_text_w(durS, 2), barY + 18, durS, 2, MUT);
+        stext(g, barX, barY + 18, curS, 3, TXT);
+        stext(g, barX + barW - gfx_text_w(durS, 3), barY + 18, durS, 3, MUT);
     } else {
         // live stream: a thin static accent line + LIVE tag
         gfx_round(g, barX, barY, barW, barH, barH / 2, SURF2);
         gfx_round(g, barX, barY, barW, barH, barH / 2, ACCENT);
-        stext(g, barX, barY + 18, "LIVE", 2, LIVE);
+        stext(g, barX, barY + 18, "LIVE", 3, LIVE);
     }
 }
 
@@ -547,13 +571,13 @@ static void draw_channel_overlay(Gfx *g, int sel) {
 
         char name[96];
         httpd_chan_get(idx, name, sizeof(name), NULL, 0);
-        int maxch = (rw - 170) / 16; if (maxch < 4) maxch = 4;
+        int maxch = (rw - 200) / 24; if (maxch < 4) maxch = 4;   // scale-3 name
         if ((int)strlen(name) > maxch) name[maxch] = '\0';
 
         char num[8]; snprintf(num, sizeof(num), "%d", idx + 1);
         GfxColor numc = seld ? INK : FAINT, nc = seld ? INK : TXT;
-        gfx_text(g, rx + 26, rowY + rowH / 2 - 8, num, 2, numc);
-        gfx_text(g, rx + 104, rowY + rowH / 2 - 8, name, 2, nc);
+        gfx_text(g, rx + 26, rowY + rowH / 2 - 4, num, 2, numc);
+        gfx_text(g, rx + 104, rowY + rowH / 2 - 12, name, 3, nc);
         if (idx == cur) {   // live marker on the tuned channel
             int dx = rx + rw - 40;
             gfx_circle(g, dx, rowY + rowH / 2, 6, seld ? INK : LIVE);
@@ -567,27 +591,23 @@ static void draw_channel_overlay(Gfx *g, int sel) {
 // NO panel/blend behind it — the cheapest possible overlay, can't affect decode.
 static void draw_stats_overlay(Gfx *g, double netBps, int fps) {
     PlayerStats s; player_stats(&s);
-    // Dead simple, like the GoldHEN counters: plain white text in the top-right
-    // corner — no panel, no background, no drop-shadow. Each line is right-aligned
-    // to the same right margin. Minimal compositing so showing it barely touches
-    // fps. Lines are blanked elsewhere via the bar-clear / video overwrite.
-    int rh = 26, ry = 30, rx = g->width - 34;
+    // GoldHEN-style corner counter: white text, top-right, no panel — but with a
+    // subtle drop-shadow (stext draws a dark copy underneath) so it stays readable
+    // over bright/white scenes. Tight line spacing. Right-aligned to one margin.
+    int rh = 22, ry = 28, rx = g->width - 34;
     char b[96];
-    snprintf(b, sizeof(b), "%s %s", s.hw ? "HW" : "SW", s.codec);
-    gfx_text(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh;
-    snprintf(b, sizeof(b), "%dx%d  %d fps", s.w, s.h, fps);
-    gfx_text(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh;
-    if (s.aheadSec > 0.1) snprintf(b, sizeof(b), "buffer %d%%  +%.1fs", s.bufPct, s.aheadSec);
-    else                  snprintf(b, sizeof(b), "buffer %d%%", s.bufPct);
-    gfx_text(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh;
-    if (netBps >= 1e6)      snprintf(b, sizeof(b), "%.1f MB/s", netBps / 1e6);
-    else if (netBps >= 1e3) snprintf(b, sizeof(b), "%.0f KB/s", netBps / 1e3);
-    else                    snprintf(b, sizeof(b), "%.0f B/s", netBps);
-    gfx_text(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh;
-    snprintf(b, sizeof(b), "%s%s", s.hls ? (s.segDemux ? "HLS seg" : "HLS") : "HTTP", s.lan ? " LAN" : "");
-    gfx_text(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh;
-    snprintf(b, sizeof(b), "drops %ld", s.drops);
-    gfx_text(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh;
+    #define STAT(...) do { snprintf(b, sizeof(b), __VA_ARGS__); \
+        stext(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh; } while (0)
+    STAT("%s %s", s.hw ? "HW" : "SW", s.codec);
+    STAT("%dx%d  %d fps", s.w, s.h, fps);
+    if (s.aheadSec > 0.1) STAT("buffer %d%%  +%.1fs", s.bufPct, s.aheadSec);
+    else                  STAT("buffer %d%%", s.bufPct);
+    if (netBps >= 1e6)      STAT("%.1f MB/s", netBps / 1e6);
+    else if (netBps >= 1e3) STAT("%.0f KB/s", netBps / 1e3);
+    else                    STAT("%.0f B/s", netBps);
+    STAT("%s%s", s.hls ? (s.segDemux ? "HLS seg" : "HLS") : "HTTP", s.lan ? " LAN" : "");
+    STAT("drops %ld", s.drops);
+    #undef STAT
 }
 #endif
 
@@ -661,6 +681,7 @@ int main(void) {
 
     while (running) {
         g_heartbeat = sceKernelGetProcessTime();   // pet the freeze watchdog each frame
+        g_wdBusy = 0;                               // loop is alive again -> back to the strict 15s grace
         uint64_t now = sceKernelGetProcessTime();
         uint32_t pressed = pad_poll(&pad);
 

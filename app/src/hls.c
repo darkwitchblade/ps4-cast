@@ -34,6 +34,8 @@ static volatile int g_segGen;     // increments when advancing to the next media
 static volatile int g_resetGen;   // increments when live HLS skips/jumps and player must re-anchor
 static int     g_open;            // a segment is open in httpsrc
 static int     g_active;
+static volatile int *g_segStopFlag = NULL;   // points at the fetch thread's stop flag; checked in hls_next_segment's retry loop
+void hls_set_seg_stop_flag(volatile int *p) { g_segStopFlag = p; }
 static char    g_dbg[360] = "idle";   // holds open errors; live status built in hls_debug
 
 typedef struct {
@@ -1165,6 +1167,10 @@ int hls_next_segment(uint8_t **outBuf, int *outLen, int *outResetGen) {
     if (!g_active || !hls_can_segment_demux()) return -1;
 
     for (;;) {
+        // Bail immediately on teardown. Without this, this retry loop kept
+        // re-fetching during a channel switch (the abort flag is per-fetch and got
+        // re-cleared), so player_stop blocked ~30s waiting for it to give up.
+        if (g_segStopFlag && *g_segStopFlag) return -1;
         if (g_segIdx >= g_segCount) {
             if (!g_isLive) return -1;            // VOD: all segments played -> EOF
             if (refresh_live_playlist() != 0) {

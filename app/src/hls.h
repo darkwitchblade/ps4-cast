@@ -30,6 +30,7 @@ int  hls_at_eof(void);                             // VOD: all segments consumed
 uint64_t hls_rx_total(void);                       // total bytes fetched (stats)
 int  hls_buffer_pct(void);                          // read-ahead fill 0-100
 int  hls_next_segment(uint8_t **outBuf, int *outLen, int *outResetGen);
+void hls_set_seg_stop_flag(volatile int *p);   // fetch thread registers its stop flag so the retry loop bails on teardown
 
 void hls_close(void);
 

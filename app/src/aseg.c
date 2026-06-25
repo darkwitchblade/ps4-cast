@@ -120,17 +120,23 @@ static int resolve_host(void) {
 }
 
 static int tcp_connect(void) {
+    if (g_abort) return -1;                  // already tearing down: don't begin a fresh blocking connect
     int s = sceNetSocket("ps4cast_aseg", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_STREAM, 0);
     if (s < 0) return s;
-    int tmo = 8 * 1000 * 1000;
+    int tmo = 3 * 1000 * 1000;   // 3s (was 8s): a stalled segment read fails fast so a channel switch's player_stop teardown isn't blocked waiting out a long socket timeout
     sceNetSetsockopt(s, ORBIS_NET_SOL_SOCKET, ORBIS_NET_SO_RCVTIMEO, &tmo, sizeof(tmo));
     sceNetSetsockopt(s, ORBIS_NET_SOL_SOCKET, ORBIS_NET_SO_SNDTIMEO, &tmo, sizeof(tmo));
     ps4_sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.len = sizeof(sa); sa.family = ORBIS_NET_AF_INET;
     sa.port = sceNetHtons(g_port); sa.addr = g_addr;
+    // Publish the socket BEFORE the blocking connect so aseg_abort()'s
+    // sceNetSocketAbort(g_sock) can interrupt a slow connect during teardown
+    // (otherwise the connecting socket is invisible to the aborter and a dead
+    // segment server wedges player_stop for ~13s).
+    g_sock = s;
     if (sceNetConnect(s, (const OrbisNetSockaddr *)&sa, sizeof(sa)) < 0) {
-        sceNetSocketClose(s);
+        sceNetSocketClose(s); g_sock = -1;
         return -1;
     }
     return s;
@@ -240,6 +246,7 @@ static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
     uint8_t lead[4096]; int leadLen = 0; long clen = -1;
     int opened = 0;
     for (int hop = 0; hop < 5 && !opened; hop++) {
+        if (g_abort) { conn_close(); g_kaAlive = 0; return -9; }   // bail between redirect hops on teardown
         if (parse_url(cur) != 0) { conn_close(); g_kaAlive = 0; return -1; }
         if (resolve_host() != 0) { conn_close(); g_kaAlive = 0; return -2; }
         // Reuse the kept-alive socket if it's to the same host:port:tls.
