@@ -11,7 +11,15 @@
 
 #define GRAIN        256          // must match the buffer size given to Output
 #define RATE         48000
-#define RING_FRAMES  (RATE * 3)   // 3 seconds of stereo headroom
+// Stereo ring headroom. 3s was too tight: with a large network read-ahead the
+// decode thread races ahead of realtime at stream start and after every seek,
+// pinned g_fill at the cap, and audio_write() then DISCARDED the excess samples
+// (measured on-device: 77440 frames = 1.61s of audio silently lost). That audio
+// never plays, so it desyncs A/V for the rest of the segment and re-triggers on
+// each seek. 8s absorbs the burst so nothing is dropped. Cost: 8*48000*2ch*2B =
+// ~1.5MB. Ring depth does not add A/V latency (the clock tracks output position)
+// and does not slow seeks (audio_flush empties it).
+#define RING_FRAMES  (RATE * 8)
 #define USER_ID_SYSTEM 0xFF       // ORBIS_USER_SERVICE_USER_ID_SYSTEM
 
 static int16_t          *g_pcm;            // ring of stereo frames (2 int16 each)
@@ -178,7 +186,10 @@ void audio_write(const int16_t *interleaved, int nframes) {
     if (!g_ok) return;
     scePthreadMutexLock(&g_amtx);
     for (int i = 0; i < nframes; i++) {
-        if (g_fill >= RING_FRAMES) { g_dropped += nframes - i; break; } // >3s buffered
+        // Ring full -> drop. Any g_dropped > 0 means audio was LOST and A/V will
+        // be desynced by that much, so it should stay 0 in practice (watch the
+        // "drop=" in audio_debug); if it climbs, RING_FRAMES is too small again.
+        if (g_fill >= RING_FRAMES) { g_dropped += nframes - i; break; }
         size_t idx = ((g_head + g_fill) % RING_FRAMES) * 2;
         g_pcm[idx] = interleaved[i*2]; g_pcm[idx+1] = interleaved[i*2+1];
         g_fill++; g_written++;
