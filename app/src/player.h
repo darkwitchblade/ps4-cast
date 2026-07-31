@@ -20,6 +20,7 @@ void player_debug(char *out, int len); // live playback debug state (one line)
 void player_pause(int paused);       // 1 = pause, 0 = resume
 int  player_is_paused(void);
 void player_seek(double seconds);    // absolute position in seconds
+void player_seek_relative(double delta); // relative; accumulates across rapid presses
 void player_progress(double *cur, double *dur); // current/total seconds
 void player_interrupt(void);         // unblock a stuck read so Stop/cast works
 void player_set_hw(int on);          // runtime hardware-decode on/off (A/B testing)

@@ -637,6 +637,15 @@ void player_pause(int paused) {
     audio_pause(g_paused);
 }
 int  player_is_paused(void)   { return g_paused; }
+// Seek by a delta from the PENDING target when one is queued, else from the
+// current position. Rapid R1/L1 presses used to all read g_curSec, which only
+// updates once the decode thread applies the seek — so a second press within
+// that window recomputed the SAME target and was silently a no-op.
+void player_seek_relative(double delta) {
+    double base = g_seekPending ? g_seekTo : g_curSec;
+    player_seek(base + delta);
+}
+
 void player_seek(double seconds) {
     if (seconds < 0) seconds = 0;
     if (g_durSec > 0 && seconds > g_durSec) seconds = g_durSec;

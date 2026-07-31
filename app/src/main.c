@@ -801,12 +801,16 @@ int main(void) {
                 player_pause(!player_is_paused());
                 hudUntil = sceKernelGetProcessTime() + 9000000ULL;
             }
-            if (pressed & ORBIS_PAD_BUTTON_LEFT)  player_seek(cur - 10.0);
-            if (pressed & ORBIS_PAD_BUTTON_RIGHT) player_seek(cur + 10.0);
-            if (pressed & ORBIS_PAD_BUTTON_DOWN)  player_seek(cur - 30.0);
-            if (pressed & ORBIS_PAD_BUTTON_UP)    player_seek(cur + 30.0);
-            if (pressed & ORBIS_PAD_BUTTON_L1)    player_seek(cur - 60.0);
-            if (pressed & ORBIS_PAD_BUTTON_R1)    player_seek(cur + 60.0);
+            // Relative so rapid presses ACCUMULATE. These used to seek from `cur`
+            // (g_curSec), which only updates once the decode thread applies the
+            // seek — so a second press before that recomputed the same target and
+            // did nothing. Tapping R1 three times now jumps +180s, not +60s.
+            if (pressed & ORBIS_PAD_BUTTON_LEFT)  player_seek_relative(-10.0);
+            if (pressed & ORBIS_PAD_BUTTON_RIGHT) player_seek_relative(+10.0);
+            if (pressed & ORBIS_PAD_BUTTON_DOWN)  player_seek_relative(-30.0);
+            if (pressed & ORBIS_PAD_BUTTON_UP)    player_seek_relative(+30.0);
+            if (pressed & ORBIS_PAD_BUTTON_L1)    player_seek_relative(-60.0);
+            if (pressed & ORBIS_PAD_BUTTON_R1)    player_seek_relative(+60.0);
             if (pressed & ORBIS_PAD_BUTTON_SQUARE) { player_seek(0); notify("Restarted from the beginning"); }
             if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
                 player_stop();

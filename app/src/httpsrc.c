@@ -56,7 +56,11 @@ static int      g_leadOff = 0, g_leadLen = 0;
 // through jitter. Seeks flush the ring and reposition the network connection.
 #define RING_CAP   (48 * 1024 * 1024)
 #define RING_CHUNK (256 * 1024)
-#define RING_KEEP_BEHIND (12 * 1024 * 1024)
+// History kept behind the play position. Sized so a back-seek (L1 = -60s) is
+// served from cache instead of forcing a reconnect + rebuffer: 12MB was only
+// ~36s at a typical ~330KB/s stream, so every -60s seek missed. 24MB covers
+// ~72s there, and still leaves ~24MB (~72s) of forward read-ahead in RING_CAP.
+#define RING_KEEP_BEHIND (24 * 1024 * 1024)
 
 static uint8_t           *g_ring;
 static size_t             g_ringHead, g_ringFill;
