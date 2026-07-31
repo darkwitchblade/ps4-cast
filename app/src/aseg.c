@@ -125,7 +125,7 @@ static int tcp_connect(void) {
     if (g_abort) return -1;                  // already tearing down: don't begin a fresh connect
     int s = sceNetSocket("ps4cast_aseg", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_STREAM, 0);
     if (s < 0) return s;
-    int tmo = 3 * 1000 * 1000;
+    int tmo = 2 * 1000 * 1000;   // 2s: caps how long an in-flight segment recv blocks before the teardown abort check breaks it
     sceNetSetsockopt(s, ORBIS_NET_SOL_SOCKET, ORBIS_NET_SO_RCVTIMEO, &tmo, sizeof(tmo));
     sceNetSetsockopt(s, ORBIS_NET_SOL_SOCKET, ORBIS_NET_SO_SNDTIMEO, &tmo, sizeof(tmo));
     ps4_sockaddr_in sa;
@@ -144,7 +144,7 @@ static int tcp_connect(void) {
     int connected = 0;
     uint64_t t0 = sceKernelGetProcessTime();
     sceKernelUsleep(15000);                                        // let the handshake start before probing
-    while (sceKernelGetProcessTime() - t0 < 4ULL * 1000 * 1000) {
+    while (sceKernelGetProcessTime() - t0 < 2500ULL * 1000) {       // ~2.5s connect budget
         if (g_abort) break;
         if (sceNetSend(s, "", 0, 0) >= 0) { connected = 1; break; } // writable -> connected
         sceKernelUsleep(20000);

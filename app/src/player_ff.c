@@ -142,7 +142,7 @@ static int  g_hlsSegDemux = 0;
 // the single-thread decode-and-present path (the known-good 02.19 behaviour).
 #define PLAYER_DECODE_THREAD 1
 #define FQ_SLOTS 24
-#define HLS_START_FRAMES 8     // show the first frame after fewer buffered frames -> faster channel start
+#define HLS_START_FRAMES 5     // show the first frame after fewer buffered frames -> faster channel start
 
 typedef struct { AVFrame *frame; } FrameSlot;   // ref-counted clone, presented then freed
 static FrameSlot         g_fq[FQ_SLOTS];

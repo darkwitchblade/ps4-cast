@@ -48,22 +48,30 @@ const char *audio_debug(void) {
     return b;
 }
 
-double audio_clock(void) { return g_base + (double)g_hwOut / RATE; }
+// A/V master clock = position of the real audio CONTENT handed to the device.
+// It must track g_contentOut, NOT g_hwOut: on every underrun the output thread
+// pads the grain with silence (see the pad in the audio thread), so g_hwOut
+// advances by a full GRAIN while only `avail` frames of actual content played.
+// Clocking video off g_hwOut therefore shifted video permanently AHEAD of the
+// audio you hear, by the total silence inserted — a lip-sync error that could
+// never self-correct and grew at every underrun. It was worst right after a
+// seek, where audio_flush() empties the ring and the refill underruns hard.
+// Using g_contentOut keeps video locked to the audio actually being heard; a
+// genuine audio starvation now stalls the clock (video holds on the last frame)
+// instead of silently desyncing, and the player's rebuffer logic handles that.
+double audio_clock(void) { return g_base + (double)g_contentOut / RATE; }
 int    audio_has_clock(void) { return g_baseSet; }
 int    audio_ok(void)    { return g_ok; }
 
 void audio_set_base(double pts_sec) {
     if (!g_baseSet) {
-        // Anchor to the real audio device timeline. During network/audio
-        // underruns the device still advances by outputting padded silence, and
-        // video must keep following that realtime clock instead of freezing.
-        g_base = pts_sec - (double)g_hwOut / RATE;
+        g_base = pts_sec - (double)g_contentOut / RATE;
         g_baseSet = 1;
     }
 }
 
 void audio_reset_base(double pts_sec) {
-    g_base = pts_sec - (double)g_hwOut / RATE;
+    g_base = pts_sec - (double)g_contentOut / RATE;
     g_baseSet = 1;
 }
 
