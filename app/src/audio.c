@@ -20,6 +20,9 @@
 // ~1.5MB. Ring depth does not add A/V latency (the clock tracks output position)
 // and does not slow seeks (audio_flush empties it).
 #define RING_FRAMES  (RATE * 8)
+// Max silence-padding debt the clock will repay (~150ms). Bounds the correction
+// so a long starvation can't queue a multi-second clock pull-back.
+#define PAD_DEBT_MAX ((uint64_t)(RATE * 150 / 1000))
 #define USER_ID_SYSTEM 0xFF       // ORBIS_USER_SERVICE_USER_ID_SYSTEM
 
 static int16_t          *g_pcm;            // ring of stereo frames (2 int16 each)
@@ -38,6 +41,8 @@ static volatile int      g_baseSet = 0;
 static volatile int      g_paused = 0;
 static int               g_initRc = -999, g_openRc = -999, g_volRc = -999;
 static long              g_written = 0, g_dropped = 0, g_underruns = 0;
+static volatile uint64_t g_padComp = 0;   // frames of silence padding cancelled out of the clock (drift removed)
+static volatile uint64_t g_padDebt = 0;   // padding not yet repaid (repaid gradually once audio flows again)
 
 const char *audio_debug(void) {
     static char b[180];
@@ -48,25 +53,26 @@ const char *audio_debug(void) {
         scePthreadMutexUnlock(&g_amtx);
     }
     snprintf(b, sizeof(b),
-             "ao init=%d open=%d vol=%d ok=%d pause=%d fill=%ums wr=%ld drop=%ld und=%ld out=%llums hw=%llums",
+             "ao init=%d open=%d vol=%d ok=%d pause=%d fill=%ums wr=%ld drop=%ld und=%ld out=%llums hw=%llums comp=%llums",
              g_initRc, g_openRc, g_volRc, g_ok, g_paused,
              (unsigned)(fill * 1000 / RATE), g_written, g_dropped, g_underruns,
              (unsigned long long)(g_contentOut * 1000 / RATE),
-             (unsigned long long)(g_hwOut * 1000 / RATE));
+             (unsigned long long)(g_hwOut * 1000 / RATE),
+             (unsigned long long)(g_padComp * 1000 / RATE));
     return b;
 }
 
-// A/V master clock, anchored to the audio DEVICE timeline (g_hwOut).
+// A/V master clock, anchored to the audio DEVICE timeline (g_hwOut) so it always
+// advances in realtime and can never stall playback. Silence padding would
+// otherwise walk it ahead of the audio actually heard, so the output thread
+// cancels that out by pulling g_base back per padded partial grain (see there).
 //
-// NOTE: g_hwOut includes the silence the output thread pads a short grain with,
-// so accumulated padding does shift video slightly ahead of the audio actually
-// heard (measured ~176ms after many underruns). A previous attempt clocked this
-// off g_contentOut instead to remove that drift — DO NOT do that naively: after
-// a seek, audio_flush() empties the ring and (on a slow refill) no content
-// reaches the device, so g_contentOut stops, the clock freezes and VIDEO FREEZES
-// PERMANENTLY. Reverted for that reason. A correct content-based clock needs a
-// starvation fallback (e.g. drop to the wall clock while the ring is dry) before
-// it is safe; the padding drift is the lesser evil until then.
+// DO NOT "simplify" this to g_contentOut. That was tried (v03.61) and deadlocks:
+// the decode thread blocks once the video queue is full, so it stops producing
+// audio; with a pure content clock the clock then never advances, no frame is
+// ever presented, the queue never drains — video froze permanently after a seek.
+// The device timeline + per-grain base compensation gives the same accuracy
+// without that failure mode.
 double audio_clock(void) { return g_base + (double)g_hwOut / RATE; }
 int    audio_has_clock(void) { return g_baseSet; }
 int    audio_ok(void)    { return g_ok; }
@@ -95,6 +101,12 @@ void audio_flush(void) {
     g_hwOut = 0;
     g_base = 0;
     g_baseSet = 0;
+    // The timeline is re-anchored after a flush (seek/new stream), so any padding
+    // debt from before it is meaningless. Clearing it is essential: leaving it
+    // made the clock repay a phantom multi-second debt forever, dragging video
+    // seconds BEHIND audio.
+    g_padDebt = 0;
+    g_padComp = 0;
     scePthreadMutexUnlock(&g_amtx);
 }
 
@@ -130,7 +142,34 @@ static void *audio_main(void *arg) {
         // clock — otherwise it runs ahead during the hold and every refilled video
         // frame is "late" on resume, dumping the whole queue (mass drops).
         if (!g_paused) {
-            if (avail < GRAIN) g_underruns++;
+            if (avail < GRAIN) {
+                // Short grain: the rest was padded with silence, i.e. device time
+                // carrying no content. Record it as DEBT rather than correcting the
+                // clock now — the clock must keep advancing on device time while
+                // audio is absent. (Freezing it is what deadlocked v03.61: the
+                // decode thread blocks on a full video queue, so it stops producing
+                // audio, so a content-based clock never advances, so no frame is
+                // ever presented and the queue never drains -> video frozen.)
+                g_underruns++;
+                g_padDebt += (uint64_t)(GRAIN - avail);
+                // CAP the debt. This is meant to absorb small padding artifacts,
+                // not a genuine multi-second starvation (e.g. the refill after a
+                // seek), where the audio timeline really did skip and re-anchoring
+                // handles it. Without a cap, a 4s starve queued a 4s correction
+                // that dragged video seconds behind audio.
+                if (g_padDebt > PAD_DEBT_MAX) g_padDebt = PAD_DEBT_MAX;
+            } else if (g_padDebt > 0) {
+                // Audio is flowing again: repay the debt a little per grain so the
+                // clock slides back into alignment with the audio actually heard.
+                // Paid gradually (not as one step) so video re-syncs smoothly
+                // instead of jumping and dumping the frame queue as "late".
+                // ~16 frames/grain = 0.33ms per 5.33ms grain, so a typical ~128ms
+                // startup burst is absorbed in ~2s and never becomes permanent.
+                uint64_t step = g_padDebt < 16 ? g_padDebt : 16;
+                g_base -= (double)step / RATE;
+                g_padDebt -= step;
+                g_padComp += step;
+            }
             g_contentOut += (uint64_t)avail;
             g_hwOut += GRAIN;
         }
@@ -147,7 +186,7 @@ int audio_open(void) {
     if (g_devUp && g_handle >= 0) {
         scePthreadMutexLock(&g_amtx);
         g_head = g_fill = 0; g_contentOut = 0; g_hwOut = 0; g_base = 0; g_baseSet = 0; g_paused = 0;
-        g_written = g_dropped = g_underruns = 0;
+        g_written = g_dropped = g_underruns = 0; g_padComp = 0; g_padDebt = 0;
         g_ok = 1;
         scePthreadCondSignal(&g_acond);
         scePthreadMutexUnlock(&g_amtx);
@@ -167,7 +206,7 @@ int audio_open(void) {
     g_pcm = malloc(sizeof(int16_t) * 2 * RING_FRAMES);
     if (!g_pcm) { sceAudioOutClose(g_handle); g_handle = -1; return -1; }
     g_head = g_fill = 0; g_contentOut = 0; g_hwOut = 0; g_base = 0; g_baseSet = 0; g_paused = 0; g_astop = 0;
-    g_written = g_dropped = g_underruns = 0;
+    g_written = g_dropped = g_underruns = 0; g_padComp = 0; g_padDebt = 0;
     g_ok = 1;
     scePthreadMutexInit(&g_amtx, NULL, "ps4cast_a");
     scePthreadCondInit(&g_acond, NULL, "ps4cast_ac");
