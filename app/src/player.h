@@ -27,6 +27,8 @@ int  player_hw_enabled(void);        // current hardware-decode toggle state
 int  player_buffering(void);         // 1 = playing but waiting on data (stalled)
 int  player_buffer_pct(void);        // read-ahead buffer level, 0-100
 uint64_t player_rx_total(void);      // total network bytes pulled (active source)
+void player_set_avsync(int ms);      // +ms delays video (video-ahead), -ms advances it
+int  player_get_avsync(void);        // current A/V sync trim, ms
 
 // Live playback telemetry for the on-screen stats overlay.
 typedef struct {

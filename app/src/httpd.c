@@ -814,11 +814,11 @@ static void handle_client(OrbisNetId c) {
         double cur = 0, dur = 0;
         player_progress(&cur, &dur);
         int j = snprintf(json, sizeof(json),
-                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"diag\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d,\"debug\":%d,\"chan_n\":%d,\"chan_cur\":%d,\"buf\":%d,\"rx\":%llu,\"sys\":\"%s\",\"fps\":%d}",
+                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"diag\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d,\"debug\":%d,\"chan_n\":%d,\"chan_cur\":%d,\"buf\":%d,\"rx\":%llu,\"sys\":\"%s\",\"fps\":%d,\"avsync\":%d}",
                          APP_VER, jb_result(), goldhen_status(), player_status(), ssdp_status(),
                          active, player_is_paused(), (int)(cur + 0.5), (int)(dur + 0.5), g_last_push, dbg, pad_diag_get(),
                          player_hw_enabled(), notify_get_debug(), g_chanN, g_chanCur,
-                         player_buffer_pct(), (unsigned long long)player_rx_total(), sys_diag_get(), sys_get_fps());
+                         player_buffer_pct(), (unsigned long long)player_rx_total(), sys_diag_get(), sys_get_fps(), player_get_avsync());
         send_response(c, "200 OK", "application/json", json, j);
         return;
     }
@@ -840,6 +840,13 @@ static void handle_client(OrbisNetId c) {
 
     // Toggle the hardware-decode fast path at runtime (A/B testing vs software).
     // POST /hwdecode body "0"/"1"; takes effect on the next cast.
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/avsync") == 0) {
+        player_set_avsync(atoi(body));
+        char m[48]; int n = snprintf(m, sizeof(m), "avsync %dms", player_get_avsync());
+        send_response(c, "200 OK", "text/plain", m, n);
+        return;
+    }
+
     if (strcmp(method, "POST") == 0 && strcmp(path, "/hwdecode") == 0) {
         int on = (body[0] != '0');
         player_set_hw(on);

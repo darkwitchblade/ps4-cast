@@ -47,6 +47,12 @@ static int               g_vstream = -1;
 static int               g_useHw = 0;
 static int               g_interlaced = 0;   // source is interlaced -> bob-deinterlace
 static char              g_swDiag[80] = "";   // last channel-switch stage timing (stop/open/probe ms)
+// Manual A/V sync trim, milliseconds. POSITIVE delays VIDEO (use when video runs
+// ahead of the sound you hear); negative advances it. Corrects the fixed offset
+// our clock cannot see: the audio device's own buffering plus the TV's video
+// processing/soundbar delay downstream of "handed to the device". Every serious
+// player exposes this because it is not measurable from inside the app.
+static volatile int      g_avSyncMs = 0;
 static char              g_stopDiag[64] = ""; // last player_stop breakdown (decode-join / fetch-join / audio-join ms)
 static AVBSFContext     *g_bsf = NULL;
 static AVPacket         *g_hwPkt = NULL;
@@ -661,6 +667,9 @@ int player_buffer_pct(void) {
 }
 // Total bytes pulled from the network on the ACTIVE source (HLS or direct HTTP),
 // so the on-screen network-speed stat works on every stream type.
+void player_set_avsync(int ms) { if (ms < -2000) ms = -2000; if (ms > 2000) ms = 2000; g_avSyncMs = ms; }
+int  player_get_avsync(void) { return g_avSyncMs; }
+
 uint64_t player_rx_total(void) { return g_isHls ? hls_rx_total() : httpsrc_rx_total(); }
 
 void player_progress(double *cur, double *dur) {
@@ -1631,7 +1640,7 @@ static int render_threaded(Gfx *g) {
 
     int useAudio = (g_haveAudio && audio_ok() && audio_has_clock() && !(g_sepAudioMode && g_sepAudioEof));
     int64_t clock;
-    if (useAudio) clock = (int64_t)(audio_clock() * 1000000.0);
+    if (useAudio) clock = (int64_t)(audio_clock() * 1000000.0) - (int64_t)g_avSyncMs * 1000;
     else { uint64_t now = sceKernelGetProcessTime(); clock = g_gotFrame ? ((int64_t)(now - g_startProc) + g_startPts) : 0; }
 
     AVFrame *show = NULL; int64_t showPts = 0;
@@ -1743,7 +1752,7 @@ int player_render(Gfx *g) {
         } else {
             // lag (us) > 0 = video is behind the master clock.
             int64_t lag;
-            if (useAudio) lag = (int64_t)(audio_clock() * 1000000.0) - ptsUs;
+            if (useAudio) lag = (int64_t)(audio_clock() * 1000000.0) - (int64_t)g_avSyncMs * 1000 - ptsUs;
             else          lag = (int64_t)sceKernelGetProcessTime() - ((int64_t)g_startProc + (ptsUs - g_startPts));
             g_lastLagUs = lag;
 
