@@ -48,30 +48,33 @@ const char *audio_debug(void) {
     return b;
 }
 
-// A/V master clock = position of the real audio CONTENT handed to the device.
-// It must track g_contentOut, NOT g_hwOut: on every underrun the output thread
-// pads the grain with silence (see the pad in the audio thread), so g_hwOut
-// advances by a full GRAIN while only `avail` frames of actual content played.
-// Clocking video off g_hwOut therefore shifted video permanently AHEAD of the
-// audio you hear, by the total silence inserted — a lip-sync error that could
-// never self-correct and grew at every underrun. It was worst right after a
-// seek, where audio_flush() empties the ring and the refill underruns hard.
-// Using g_contentOut keeps video locked to the audio actually being heard; a
-// genuine audio starvation now stalls the clock (video holds on the last frame)
-// instead of silently desyncing, and the player's rebuffer logic handles that.
-double audio_clock(void) { return g_base + (double)g_contentOut / RATE; }
+// A/V master clock, anchored to the audio DEVICE timeline (g_hwOut).
+//
+// NOTE: g_hwOut includes the silence the output thread pads a short grain with,
+// so accumulated padding does shift video slightly ahead of the audio actually
+// heard (measured ~176ms after many underruns). A previous attempt clocked this
+// off g_contentOut instead to remove that drift — DO NOT do that naively: after
+// a seek, audio_flush() empties the ring and (on a slow refill) no content
+// reaches the device, so g_contentOut stops, the clock freezes and VIDEO FREEZES
+// PERMANENTLY. Reverted for that reason. A correct content-based clock needs a
+// starvation fallback (e.g. drop to the wall clock while the ring is dry) before
+// it is safe; the padding drift is the lesser evil until then.
+double audio_clock(void) { return g_base + (double)g_hwOut / RATE; }
 int    audio_has_clock(void) { return g_baseSet; }
 int    audio_ok(void)    { return g_ok; }
 
 void audio_set_base(double pts_sec) {
     if (!g_baseSet) {
-        g_base = pts_sec - (double)g_contentOut / RATE;
+        // Anchor to the real audio device timeline. During network/audio
+        // underruns the device still advances by outputting padded silence, and
+        // video must keep following that realtime clock instead of freezing.
+        g_base = pts_sec - (double)g_hwOut / RATE;
         g_baseSet = 1;
     }
 }
 
 void audio_reset_base(double pts_sec) {
-    g_base = pts_sec - (double)g_contentOut / RATE;
+    g_base = pts_sec - (double)g_hwOut / RATE;
     g_baseSet = 1;
 }
 
