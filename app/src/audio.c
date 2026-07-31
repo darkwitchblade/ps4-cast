@@ -20,9 +20,17 @@
 // ~1.5MB. Ring depth does not add A/V latency (the clock tracks output position)
 // and does not slow seeks (audio_flush empties it).
 #define RING_FRAMES  (RATE * 8)
-// Max silence-padding debt the clock will repay (~150ms). Bounds the correction
-// so a long starvation can't queue a multi-second clock pull-back.
-#define PAD_DEBT_MAX ((uint64_t)(RATE * 150 / 1000))
+// Max silence-padding debt the clock will repay. Bounds the correction so a long
+// starvation can't queue a multi-second clock pull-back.
+//
+// 150ms proved too tight: the starvation right after a seek generates ~228ms of
+// padding, so only 150ms was repayable and a ~78ms residual desync survived every
+// seek (measured). 500ms covers that with margin. Safe at this size only because
+// audio_flush() now clears the debt on seek/new-stream — the runaway that dragged
+// video seconds behind was an UNCLEARED debt, not a large one. Repayment is
+// gradual (16 frames/grain, ~6% of realtime), so even a full 500ms slides back
+// over ~8s and stays imperceptible.
+#define PAD_DEBT_MAX ((uint64_t)(RATE * 500 / 1000))
 #define USER_ID_SYSTEM 0xFF       // ORBIS_USER_SERVICE_USER_ID_SYSTEM
 
 static int16_t          *g_pcm;            // ring of stereo frames (2 int16 each)
@@ -108,6 +116,14 @@ void audio_flush(void) {
     g_padDebt = 0;
     g_padComp = 0;
     scePthreadMutexUnlock(&g_amtx);
+}
+
+unsigned audio_fill_ms(void) {
+    if (!g_ok) return 0;
+    scePthreadMutexLock(&g_amtx);
+    size_t f = g_fill;
+    scePthreadMutexUnlock(&g_amtx);
+    return (unsigned)(f * 1000 / RATE);
 }
 
 void audio_pause(int paused) {

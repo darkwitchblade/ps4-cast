@@ -1309,6 +1309,18 @@ static void *decode_thread_main(void *arg) {
             }
         }
 
+        // Backpressure on the AUDIO ring. Without this the decode thread races
+        // ahead (it is only gated by the video queue), fills the ring and
+        // audio_write() DISCARDS the overflow — measured 0.70s of audio lost even
+        // with an 8s ring, which desyncs A/V permanently. Waiting instead keeps
+        // every sample. Bounded (~1s) and honours stop/seek so it can never
+        // deadlock the way a frozen clock did in v03.61.
+        for (int aguard = 0; aguard < 200; aguard++) {
+            if (g_decStop || g_seekPending || g_paused) break;
+            if (audio_fill_ms() < 6000) break;      // 6s of 8s ring: plenty of headroom
+            sceKernelUsleep(5000);
+        }
+
         int rc = av_read_frame(g_fmt, g_pkt);
         if (rc < 0) {
             if (g_useHw && g_roN > 0) ro_drain();   // flush remaining reordered frames
