@@ -21,6 +21,13 @@
 
 static char  **g_segs;            // resolved absolute segment URLs
 static int     g_segCount;
+// RFC 8216: #EXT-X-DISCONTINUITY marks a change in encoding/timestamps/track
+// layout. Segments after one must be decoded against fresh decoder + clock
+// state, otherwise stale references and timestamps corrupt playback. Flag the
+// segment that FOLLOWS the tag so the seg-demux path can bump the reset
+// generation exactly there.
+static unsigned char g_segDisc[HLS_MAX_SEGMENTS];
+static int     g_pendDisc;        // next segment starts a discontinuity
 static int     g_segIdx;          // current segment being read
 static char   *g_initSeg;         // fMP4 init segment URL (EXT-X-MAP), or NULL
 static int     g_initPending;     // 1 = init segment still to be streamed first
@@ -666,6 +673,7 @@ static int parse_media(char *body, const char *base) {
     g_isLive = strstr(body, "#EXT-X-ENDLIST") ? 0 : 1;
     g_targetDurMs = 3000;
     g_mediaSeq = 0;
+    g_pendDisc = 0;
 
     char resolved[2048];
     char *save = NULL;
@@ -680,6 +688,7 @@ static int parse_media(char *body, const char *base) {
             }
             const char *ms = strstr(line, "#EXT-X-MEDIA-SEQUENCE:");
             if (ms) g_mediaSeq = atoi(ms + 22);
+            if (strstr(line, "#EXT-X-DISCONTINUITY")) g_pendDisc = 1;
             // fMP4 init segment.
             const char *map = strstr(line, "#EXT-X-MAP:");
             if (map) {
@@ -703,7 +712,7 @@ static int parse_media(char *body, const char *base) {
         if (g_segCount >= HLS_MAX_SEGMENTS) break;
         resolve_url(base, line, resolved, sizeof(resolved));
         g_segs[g_segCount] = strdup(resolved);
-        if (g_segs[g_segCount]) g_segCount++;
+        if (g_segs[g_segCount]) { g_segDisc[g_segCount] = (unsigned char)g_pendDisc; g_pendDisc = 0; g_segCount++; }
     }
     return g_segCount > 0 ? 0 : -1;
 }
@@ -1193,6 +1202,13 @@ int hls_next_segment(uint8_t **outBuf, int *outLen, int *outResetGen) {
             g_memSeg = -1;
             g_segIdx++;
             g_segGen++;
+            // A segment flagged EXT-X-DISCONTINUITY needs fresh decoder/clock
+            // state; the reset generation is what the player re-anchors on.
+            if (g_segDisc[seg]) {
+                g_resetGen++;
+                if (outResetGen) *outResetGen = g_resetGen;
+                trace_mark("hls discontinuity at seg=%d -> reset=%d", seg, g_resetGen);
+            }
             trace_mark("hls segdemux take next_idx=%d/%d gen=%d reset=%d", g_segIdx, g_segCount, g_segGen, g_resetGen);
             return 0;
         }
