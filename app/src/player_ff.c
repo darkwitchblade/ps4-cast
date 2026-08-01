@@ -422,6 +422,11 @@ int player_play(const char *url) {
     // device never opened). 4MB/4s finds the audio PID on these streams while
     // keeping switches quick. Probe reads pet the watchdog, so a longer probe
     // cannot trip the freeze detector.
+    // 4MB/4s. Measured: shrinking this to 2MB/2.5s did NOT speed up launch
+    // (probe 2165ms -> 2315ms) because the probe is bound by DOWNLOADING ~2s of
+    // stream, not by these ceilings — so the smaller value bought nothing and only
+    // raised the risk of missing the audio PID (1MB did exactly that: silent HLS).
+    // Launch latency has to be attacked by prefetching data, not by trimming here.
     g_fmt->probesize = 4 * 1024 * 1024;
     g_fmt->max_analyze_duration = 4 * (int64_t)AV_TIME_BASE;
 

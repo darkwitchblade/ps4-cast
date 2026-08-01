@@ -231,11 +231,13 @@ static int resolve_host(void) {
     if (pool < 0) return -1;
     OrbisNetId rid = sceNetResolverCreate("ps4cast_res", pool, 0);
     if (rid < 0) return -2;
-    // 3s x1 try, NOT 8s x3. A dead/slow host could burn up to 24s here — and this
-    // runs before the fetch budget can bail — so two resolves in one hls_open
-    // (master + variant) exceeded the 35s channel-switch watchdog grace on their
-    // own and fail-closed the app while zapping past unreachable channels.
-    int rc = sceNetResolverStartNtoa(rid, g_host, &a, 3 * 1000 * 1000, 1, 0);
+    // 4s x2 (max 8s), not the original 8s x3 (24s) and not 3s x1. 24s ran before
+    // the fetch budget could bail and blew the channel-switch watchdog grace, but
+    // a single 3s try was too strict the other way: it failed on hosts that
+    // resolve fine (a channel whose server answers in 0.4s from a PC reported
+    // "hls fetch failed" on console). Two tries with a sane timeout covers a
+    // transient DNS hiccup while staying well inside the grace.
+    int rc = sceNetResolverStartNtoa(rid, g_host, &a, 4 * 1000 * 1000, 2, 0);
     sceNetResolverDestroy(rid);
     if (rc < 0) return -3;
     g_addr = a.s_addr;
