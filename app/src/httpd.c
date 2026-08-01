@@ -1206,6 +1206,94 @@ static void handle_client(OrbisNetId c) {
         scePthreadMutexLock(&g_mtx); int n = json_list(j, sizeof(j), g_fav, g_favN); scePthreadMutexUnlock(&g_mtx);
         send_response(c, "200 OK", "application/json", j, n); return;
     }
+    // ---- channel list management (web UI) ---------------------------------
+    // GET /channels -> [{i,n,g,u,f},...] so the phone/browser can manage the
+    // list, which is far easier than editing it with a gamepad.
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/channels") == 0) {
+        static char j[96 * 1024];
+        scePthreadMutexLock(&g_mtx);
+        int o = 0; j[o++] = '[';
+        for (int i = 0; i < g_chanN && o < (int)sizeof(j) - 1600; i++) {
+            if (i) j[o++] = ',';
+            o += snprintf(j + o, sizeof(j) - o, "{\"i\":%d,\"n\":", i);
+            json_str(j, sizeof(j), &o, g_chanName[i], CHAN_NAME_MAX);
+            o += snprintf(j + o, sizeof(j) - o, ",\"g\":");
+            json_str(j, sizeof(j), &o, g_chanGroup[i], CHAN_GRP_MAX);
+            o += snprintf(j + o, sizeof(j) - o, ",\"u\":");
+            json_str(j, sizeof(j), &o, g_chanUrl[i], 1000);
+            o += snprintf(j + o, sizeof(j) - o, ",\"f\":%d}", g_chanFav[i] ? 1 : 0);
+        }
+        j[o++] = ']';
+        scePthreadMutexUnlock(&g_mtx);
+        send_response(c, "200 OK", "application/json", j, o); return;
+    }
+    // POST /channel/add   body: name\tgroup\turl
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/channel/add") == 0) {
+        char b[URL_MAX + CHAN_NAME_MAX + CHAN_GRP_MAX + 8];
+        strncpy(b, body, sizeof(b) - 1); b[sizeof(b) - 1] = 0;
+        for (int i = (int)strlen(b) - 1; i >= 0 && (b[i]=='\r'||b[i]=='\n'); i--) b[i] = 0;
+        char *t1 = strchr(b, '\t'), *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
+        if (!t1 || !t2) { send_response(c, "400 Bad Request", "text/plain", "need name\tgroup\turl", 20); return; }
+        *t1 = 0; *t2 = 0;
+        scePthreadMutexLock(&g_mtx);
+        chan_add(b, t1 + 1, t2 + 1);
+        scePthreadMutexUnlock(&g_mtx);
+        chan_save_file();
+        send_response(c, "200 OK", "text/plain", "ok", 2); return;
+    }
+    // POST /channel/edit  body: index\tname\tgroup\turl
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/channel/edit") == 0) {
+        char b[URL_MAX + CHAN_NAME_MAX + CHAN_GRP_MAX + 16];
+        strncpy(b, body, sizeof(b) - 1); b[sizeof(b) - 1] = 0;
+        for (int i = (int)strlen(b) - 1; i >= 0 && (b[i]=='\r'||b[i]=='\n'); i--) b[i] = 0;
+        char *t1 = strchr(b, '\t'); if (!t1) goto edit_bad; *t1 = 0;
+        char *t2 = strchr(t1 + 1, '\t'); if (!t2) goto edit_bad; *t2 = 0;
+        char *t3 = strchr(t2 + 1, '\t'); if (!t3) goto edit_bad; *t3 = 0;
+        {
+            int idx = atoi(b);
+            scePthreadMutexLock(&g_mtx);
+            if (idx >= 0 && idx < g_chanN) {
+                strncpy(g_chanName[idx], t1 + 1, CHAN_NAME_MAX - 1); g_chanName[idx][CHAN_NAME_MAX-1] = 0;
+                strncpy(g_chanGroup[idx], t2 + 1, CHAN_GRP_MAX - 1); g_chanGroup[idx][CHAN_GRP_MAX-1] = 0;
+                strncpy(g_chanUrl[idx], t3 + 1, URL_MAX - 1);        g_chanUrl[idx][URL_MAX-1] = 0;
+            }
+            filter_rebuild();
+            scePthreadMutexUnlock(&g_mtx);
+            chan_save_file();
+            send_response(c, "200 OK", "text/plain", "ok", 2); return;
+        }
+    edit_bad:
+        send_response(c, "400 Bad Request", "text/plain", "need i\tname\tgroup\turl", 23); return;
+    }
+    // POST /channel/del   body: index   (empty body = clear the whole list)
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/channel/del") == 0) {
+        scePthreadMutexLock(&g_mtx);
+        if (!body[0] || body[0] == '\n') { g_chanN = 0; g_chanCur = -1; }
+        else {
+            int idx = atoi(body);
+            if (idx >= 0 && idx < g_chanN) {
+                for (int i = idx; i < g_chanN - 1; i++) {
+                    memcpy(g_chanName[i], g_chanName[i+1], CHAN_NAME_MAX);
+                    memcpy(g_chanGroup[i], g_chanGroup[i+1], CHAN_GRP_MAX);
+                    memcpy(g_chanUrl[i], g_chanUrl[i+1], URL_MAX);
+                    g_chanFav[i] = g_chanFav[i+1];
+                }
+                g_chanN--;
+                if (g_chanCur == idx) g_chanCur = -1;
+                else if (g_chanCur > idx) g_chanCur--;
+            }
+        }
+        filter_rebuild();
+        scePthreadMutexUnlock(&g_mtx);
+        chan_save_file();
+        send_response(c, "200 OK", "text/plain", "ok", 2); return;
+    }
+    // POST /channel/fav   body: index   (toggles)
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/channel/fav") == 0) {
+        httpd_chan_toggle_fav(atoi(body));
+        send_response(c, "200 OK", "text/plain", "ok", 2); return;
+    }
+
     // Continue Watching: saved resume positions [{u,p,d},...], most recent first.
     if (strcmp(method, "GET") == 0 && strcmp(path, "/resume") == 0) {
         static char j[MAX_RESUME * (URL_MAX + 32) + 16];
