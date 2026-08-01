@@ -1,6 +1,8 @@
 #include "tls.h"
 
-// NOTE: deliberately NO watchdog_kick() in ll_read/ll_write. g_heartbeat means
+extern void watchdog_kick(void);
+
+// NOTE: deliberately NO unconditional watchdog_kick() in ll_read/ll_write. g_heartbeat means
 // "the main render loop is alive"; kicking it from the read-ahead / audio threads
 // lets a frozen main loop look healthy forever, and puts a syscall on the
 // per-record streaming path (measured: playback stopped being smooth). The
@@ -39,6 +41,14 @@ struct tls_ctx {
     br_x509_minimal_context xdummy;
     br_sslio_context io;
     int sock;
+    // Absolute deadline (sceKernelGetProcessTime units) for reads, or 0 = none.
+    // BearSSL loops inside br_sslio_read until a whole TLS record is assembled, so
+    // a server that TRICKLES record bytes keeps ll_read returning >0 and never
+    // returns control to the caller's budget check -- an unbounded block inside a
+    // single conn_read ("HANG stale=36s at=aseg/body-eof"). Only aseg arms this;
+    // httpsrc leaves it 0 and pays no clock syscall on the video path.
+    uint64_t rdDeadline;
+    unsigned rdTick;
     unsigned char iobuf[BR_SSL_BUFSIZE_BIDI];
     struct {
         const br_x509_class *vtable;
@@ -103,22 +113,62 @@ static const br_x509_class accept_x509_vtable = {
 
 // --- low-level I/O over the OrbisNet socket --------------------------------
 static int ll_read(void *ctx, unsigned char *buf, size_t len) {
-    int s = *(int *)ctx;
-    int n = sceNetRecv(s, buf, len, 0);
-    if (n <= 0) return -1;
-    return n;
+    tls_ctx *t = (tls_ctx *)ctx;
+    // Check EVERY call when armed. Sampling every 16th call was useless here: each
+    // call can block for the 2s socket timeout and still return a byte on a
+    // trickling peer, so the first check came 16*2s = 32s in -- the ~36s the
+    // watchdog kept catching. These calls already block on the network, so a clock
+    // read per call is free; and only aseg arms a deadline, so the video streaming
+    // path (httpsrc) still pays nothing and stays smooth.
+    // Deadline armed (aseg) => its socket is non-blocking, so poll with our own
+    // bound. Unarmed (httpsrc video path) => blocking socket, behave exactly as
+    // before: no clock syscall, no poll loop, no change to streaming smoothness.
+    if (!t->rdDeadline) {
+        int n = sceNetRecv(t->sock, buf, len, 0);
+        if (n <= 0) return -1;
+        return n;
+    }
+    uint64_t t0 = sceKernelGetProcessTime();
+    for (;;) {
+        int n = sceNetRecv(t->sock, buf, len, 0);
+        if (n > 0) return n;
+        if (n == 0) return -1;                                   // EOF mid-record
+        uint64_t now = sceKernelGetProcessTime();
+        if (now > t->rdDeadline || now - t0 > 4ULL * 1000 * 1000) return -1;
+        watchdog_kick();
+        sceKernelUsleep(3000);
+    }
 }
 static int ll_write(void *ctx, const unsigned char *buf, size_t len) {
-    int s = *(int *)ctx;
+    tls_ctx *tc = (tls_ctx *)ctx;
+    int s = tc->sock;
+    if (tc->rdDeadline) {
+        uint64_t t0 = sceKernelGetProcessTime();
+        for (;;) {
+            int n = sceNetSend(s, buf, len, 0);
+            if (n > 0) return n;
+            uint64_t now = sceKernelGetProcessTime();
+            if (now > tc->rdDeadline || now - t0 > 4ULL * 1000 * 1000) return -1;
+            watchdog_kick();
+            sceKernelUsleep(3000);
+        }
+    }
     int n = sceNetSend(s, buf, len, 0);
     if (n <= 0) return -1;
     return n;
 }
 
-tls_ctx *tls_open(int sock, const char *host) {
+tls_ctx *tls_open(int sock, const char *host) { return tls_open_bounded(sock, host, 0); }
+
+// deadlineUs must be armed BEFORE the handshake when the socket is non-blocking:
+// with no deadline, ll_read/ll_write take the blocking branch and treat the first
+// EAGAIN as fatal, so the handshake dies the moment data isn't already buffered.
+// (That looked like "works on the first few tunes, then fails every time".)
+tls_ctx *tls_open_bounded(int sock, const char *host, uint64_t deadlineUs) {
     tls_ctx *t = malloc(sizeof(*t));
     if (!t) return NULL;
     t->sock = sock;
+    t->rdDeadline = deadlineUs; t->rdTick = 0;
 
     br_ssl_client_init_full(&t->sc, &t->xdummy, NULL, 0);
     memset(&t->xc, 0, sizeof(t->xc));
@@ -136,7 +186,7 @@ tls_ctx *tls_open(int sock, const char *host) {
         free(t);
         return NULL;
     }
-    br_sslio_init(&t->io, &t->sc.eng, ll_read, &t->sock, ll_write, &t->sock);
+    br_sslio_init(&t->io, &t->sc.eng, ll_read, t, ll_write, t);
     return t;
 }
 
@@ -164,6 +214,8 @@ int tls_write(tls_ctx *t, const uint8_t *buf, int len) {
 int tls_last_error(tls_ctx *t) {
     return t ? br_ssl_engine_last_error(&t->sc.eng) : -1;
 }
+
+void tls_set_read_deadline(tls_ctx *t, uint64_t absUs) { if (t) { t->rdDeadline = absUs; t->rdTick = 0; } }
 
 void tls_close(tls_ctx *t) {
     if (!t) return;

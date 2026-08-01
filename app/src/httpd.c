@@ -299,6 +299,7 @@ static int json_list(char *out, int cap, char arr[][URL_MAX], int n) {
 // return a single entry that points at the original URL so it can be cast.
 #define PLAYLIST_MAX_ENTRIES 200
 extern int aseg_fetch(const char *url, uint8_t **buf, int *len);
+extern void aseg_resume(void);
 
 // Append a JSON-escaped, length-capped string (with surrounding quotes).
 static void json_str(char *out, int cap, int *po, const char *s, int maxchars) {
@@ -994,7 +995,11 @@ static void handle_client(OrbisNetId c) {
     if (strcmp(method, "GET") == 0 && strcmp(path, "/crashlog") == 0) {
         int fd = sceKernelOpen("/data/ps4cast_crash.log", 0 /*O_RDONLY*/, 0);
         if (fd < 0) { send_response(c, "200 OK", "text/plain", "(no crash logged)", 17); return; }
-        static char cb[512];
+        // Read the WHOLE log (it is capped at CRASHLOG_MAX=4096 on the write side).
+        // This used to read only the first 512 bytes, which silently truncated the
+        // NEWEST entry -- the one that matters -- mid-line: "HANG v03.98 stale=... up"
+        // with the at= marker cut off.
+        static char cb[4100];
         int cn = (int)sceKernelRead(fd, cb, sizeof(cb) - 1);
         sceKernelClose(fd);
         if (cn < 0) cn = 0;
@@ -1359,6 +1364,7 @@ static void handle_client(OrbisNetId c) {
         int n = 0;
         if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) {
             uint8_t *buf = NULL; int len = 0;
+            aseg_resume();   // sticky abort from a previous Stop must not block a web-UI playlist load
             if (aseg_fetch(url, &buf, &len) == 0 && buf && len > 0) {
                 uint8_t *txt = realloc(buf, (size_t)len + 1);
                 if (txt) {

@@ -7,6 +7,10 @@
 
 #include <stdint.h>
 
+// Create the fetch lock. MUST be called once from main() before any thread
+// fetches -- a lazy init inside aseg_fetch races and can wedge the lock forever.
+void aseg_init(void);
+
 // Download an entire (small) resource into a malloc'd buffer. Caller frees *buf.
 // http + https (BearSSL), follows up to a few redirects. Returns 0, else < 0.
 int aseg_fetch(const char *url, uint8_t **buf, int *len);
@@ -19,5 +23,13 @@ void aseg_resume(void);
 // the generous SEGMENT budget (0). A single budget for both either starves slow
 // segments (continuous rebuffering) or lets a dead host block a channel switch.
 void aseg_set_playlist_budget(int on);
+
+// Last HTTP status seen (0 = status line unparseable) and its first bytes.
+int aseg_last_status(void);
+const char *aseg_last_line(void);
+int aseg_bad_reuse(void);   // 1 if the failing request went out on a REUSED keep-alive socket
+int aseg_bad_hop(void);
+const char *aseg_bad_path(void);
+int aseg_bad_pathlen(void);
 
 #endif

@@ -2,7 +2,7 @@
 # STABLE title id: DirectPackageInstaller updates it in place (one icon). The
 # display TITLE carries the version, and /status reports APP_VER so we always
 # know which build is actually running.
-VERSION     := 03.95
+VERSION     := 04.16
 TITLE       := PS4 Cast $(VERSION)
 TITLE_ID    := PCST00001
 CONTENT_ID  := IV0000-PCST00001_00-PS4CAST000000001

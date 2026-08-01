@@ -2,7 +2,7 @@
 #include "tls.h"
 
 extern void watchdog_kick(void);
-extern void watchdog_note(const char *w);   // see aseg.c: bounded slow I/O must not look like a freeze
+extern const char *watchdog_note(const char *w);   // see aseg.c: bounded slow I/O must not look like a freeze
 
 #include <stdio.h>
 #include <string.h>
@@ -239,9 +239,9 @@ static int resolve_host(void) {
     // "hls fetch failed" on console). Two tries with a sane timeout covers a
     // transient DNS hiccup while staying well inside the grace.
     watchdog_kick();
-    watchdog_note("dns");   // unabortable; the one blocking call we cannot pet through
+    const char *pv_dns = watchdog_note("dns");   // unabortable; the one blocking call we cannot pet through
     int rc = sceNetResolverStartNtoa(rid, g_host, &a, 4 * 1000 * 1000, 2, 0);
-    watchdog_note("");
+    watchdog_note(pv_dns);
     watchdog_kick();
     sceNetResolverDestroy(rid);
     if (rc < 0) return -3;
@@ -334,9 +334,9 @@ static int request_from_ex(uint64_t pos, int *status, int64_t *total, char *loc,
         g_sock = tcp_connect();
         if (g_sock < 0) { snprintf(g_dbg, sizeof(g_dbg), "connect failed"); return -1; }
         if (g_tlsmode) {
-            watchdog_note("tls");   // handshake to a half-open host can block for seconds
+            const char *pv_tls = watchdog_note("tls");   // handshake to a half-open host can block for seconds
             g_tls = tls_open(g_sock, g_host);
-            watchdog_note(""); watchdog_kick();
+            watchdog_note(pv_tls); watchdog_kick();
             if (!g_tls) { conn_close(); snprintf(g_dbg, sizeof(g_dbg), "tls handshake failed (%s)", g_host); return -2; }
         }
     } else {

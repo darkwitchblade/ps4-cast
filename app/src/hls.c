@@ -1,4 +1,6 @@
 #include "hls.h"
+extern void watchdog_kick(void);
+extern const char *watchdog_note(const char *w);
 #include "httpsrc.h"
 #include "aseg.h"
 #include "trace.h"
@@ -35,6 +37,10 @@ static char    g_mediaUrl[2048];  // current media playlist URL (for live refres
 static int     g_isLive;          // no EXT-X-ENDLIST: refresh playlist at the end
 static int     g_targetDurMs;     // EXT-X-TARGETDURATION for live refresh pacing
 static int     g_mediaSeq;        // EXT-X-MEDIA-SEQUENCE for sliding live windows
+// Does the body we parsed actually belong to the URL we asked for?
+static volatile unsigned g_openGen = 0;   // bumped on every close/open
+static char    g_dbgVarUrl[56] = "";
+static char    g_dbgSeg0[56] = "";
 static uint64_t g_lastRefreshUs;
 static uint64_t g_segPos;         // byte cursor within current open segment
 static volatile int g_segGen;     // increments when advancing to the next media segment
@@ -167,14 +173,16 @@ const char *hls_debug(void) {
             scePthreadMutexUnlock(&g_aprefMtx);
         }
         snprintf(b, sizeof(b),
-                 "hls v%d/%d %s %dp %dk%s%s seg=%d/%d pf=%d/%d vf=%dms/%dKB/rc%d/f%d af=%d/%d %dms/%dKB/rc%d/f%d",
+                 "hls v%d/%d %s %dp %dk%s%s seg=%d/%d pf=%d/%d vf=%dms/%dKB/rc%d/f%d af=%d/%d %dms/%dKB/rc%d/f%d st=%d[%s] reuse=%d hop=%d plen=%d p=%s VAR=%s SEG0=%s",
                  g_curVariant + 1, g_variantCount, codec_name(v->codec), v->height,
                  v->bw / 1000, v->fps ? (v->fps > 30 ? "60" : "") : "",
                  g_sepAudio ? " SEPAUDIO" : "", g_segIdx, g_segCount,
                  cached, g_prefUp ? g_prefDepth : 0,
                  g_vLastMs, g_vLastBytes / 1024, g_vLastRc, g_vFailCount,
                  acached, g_aprefUp ? HLS_AUDIO_PREFETCH_SLOTS : 0,
-                 g_aLastMs, g_aLastBytes / 1024, g_aLastRc, g_aFailCount);
+                 g_aLastMs, g_aLastBytes / 1024, g_aLastRc, g_aFailCount,
+                 aseg_last_status(), aseg_last_line(), aseg_bad_reuse(), aseg_bad_hop(),
+                 aseg_bad_pathlen(), aseg_bad_path(), g_dbgVarUrl, g_dbgSeg0);
         return b;
     }
     if (g_active) {
@@ -265,7 +273,10 @@ static void prefetch_stop(void) {
         scePthreadCondSignal(&g_prefCond);
         scePthreadMutexUnlock(&g_prefMtx);
         aseg_abort();
+        watchdog_kick();
+        watchdog_note("join/pref");
         scePthreadJoin(g_prefThread, NULL);
+        watchdog_kick();
         scePthreadCondDestroy(&g_prefCond);
         scePthreadMutexDestroy(&g_prefMtx);
         g_prefUp = 0;
@@ -359,6 +370,7 @@ static void *prefetch_main(void *arg) {
 
 static void prefetch_start(void) {
     if (g_prefUp) return;
+    aseg_resume();   // a mid-playback variant switch stops then restarts us; without this the sticky abort would wedge the new worker
     // Live prefetch needs its own sequence-numbered queue. Reusing the VOD
     // index cache can race tiny sliding windows and was observed to crash at
     // the live edge. Keep v02.80 live-safe; VOD still prefetches normally.
@@ -437,7 +449,10 @@ static void apref_stop(void) {
         scePthreadCondSignal(&g_aprefCond);
         scePthreadMutexUnlock(&g_aprefMtx);
         aseg_abort();
+        watchdog_kick();
+        watchdog_note("join/apref");
         scePthreadJoin(g_aprefThread, NULL);
+        watchdog_kick();
         scePthreadCondDestroy(&g_aprefCond);
         scePthreadMutexDestroy(&g_aprefMtx);
         g_aprefUp = 0;
@@ -518,6 +533,7 @@ static void *apref_main(void *arg) {
 
 static void apref_start(void) {
     if (g_aprefUp || !g_audioReady || g_aAbort || g_aInitPending) return;
+    aseg_resume();
     for (int i = 0; i < HLS_AUDIO_PREFETCH_SLOTS; i++) g_apref[i].seg = -1;
     g_aprefStop = 0;
     scePthreadMutexInit(&g_aprefMtx, NULL, "ps4cast_hlsap_m");
@@ -593,9 +609,15 @@ static int apref_wait_take(int seg) {
 }
 
 void hls_close(void) {
+    g_openGen++;      // anything still looping from the previous stream is now stale
+    g_active = 0;     // ...and hls_next_segment's retry loop re-checks this every pass
+    watchdog_note("close/apref-stop");
     apref_stop();
+    watchdog_note("close/pref-stop");
     prefetch_stop();
+    watchdog_note("close/httpsrc");
     if (g_open) { httpsrc_close(); g_open = 0; }
+    watchdog_note("close/free");
     free_segs();
     free_asegs();
     g_active = 0; g_segPos = 0; g_initPending = 0;
@@ -977,18 +999,28 @@ static int setup_audio_rendition(const char *masterBody, const char *masterUrl) 
 static int load_variant(int idx) {
     if (idx < 0 || idx >= g_variantCount) return -1;
     int len = 0;
+    watchdog_note("lv/fetch");
+    { const char *u = g_variants[idx].url; int L = (int)strlen(u);
+      snprintf(g_dbgVarUrl, sizeof(g_dbgVarUrl), "%s", L > 50 ? u + L - 50 : u); }
     char *body = fetch_all(g_variants[idx].url, &len);
+    watchdog_note("lv/post-fetch");
     if (!body) return -1;
     int nextSeq = g_mediaSeq + g_segIdx;
     char mediaUrl[2048];
     strncpy(mediaUrl, g_variants[idx].url, sizeof(mediaUrl) - 1);
     mediaUrl[sizeof(mediaUrl) - 1] = '\0';
+    watchdog_note("lv/free-segs");
     free_segs();
-    if (parse_media(body, mediaUrl) != 0) { free(body); return -1; }
+    watchdog_note("lv/parse");
+    if (parse_media(body, mediaUrl) != 0) { free(body); watchdog_note("lv/done"); return -1; }
+    watchdog_note("lv/done");
     strncpy(g_mediaUrl, mediaUrl, sizeof(g_mediaUrl) - 1);
     g_mediaUrl[sizeof(g_mediaUrl) - 1] = '\0';
     free(body);
     g_segIdx = nextSeq - g_mediaSeq;
+    { const char *s0 = (g_segCount > 0 && g_segs[0]) ? g_segs[0] : "(none)";
+      int L = (int)strlen(s0);
+      snprintf(g_dbgSeg0, sizeof(g_dbgSeg0), "%s", L > 50 ? s0 + L - 50 : s0); }
     if (g_segIdx >= g_segCount) g_segIdx = g_segCount > 0 ? g_segCount - 1 : 0;
     if (g_segIdx < 0) g_segIdx = 0;
     g_curVariant = idx;
@@ -1000,9 +1032,11 @@ static int load_variant(int idx) {
 void hls_request_downshift(void) { g_downshiftReq = 1; }
 
 int hls_open(const char *url) {
-    aseg_resume();                 // drop a stale abort from the previous stop (was failing this fetch with rc=-9)
     aseg_set_playlist_budget(1);   // small fetches: fail fast so a dead channel can't block the switch
-    hls_close();
+    watchdog_note("open/close");
+    hls_close();                   // raises abort + joins the prefetch threads
+    aseg_resume();                 // ...so resume only AFTER they are gone, never before
+    watchdog_note("open/master");
     trace_mark("hls open %s", url);
     g_variantCount = 0; g_curVariant = -1; g_downshiftReq = 0; g_sepAudio = 0;
     g_vLastRc = g_vLastBytes = g_vLastMs = g_vFailCount = 0; g_vLastUrl[0] = '\0';
@@ -1022,12 +1056,15 @@ int hls_open(const char *url) {
         // video segments) — our segment streamer only pulls the video variant,
         // so such streams would play silently. Flag it for telemetry.
         g_sepAudio = (strstr(body, "TYPE=AUDIO") != NULL && strstr(body, "URI=") != NULL);
+        watchdog_note("open/variants");
         collect_variants(body, url);
         if (g_variantCount == 0) { free(body); snprintf(g_dbg, sizeof(g_dbg), "no variant"); { aseg_set_playlist_budget(0); return -3; } }
         g_segIdx = 0;
+        watchdog_note("open/load-variant");
         if (load_variant(pick_start_variant()) != 0) { free(body); snprintf(g_dbg, sizeof(g_dbg), "variant fetch failed"); { aseg_set_playlist_budget(0); return -4; } }
         // Separate audio rendition: set up the parallel audio segment list now,
         // while we still hold the master body (needs the chosen variant's group).
+        watchdog_note("open/audio-rend");
         if (g_sepAudio) setup_audio_rendition(body, url);
         free(body);
     } else {
@@ -1047,8 +1084,11 @@ int hls_open(const char *url) {
     g_open = 0;
     g_active = 1;
     g_lastRefreshUs = sceKernelGetProcessTime();
+    watchdog_note("open/pref-start");
     prefetch_start();
+    watchdog_note("open/apref-start");
     apref_start();
+    watchdog_note("open/done");
     snprintf(g_dbg, sizeof(g_dbg), "hls %d segs%s v=%d/%d", g_segCount,
              g_initSeg ? " +init" : "", g_curVariant + 1, g_variantCount);
     { aseg_set_playlist_budget(0); return 0; }
@@ -1093,6 +1133,7 @@ static int refresh_live_playlist(void) {
 
 // Ensure a segment is open in httpsrc; advance through init + segment list.
 static int ensure_segment(void) {
+    if (!g_active) return -1;      // closed: never start new work for a dead stream
     if (g_memBuf) return 0;
     if (g_open) return 0;
     const char *u = NULL;
@@ -1129,7 +1170,14 @@ static int ensure_segment(void) {
 
 int hls_read(uint8_t *buf, uint32_t len) {
     if (!g_active) return -1;
+    const unsigned myGen = g_openGen;
     for (;;) {
+        // Re-check EVERY pass, not just on entry. This retry loop is driven by
+        // FFmpeg on the decode thread; with only the entry check, a thread already
+        // in here when the stream closed retried forever at 300ms -- the zombie
+        // that kept fetching the OLD channel and overwriting the HLS globals of
+        // every channel tuned afterwards (a post-burst /chan looked ignored).
+        if (!g_active || g_openGen != myGen) return -1;
         int es = ensure_segment();
         if (es == -2) { sceKernelUsleep(300 * 1000); continue; }
         if (es != 0) return 0; // EOF
@@ -1195,15 +1243,23 @@ int hls_next_segment(uint8_t **outBuf, int *outLen, int *outResetGen) {
     if (outLen) *outLen = 0;
     if (outResetGen) *outResetGen = g_resetGen;
     if (!g_active || !hls_can_segment_demux()) return -1;
+    const unsigned myGen = g_openGen;
 
     for (;;) {
         // Bail immediately on teardown. Without this, this retry loop kept
         // re-fetching during a channel switch (the abort flag is per-fetch and got
         // re-cleared), so player_stop blocked ~30s waiting for it to give up.
         if (g_segStopFlag && *g_segStopFlag) return -1;
+        // g_active / generation were checked only ON ENTRY, so a thread already
+        // inside this loop when the stream closed never noticed and kept fetching
+        // and refreshing FOREVER -- against the OLD channel, while mutating the
+        // shared HLS globals underneath every channel tuned afterwards. That
+        // orphan is why a post-burst /chan appeared to do nothing at all.
+        if (!g_active || g_openGen != myGen) return -1;
         if (g_segIdx >= g_segCount) {
             if (!g_isLive) return -1;            // VOD: all segments played -> EOF
             if (refresh_live_playlist() != 0) {
+                if (!g_active || g_openGen != myGen) return -1;
                 sceKernelUsleep(300 * 1000);
                 continue;
             }

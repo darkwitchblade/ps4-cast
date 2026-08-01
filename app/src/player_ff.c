@@ -217,6 +217,7 @@ static volatile int      g_segFetchStop;
 static int               g_segFetchUp;       // fetch thread joined-state tracking
 static int               g_segReadAhead;     // 1 = decode pops ring; 0 = inline fetch
 static void *decode_segment_thread_main(void *arg);
+static void seg_readahead_stop(void);
 static void  present_pool_start(void);
 static void  present_pool_stop(void);
 static void *decode_thread_main(void *arg);
@@ -225,7 +226,8 @@ static void *audio_thread_main(void *arg);
 
 // ---- custom AVIO: plain file/stream via httpsrc, or HLS via hls ------------
 extern void watchdog_kick(void);       // main.c: pet the freeze watchdog from the main-thread probe
-extern void watchdog_set_busy(int on); // main.c: longer watchdog grace during a slow channel switch
+extern void watchdog_set_busy(int on);
+extern const char *watchdog_note(const char *w); // main.c: longer watchdog grace during a slow channel switch
 
 static int avio_read_cb(void *o, uint8_t *buf, int size) {
     (void)o;
@@ -393,7 +395,9 @@ int player_play(const char *url) {
     // everything else (mp4/mov/mkv/avi/ts/... over http/https) via httpsrc.
     g_isHls = hls_is_url(startUrl);
     g_playStage = "source-open";
+    watchdog_note(g_isHls ? "hls_open" : "httpsrc_open");
     int orc = g_isHls ? hls_open(startUrl) : httpsrc_open(startUrl);
+    watchdog_note("-");
     uint64_t swtOpen = sceKernelGetProcessTime();
     if (orc != 0) {
         snprintf(g_status, sizeof(g_status), "source: %s", g_isHls ? hls_debug() : httpsrc_debug());
@@ -1513,6 +1517,15 @@ static void *seg_fetch_thread_main(void *arg) {
 // Bring up the read-ahead ring + fetch thread. On any failure, leaves
 // g_segReadAhead = 0 so decode fetches inline (no read-ahead, still works).
 static void seg_readahead_start(void) {
+    // NEVER orphan a running fetch thread. This used to blindly zero g_segFetchUp
+    // and g_segReadAhead and create a new thread; called again while one was live
+    // (a fast channel-switch burst does exactly that), the old thread was never
+    // joined AND its stop flag was reset to 0, so it looped forever -- refetching
+    // the PREVIOUS channel and mutating the shared HLS globals (g_segIdx,
+    // g_mediaSeq, refresh) underneath every channel tuned afterwards. That is why
+    // a post-burst /chan did nothing: an orphan kept overwriting its state.
+    // It also re-initialised g_srMtx while the orphan was still using it.
+    seg_readahead_stop();
     g_srHead = g_srCount = 0; g_srBytes = 0; g_segFetchStop = 0; g_segReadAhead = 0; g_segFetchUp = 0;
     for (int i = 0; i < SEG_RING; i++) g_segRing[i].buf = NULL;
     if (scePthreadMutexInit(&g_srMtx, NULL, "ps4cast_sr") != 0) return;
@@ -1530,7 +1543,9 @@ static void seg_readahead_start(void) {
 // Stop + join the fetch thread and free buffered segments. Safe to call when the
 // ring was never started (g_segReadAhead == 0).
 static void seg_readahead_stop(void) {
-    if (!g_segReadAhead) return;
+    // Join whenever a thread exists, even if g_segReadAhead was cleared by a
+    // re-entrant start -- otherwise the thread leaks and runs forever.
+    if (!g_segReadAhead && !g_segFetchUp) return;
     g_segFetchStop = 1;
     aseg_abort();                       // unblock an in-flight segment fetch
     scePthreadMutexLock(&g_srMtx);

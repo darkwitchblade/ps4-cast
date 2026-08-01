@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "gfx.h"
+#include "aseg.h"
 #include "qr.h"
 
 #ifndef BOOT_MINIMAL
@@ -194,7 +195,18 @@ static void *watchdog_main(void *arg) {
 // so a slow-but-alive stream switch isn't mistaken for a freeze and killed
 // (that was the CE-34878 on channel switching). Only kicks once the loop is
 // running; safe to call from anywhere.
-void watchdog_note(const char *w) { g_wdNote = w ? w : ""; }
+// Only the MAIN thread's marker is meaningful: the watchdog fires on main-loop
+// staleness, so at= must describe where the MAIN thread is blocked. This is a
+// single global and aseg/hls/httpsrc all run on worker threads too -- a worker
+// setting "dns"/"tls" clobbered main's marker, and its restore wrote back the
+// WORKER's saved value. That made at= report a thread other than the stuck one.
+// Same rule as watchdog_kick(): calls from workers are ignored.
+const char *watchdog_note(const char *w) {
+    if (g_mainTh && scePthreadSelf() != g_mainTh) return "";
+    const char *p = (const char *)g_wdNote;
+    g_wdNote = w ? w : "";
+    return p;
+}
 
 void watchdog_kick(void) {
     if (!g_heartbeat) return;
@@ -779,6 +791,7 @@ int main(void) {
     g_heartbeat = sceKernelGetProcessTime();
     OrbisPthread wd;
     g_mainTh = scePthreadSelf();
+    aseg_init();      // before httpd/playback: the fetch lock must exist before any thread can race to create it
     scePthreadCreate(&wd, NULL, watchdog_main, NULL, "ps4cast_wd");
 
 #ifdef BOOT_MINIMAL
