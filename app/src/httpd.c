@@ -61,6 +61,16 @@ static char g_fav[MAX_FAV][URL_MAX];       static int g_favN = 0;
 static char g_chanName[MAX_CHAN][CHAN_NAME_MAX];
 static char g_chanGroup[MAX_CHAN][CHAN_GRP_MAX];
 static char g_chanUrl[MAX_CHAN][URL_MAX];
+static unsigned char g_chanFav[MAX_CHAN];
+static char g_filtLetter = 0;      // 0 = no letter filter
+static int  g_filtFav = 0;         // 1 = favourites only
+static int  g_filt[MAX_CHAN];
+static int  g_filtN = 0;
+// Favourites + an on-screen filter. With thousands of channels the flat zapper
+// list is unusable, so the overlay can narrow to a starting letter (A-Z, '#' for
+// non-alphabetic) and/or favourites only. The filter maps filtered positions ->
+// absolute channel indices so navigation stays simple in main.c.
+
 static int  g_chanN = 0;
 static int  g_chanCur = -1;
 
@@ -223,7 +233,7 @@ static void chan_save_file(void) {
     if (fd < 0) return;
     char line[URL_MAX + CHAN_NAME_MAX + CHAN_GRP_MAX + 8];
     for (int i = 0; i < g_chanN; i++) {
-        int n = snprintf(line, sizeof(line), "%s\t%s\t%s\n", g_chanName[i], g_chanGroup[i], g_chanUrl[i]);
+        int n = snprintf(line, sizeof(line), "%s\t%s\t%s\t%d\n", g_chanName[i], g_chanGroup[i], g_chanUrl[i], g_chanFav[i] ? 1 : 0);
         sceKernelWrite(fd, line, n);
     }
     sceKernelClose(fd);
@@ -242,9 +252,13 @@ static void chan_load_file(void) {
         char *t1 = strchr(ln, '\t'); if (!t1) continue; *t1 = '\0';
         char *t2 = strchr(t1 + 1, '\t'); if (!t2) continue; *t2 = '\0';
         const char *grp = t1 + 1, *url = t2 + 1; if (!url[0]) continue;
+        int fav = 0;
+        char *t3 = strchr(t2 + 1, '\t');           // optional 4th column: favourite
+        if (t3) { *t3 = '\0'; fav = atoi(t3 + 1) ? 1 : 0; }
         strncpy(g_chanName[g_chanN], ln, CHAN_NAME_MAX - 1);   g_chanName[g_chanN][CHAN_NAME_MAX - 1] = '\0';
         strncpy(g_chanGroup[g_chanN], grp, CHAN_GRP_MAX - 1);  g_chanGroup[g_chanN][CHAN_GRP_MAX - 1] = '\0';
         strncpy(g_chanUrl[g_chanN], url, URL_MAX - 1);         g_chanUrl[g_chanN][URL_MAX - 1] = '\0';
+        g_chanFav[g_chanN] = (unsigned char)fav;
         g_chanN++;
     }
 }
@@ -398,6 +412,53 @@ static int chans_to_json(char *out, int cap) {
 }
 
 // ---- channel store accessors (for the on-screen D-pad zapper, main.c) -----
+
+static void filter_rebuild(void) {
+    g_filtN = 0;
+    for (int i = 0; i < g_chanN; i++) {
+        if (g_filtFav && !g_chanFav[i]) continue;
+        if (g_filtLetter) {
+            char c = g_chanName[i][0];
+            if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+            if (g_filtLetter == '#') { if (c >= 'A' && c <= 'Z') continue; }
+            else if (c != g_filtLetter) continue;
+        }
+        g_filt[g_filtN++] = i;
+    }
+}
+
+void httpd_chan_filter(char letter, int favOnly) {
+    g_filtLetter = letter; g_filtFav = favOnly ? 1 : 0;
+    scePthreadMutexLock(&g_mtx); filter_rebuild(); scePthreadMutexUnlock(&g_mtx);
+}
+char httpd_chan_filter_letter(void) { return g_filtLetter; }
+int  httpd_chan_filter_fav(void)    { return g_filtFav; }
+int  httpd_chan_filter_count(void)  { return (g_filtLetter || g_filtFav) ? g_filtN : g_chanN; }
+int  httpd_chan_filter_abs(int n) {
+    if (!(g_filtLetter || g_filtFav)) return (n >= 0 && n < g_chanN) ? n : -1;
+    return (n >= 0 && n < g_filtN) ? g_filt[n] : -1;
+}
+int  httpd_chan_is_fav(int i) { return (i >= 0 && i < g_chanN) ? g_chanFav[i] : 0; }
+void httpd_chan_toggle_fav(int i) {
+    if (i < 0 || i >= g_chanN) return;
+    scePthreadMutexLock(&g_mtx);
+    g_chanFav[i] = g_chanFav[i] ? 0 : 1;
+    filter_rebuild();
+    scePthreadMutexUnlock(&g_mtx);
+    chan_save_file();
+}
+// True if any channel starts with `letter` ('#' = non-alphabetic), so the A-Z
+// strip can grey out letters that would show an empty list.
+int httpd_chan_letter_has(char letter) {
+    for (int i = 0; i < g_chanN; i++) {
+        char c = g_chanName[i][0];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        if (letter == '#') { if (!(c >= 'A' && c <= 'Z')) return 1; }
+        else if (c == letter) return 1;
+    }
+    return 0;
+}
+
 int httpd_chan_count(void) { return g_chanN; }
 int httpd_chan_current(void) { return g_chanCur; }
 // Copy channel i's name/url into caller buffers under lock (safe vs. reloads).

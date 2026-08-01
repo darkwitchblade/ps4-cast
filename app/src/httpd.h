@@ -18,6 +18,17 @@ int  httpd_chan_current(void);                    // tuned channel index, -1 non
 int  httpd_chan_get(int i, char *name, int nameCap, char *url, int urlCap);
 void httpd_chan_group(int i, char *out, int cap);
 void httpd_chan_set_current(int i);
+// On-screen filtering for large IPTV lists: narrow by starting letter ('#' =
+// non-alphabetic, 0 = off) and/or favourites. Positions are FILTERED indices;
+// httpd_chan_filter_abs() maps them back to absolute channel indices.
+void httpd_chan_filter(char letter, int favOnly);
+char httpd_chan_filter_letter(void);
+int  httpd_chan_filter_fav(void);
+int  httpd_chan_filter_count(void);
+int  httpd_chan_filter_abs(int n);
+int  httpd_chan_is_fav(int i);
+void httpd_chan_toggle_fav(int i);
+int  httpd_chan_letter_has(char letter);
 
 // Per-URL resume positions (VOD): remember where playback stopped.
 void httpd_resume_save(const char *url, int pos, int dur);
