@@ -506,8 +506,6 @@ int player_play(const char *url) {
     // Hardware H.264: direct MP4 (needs the mp4->annexb bitstream filter) or live
     // HLS via the segment-demux path (MPEG-TS packets are already annex-b, so no
     // bsf). The plain AVIO-concatenated HLS path (no seg-demux) stays software.
-    // Interlaced H.264 (1080i broadcast streams) makes the Videodec2 hardware
-    // decoder fault hard (uncatchable GPU crash) — force software for those.
     int interlaced = (vpar->field_order == AV_FIELD_TT || vpar->field_order == AV_FIELD_BB ||
                       vpar->field_order == AV_FIELD_TB || vpar->field_order == AV_FIELD_BT);
     g_interlaced = interlaced;   // -> bob-deinterlace in build_scaled (software path)
@@ -515,8 +513,22 @@ int player_play(const char *url) {
     // progressive — optimizeProgressiveVideo=0), and bob-deinterlaced when the NV12
     // is presented. This keeps heavy 1080i (IPTV) off the CPU-bound software path,
     // which is what made switching off a 1080i channel slow and watchdog-killable.
+    // Hardware path is an experimentally-derived sceVideodec2 config: feed it ONLY
+    // 8-bit 4:2:0 H.264 within sane dimensions. Hi10P (110), 4:2:2 (122) and
+    // 4:4:4 (244) or oversized streams previously went straight to the GPU decoder
+    // and could fault the compositor; they now fall back to software.
+    int hwProfileOk = (vpar->profile <= 100);        // baseline/main/high only
+    int hwDepthOk   = (vpar->format == AV_PIX_FMT_NONE ||
+                       vpar->format == AV_PIX_FMT_YUV420P ||
+                       vpar->format == AV_PIX_FMT_YUVJ420P);
+    int hwSizeOk    = (vpar->width > 0 && vpar->height > 0 &&
+                       vpar->width <= 1920 && vpar->height <= 1088);
     int hwEligible = g_hwEnabled && vpar->codec_id == AV_CODEC_ID_H264 &&
+                     hwProfileOk && hwDepthOk && hwSizeOk &&
                      (!g_isHls || g_hlsSegDemux);
+    if (g_hwEnabled && vpar->codec_id == AV_CODEC_ID_H264 && !hwEligible)
+        notify_dbg("PS4 Cast: H.264 prof=%d fmt=%d %dx%d -> software (unsupported by HW)",
+                   vpar->profile, vpar->format, vpar->width, vpar->height);
     if (interlaced) notify_dbg("PS4 Cast: interlaced -> %s + bob-deinterlace", hwEligible ? "hardware" : "software");
     if (hwEligible) {
         int bsfOk = 1;
@@ -1557,6 +1569,16 @@ static void queue_sw_frame_us(AVRational tb) {
 static void *decode_segment_thread_main(void *arg) {
     (void)arg;
     while (!g_decStop) {
+        // Backpressure on the audio ring — the SAME guard decode_thread_main has.
+        // Live HLS/IPTV runs through THIS loop, so without it the decoder races
+        // ahead, the ring overflows and audio_write() discards samples, which
+        // desyncs A/V permanently. Bounded (~1s) and honours stop/seek/pause so it
+        // cannot deadlock.
+        for (int aguard = 0; aguard < 200; aguard++) {
+            if (g_decStop || g_seekPending || g_paused) break;
+            if (audio_fill_ms() < 6000) break;
+            sceKernelUsleep(5000);
+        }
         if (g_paused) { sceKernelUsleep(8000); continue; }
 
         uint8_t *segBuf = NULL;
