@@ -1,6 +1,13 @@
 #include "aseg.h"
 #include "tls.h"
 
+// main.c: pet the freeze watchdog during a legitimately-progressing blocking op.
+// Safe here because every fetch is bounded by ASEG_FETCH_BUDGET_US, so this can
+// never mask a true freeze — it only stops a SLOW-but-bounded playlist/segment
+// fetch from being mistaken for one (the "HANG watchdog stale=35s" fail-close
+// seen while zapping past several unreachable channels in a row).
+extern void watchdog_kick(void);
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -274,6 +281,7 @@ static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
         if (sceKernelGetProcessTime() - budget0 > ASEG_FETCH_BUDGET_US) {
             conn_close(); g_kaAlive = 0; return -12;               // dead/slow host: fail fast
         }
+        watchdog_kick();
         if (parse_url(cur) != 0) { conn_close(); g_kaAlive = 0; return -1; }
         if (resolve_host() != 0) { conn_close(); g_kaAlive = 0; return -2; }
         // Reuse the kept-alive socket if it's to the same host:port:tls.
@@ -325,6 +333,7 @@ static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
             if (sceKernelGetProcessTime() - budget0 > ASEG_FETCH_BUDGET_US) {
                 free(buf); conn_close(); g_kaAlive = 0; return -12;
             }
+            watchdog_kick();
             if (used + 64 * 1024 > cap) {
                 size_t ncap = cap * 2;
                 if (ncap > ASEG_FETCH_CAP) ncap = ASEG_FETCH_CAP;

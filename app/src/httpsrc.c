@@ -1,6 +1,8 @@
 #include "httpsrc.h"
 #include "tls.h"
 
+extern void watchdog_kick(void);   // see aseg.c: bounded slow I/O must not look like a freeze
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
