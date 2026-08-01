@@ -993,6 +993,7 @@ static int load_variant(int idx) {
 void hls_request_downshift(void) { g_downshiftReq = 1; }
 
 int hls_open(const char *url) {
+    aseg_set_playlist_budget(1);   // small fetches: fail fast so a dead channel can't block the switch
     hls_close();
     trace_mark("hls open %s", url);
     g_variantCount = 0; g_curVariant = -1; g_downshiftReq = 0; g_sepAudio = 0;
@@ -1001,10 +1002,10 @@ int hls_open(const char *url) {
 
     int len = 0;
     char *body = fetch_all(url, &len);
-    if (!body) { snprintf(g_dbg, sizeof(g_dbg), "hls fetch failed"); return -1; }
+    if (!body) { snprintf(g_dbg, sizeof(g_dbg), "hls fetch failed"); { aseg_set_playlist_budget(0); return -1; } }
     if (strstr(body, "#EXTM3U") == NULL) {
         snprintf(g_dbg, sizeof(g_dbg), "not a playlist");
-        free(body); return -2;
+        free(body); { aseg_set_playlist_budget(0); return -2; }
     }
 
     if (strstr(body, "#EXT-X-STREAM-INF")) {
@@ -1013,15 +1014,15 @@ int hls_open(const char *url) {
         // so such streams would play silently. Flag it for telemetry.
         g_sepAudio = (strstr(body, "TYPE=AUDIO") != NULL && strstr(body, "URI=") != NULL);
         collect_variants(body, url);
-        if (g_variantCount == 0) { free(body); snprintf(g_dbg, sizeof(g_dbg), "no variant"); return -3; }
+        if (g_variantCount == 0) { free(body); snprintf(g_dbg, sizeof(g_dbg), "no variant"); { aseg_set_playlist_budget(0); return -3; } }
         g_segIdx = 0;
-        if (load_variant(pick_start_variant()) != 0) { free(body); snprintf(g_dbg, sizeof(g_dbg), "variant fetch failed"); return -4; }
+        if (load_variant(pick_start_variant()) != 0) { free(body); snprintf(g_dbg, sizeof(g_dbg), "variant fetch failed"); { aseg_set_playlist_budget(0); return -4; } }
         // Separate audio rendition: set up the parallel audio segment list now,
         // while we still hold the master body (needs the chosen variant's group).
         if (g_sepAudio) setup_audio_rendition(body, url);
         free(body);
     } else {
-        if (parse_media(body, url) != 0) { snprintf(g_dbg, sizeof(g_dbg), "no segments"); free(body); hls_close(); return -5; }
+        if (parse_media(body, url) != 0) { snprintf(g_dbg, sizeof(g_dbg), "no segments"); free(body); hls_close(); { aseg_set_playlist_budget(0); return -5; } }
         strncpy(g_mediaUrl, url, sizeof(g_mediaUrl) - 1);
         g_mediaUrl[sizeof(g_mediaUrl) - 1] = '\0';
         free(body);
@@ -1041,7 +1042,7 @@ int hls_open(const char *url) {
     apref_start();
     snprintf(g_dbg, sizeof(g_dbg), "hls %d segs%s v=%d/%d", g_segCount,
              g_initSeg ? " +init" : "", g_curVariant + 1, g_variantCount);
-    return 0;
+    { aseg_set_playlist_budget(0); return 0; }
 }
 
 static int refresh_live_playlist(void) {

@@ -259,7 +259,19 @@ static int do_request(int reuse, int *status, char *loc, int loccap,
 // hls_open does TWO fetches (master + variant) — enough to block the main thread
 // past the 35s channel-switch watchdog grace and fail-close the app. Observed as
 // "HANG watchdog stale=36002ms" while zapping through unreachable channels.
-#define ASEG_FETCH_BUDGET_US (9ULL * 1000 * 1000)
+// Default budget for a SEGMENT fetch. Segments are large and a slow-but-working
+// CDN legitimately needs many seconds — an over-tight cap here makes every slow
+// segment fail and the player rebuffer continuously (observed after this was set
+// to a flat 9s for everything). Playlists are small, so hls_open lowers it around
+// the master/variant fetches, where the real risk is blocking a channel switch.
+#define ASEG_BUDGET_SEGMENT_US (25ULL * 1000 * 1000)
+#define ASEG_BUDGET_PLAYLIST_US (6ULL * 1000 * 1000)
+static volatile uint64_t g_fetchBudgetUs = ASEG_BUDGET_SEGMENT_US;
+#define ASEG_FETCH_BUDGET_US (g_fetchBudgetUs)
+
+void aseg_set_playlist_budget(int on) {
+    g_fetchBudgetUs = on ? ASEG_BUDGET_PLAYLIST_US : ASEG_BUDGET_SEGMENT_US;
+}
 
 static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
     uint64_t budget0 = sceKernelGetProcessTime();

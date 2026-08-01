@@ -13,5 +13,9 @@ int aseg_fetch(const char *url, uint8_t **buf, int *len);
 
 // Abort a fetch in progress (Stop / new cast) so the audio thread can't wedge.
 void aseg_abort(void);
+// Tighten the per-fetch time budget around small PLAYLIST fetches (1) and restore
+// the generous SEGMENT budget (0). A single budget for both either starves slow
+// segments (continuous rebuffering) or lets a dead host block a channel switch.
+void aseg_set_playlist_budget(int on);
 
 #endif

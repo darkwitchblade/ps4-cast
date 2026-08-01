@@ -30,6 +30,7 @@ typedef struct {
 #define ORBIS_NET_SOL_SOCKET   0xffff
 #define ORBIS_NET_SO_SNDTIMEO  0x1005
 #define ORBIS_NET_SO_RCVTIMEO  0x1006
+#define ORBIS_NET_SO_NBIO      0x1200
 
 static char     g_host[256];
 static char     g_path[1024];
@@ -276,10 +277,25 @@ static int tcp_connect(void) {
     memset(&sa, 0, sizeof(sa));
     sa.len = sizeof(sa); sa.family = ORBIS_NET_AF_INET;
     sa.port = sceNetHtons(g_port); sa.addr = g_addr;
-    if (sceNetConnect(s, (const OrbisNetSockaddr *)&sa, sizeof(sa)) < 0) {
-        sceNetSocketClose(s);
-        return -1;
+    // Non-blocking connect with a bounded budget — a plain blocking sceNetConnect
+    // to a dead host can be held by the OS for ~30s and is NOT interruptible, so
+    // opening several unreachable channels in a row blocked the main thread past
+    // the 35s channel-switch watchdog grace and fail-closed the app
+    // ("HANG watchdog stale=35-36s" while zapping past dead entries). Same shape
+    // as aseg's connect: start it non-blocking, poll a zero-length send until
+    // writable, pet the watchdog while waiting, then restore blocking I/O.
+    int nb = 1; sceNetSetsockopt(s, ORBIS_NET_SOL_SOCKET, ORBIS_NET_SO_NBIO, &nb, sizeof(nb));
+    sceNetConnect(s, (const OrbisNetSockaddr *)&sa, sizeof(sa));   // returns in-progress
+    int connected = 0;
+    uint64_t ct0 = sceKernelGetProcessTime();
+    sceKernelUsleep(15000);
+    while (sceKernelGetProcessTime() - ct0 < 2500ULL * 1000) {     // ~2.5s connect budget
+        if (sceNetSend(s, "", 0, 0) >= 0) { connected = 1; break; }
+        watchdog_kick();
+        sceKernelUsleep(20000);
     }
+    nb = 0; sceNetSetsockopt(s, ORBIS_NET_SOL_SOCKET, ORBIS_NET_SO_NBIO, &nb, sizeof(nb));
+    if (!connected) { sceNetSocketClose(s); return -1; }
     return s;
 }
 

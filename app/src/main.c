@@ -76,6 +76,7 @@
 #define SA_ONSTACK 0x0001
 #endif
 extern int sigaltstack(const stack_t *, stack_t *);
+extern void player_stage(const char **out);   // current player_play stage, for the hang log
 
 // Persist a one-line crash/hang note to /data (read back via GET /crashlog).
 // Uses raw syscalls so it's safe from a signal handler.
@@ -167,9 +168,10 @@ static void *watchdog_main(void *arg) {
             // itself stall on a frozen /data mount and gate the recovery.
             gfx_emergency_release();
             char b[96];
-            int n = snprintf(b, sizeof(b), "HANG v" APP_VER " watchdog stale=%llums up=%llus\n",
+            const char *stg = "?"; player_stage(&stg);
+            int n = snprintf(b, sizeof(b), "HANG v" APP_VER " stale=%llums up=%llus stage=%s\n",
                              (unsigned long long)((now - hb) / 1000),
-                             (unsigned long long)(now / 1000000ULL));
+                             (unsigned long long)(now / 1000000ULL), stg ? stg : "?");
             persist_crash(b, n);                          // record the hang for /crashlog
             _exit(0);                                     // force full exit; user just reopens
         }

@@ -46,6 +46,12 @@ static int               g_vstream = -1;
 // flow through the SAME frame queue / sync / scale path as software frames.
 static int               g_useHw = 0;
 static int               g_interlaced = 0;   // source is interlaced -> bob-deinterlace
+// Which stage of player_play is executing, for the watchdog's crash log. Four
+// speculative fixes failed to stop a "HANG watchdog stale=36s" while zapping past
+// dead channels because the blocking call was never identified — this makes the
+// crash name it instead of us inferring it from the symptom.
+static const char *volatile g_playStage = "idle";
+void player_stage(const char **out) { if (out) *out = (const char *)g_playStage; }
 static char              g_swDiag[80] = "";   // last channel-switch stage timing (stop/open/probe ms)
 // Manual A/V sync trim, milliseconds. POSITIVE delays VIDEO (use when video runs
 // ahead of the sound you hear); negative advances it. Corrects the fixed offset
@@ -369,10 +375,12 @@ static int open_sw_video(const AVCodec *dec) {
 }
 
 int player_play(const char *url) {
+    g_playStage = "enter";
     watchdog_set_busy(1);   // teardown + open + probe can run many seconds (esp. off a 1080i SW channel); don't let the freeze watchdog kill the switch
     uint64_t swt0 = sceKernelGetProcessTime();   // channel-switch stage timing (-> g_swDiag, shown in /status)
     char startUrl[2048];
     snprintf(startUrl, sizeof(startUrl), "%s", url ? url : "");
+    g_playStage = "stop";
     player_stop();
     hls_set_seg_stop_flag(&g_segFetchStop);   // so hls_next_segment's retry loop bails instantly on the next teardown (no more ~30s player_stop)
     uint64_t swtStop = sceKernelGetProcessTime();
@@ -384,6 +392,7 @@ int player_play(const char *url) {
     // Open the source. HLS (.m3u8) goes through the segment-streaming layer;
     // everything else (mp4/mov/mkv/avi/ts/... over http/https) via httpsrc.
     g_isHls = hls_is_url(startUrl);
+    g_playStage = "source-open";
     int orc = g_isHls ? hls_open(startUrl) : httpsrc_open(startUrl);
     uint64_t swtOpen = sceKernelGetProcessTime();
     if (orc != 0) {
@@ -411,11 +420,13 @@ int player_play(const char *url) {
     g_fmt->probesize = 1 * 1024 * 1024;
     g_fmt->max_analyze_duration = 1500 * (int64_t)(AV_TIME_BASE / 1000);
 
+    g_playStage = "demux-open";
     int rc = avformat_open_input(&g_fmt, "stream", NULL, NULL);
     if (rc < 0) {
         snprintf(g_status, sizeof(g_status), "demux open failed %d", rc);
         player_stop(); return -2;
     }
+    g_playStage = "probe";
     if (avformat_find_stream_info(g_fmt, NULL) < 0) {
         snprintf(g_status, sizeof(g_status), "no stream info");
         player_stop(); return -3;
@@ -592,6 +603,7 @@ int player_play(const char *url) {
 
     g_started = 1; g_active = 1; g_gotFrame = 0;
     if (g_isHls) audio_pause(1);  // startup headstart: fill frames/audio before first presentation
+    g_playStage = "started";
     snprintf(g_status, sizeof(g_status), "buffering %s %dx%d", dec->name, g_srcW, g_srcH);
     notify_dbg("PS4 Cast: ffmpeg %s %dx%d", dec->name, g_srcW, g_srcH);
 
