@@ -110,7 +110,11 @@ static int resolve_host(void) {
     if (pool < 0) return -1;
     OrbisNetId rid = sceNetResolverCreate("ps4cast_ares", pool, 0);
     if (rid < 0) return -2;
-    int rc = sceNetResolverStartNtoa(rid, g_host, &a, 8 * 1000 * 1000, 3, 0);
+    // 3s x1 try, NOT 8s x3. A dead/slow host could burn up to 24s here — and this
+    // runs before the fetch budget can bail — so two resolves in one hls_open
+    // (master + variant) exceeded the 35s channel-switch watchdog grace on their
+    // own and fail-closed the app while zapping past unreachable channels.
+    int rc = sceNetResolverStartNtoa(rid, g_host, &a, 3 * 1000 * 1000, 1, 0);
     sceNetResolverDestroy(rid);
     if (rc < 0) return -3;
     g_addr = a.s_addr;
@@ -243,7 +247,15 @@ static int do_request(int reuse, int *status, char *loc, int loccap,
     return 0;
 }
 
+// Hard ceiling on ONE fetch (all redirect hops + the body read). Without it a
+// dead host could burn ~2.5s connect + 3s read per hop across 5 hops, and
+// hls_open does TWO fetches (master + variant) — enough to block the main thread
+// past the 35s channel-switch watchdog grace and fail-close the app. Observed as
+// "HANG watchdog stale=36002ms" while zapping through unreachable channels.
+#define ASEG_FETCH_BUDGET_US (9ULL * 1000 * 1000)
+
 static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
+    uint64_t budget0 = sceKernelGetProcessTime();
     // If an abort was issued (Stop/teardown) in the race window just before this
     // fetch started, honor it and bail — do NOT clear it and begin a blocking
     // resolve/connect the abort can no longer interrupt (no socket open yet).
@@ -259,6 +271,9 @@ static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
     int opened = 0;
     for (int hop = 0; hop < 5 && !opened; hop++) {
         if (g_abort) { conn_close(); g_kaAlive = 0; return -9; }   // bail between redirect hops on teardown
+        if (sceKernelGetProcessTime() - budget0 > ASEG_FETCH_BUDGET_US) {
+            conn_close(); g_kaAlive = 0; return -12;               // dead/slow host: fail fast
+        }
         if (parse_url(cur) != 0) { conn_close(); g_kaAlive = 0; return -1; }
         if (resolve_host() != 0) { conn_close(); g_kaAlive = 0; return -2; }
         // Reuse the kept-alive socket if it's to the same host:port:tls.
@@ -307,6 +322,9 @@ static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
         // Unknown length (no Content-Length): read to EOF, then close (no reuse).
         for (;;) {
             if (g_abort) { free(buf); conn_close(); g_kaAlive = 0; return -9; }
+            if (sceKernelGetProcessTime() - budget0 > ASEG_FETCH_BUDGET_US) {
+                free(buf); conn_close(); g_kaAlive = 0; return -12;
+            }
             if (used + 64 * 1024 > cap) {
                 size_t ncap = cap * 2;
                 if (ncap > ASEG_FETCH_CAP) ncap = ASEG_FETCH_CAP;
