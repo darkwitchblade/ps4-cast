@@ -1000,6 +1000,7 @@ static int load_variant(int idx) {
 void hls_request_downshift(void) { g_downshiftReq = 1; }
 
 int hls_open(const char *url) {
+    aseg_resume();                 // drop a stale abort from the previous stop (was failing this fetch with rc=-9)
     aseg_set_playlist_budget(1);   // small fetches: fail fast so a dead channel can't block the switch
     hls_close();
     trace_mark("hls open %s", url);

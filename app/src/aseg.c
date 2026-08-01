@@ -189,6 +189,18 @@ void aseg_abort(void) {
     if (g_sock >= 0) sceNetSocketAbort(g_sock, 0);
 }
 
+// Clear a STALE abort at the start of a new stream. player_stop() raises g_abort
+// to unblock in-flight fetches; that flag then survived into the next channel's
+// FIRST playlist fetch, which bailed immediately with rc=-9 ("hls fetch failed").
+// The flag self-clears on that failed fetch, so the next attempt succeeded — which
+// is why the failure looked random (measured 8/15 channel tunes failing, always
+// rc=-9, on sources answering 200 in 0.3s from a PC).
+//
+// NOTE: this does NOT make the flag sticky. aseg_fetch keeps its own per-fetch
+// clear; an earlier attempt to remove that in favour of this call wedged fetching
+// entirely, because aseg_abort() is also raised from live-playback paths.
+void aseg_resume(void) { g_abort = 0; }
+
 // One request: connect, GET (Connection: close), parse headers. On 3xx returns
 // 1 and copies Location into `loc`. On 2xx returns 0 and leaves the connection
 // positioned at the first body byte, with header-adjacent body bytes in *lead.
