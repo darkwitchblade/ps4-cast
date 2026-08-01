@@ -95,11 +95,6 @@ void audio_set_base(double pts_sec) {
     }
 }
 
-void audio_reset_base(double pts_sec) {
-    g_base = pts_sec - (double)g_hwOut / RATE;
-    g_baseSet = 1;
-}
-
 void audio_flush(void) {
     if (!g_ok) return;
     scePthreadMutexLock(&g_amtx);

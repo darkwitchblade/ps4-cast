@@ -10,7 +10,6 @@
 int    audio_open(void);                 // 48kHz S16 stereo; 0 on success
 void   audio_write(const int16_t *interleaved, int nframes); // nframes stereo
 void   audio_set_base(double pts_sec);   // anchor the clock to the first audio pts
-void   audio_reset_base(double pts_sec); // force re-anchor after seek/new stream
 void   audio_flush(void);                // clear queued PCM after seek/stop
 unsigned audio_fill_ms(void);            // decoded audio waiting in the ring (decode-thread backpressure)
 void   audio_pause(int paused);          // pause consumption without draining PCM

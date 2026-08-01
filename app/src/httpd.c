@@ -661,6 +661,10 @@ static const char AVTRANSPORT_XML[] =
 "<argument><name>RecordMedium</name><direction>out</direction><relatedStateVariable>RecordStorageMedium</relatedStateVariable></argument>"
 "<argument><name>WriteStatus</name><direction>out</direction><relatedStateVariable>RecordMediumWriteStatus</relatedStateVariable></argument>"
 "</argumentList></action>"
+"<action><name>GetCurrentTransportActions</name><argumentList>"
+"<argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>"
+"<argument><name>Actions</name><direction>out</direction><relatedStateVariable>CurrentTransportActions</relatedStateVariable></argument>"
+"</argumentList></action>"
 "</actionList>"
 "<serviceStateTable>"
 "<stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_InstanceID</name><dataType>ui4</dataType></stateVariable>"
@@ -686,6 +690,7 @@ static const char AVTRANSPORT_XML[] =
 "<stateVariable sendEvents=\"no\"><name>PlaybackStorageMedium</name><dataType>string</dataType></stateVariable>"
 "<stateVariable sendEvents=\"no\"><name>RecordStorageMedium</name><dataType>string</dataType></stateVariable>"
 "<stateVariable sendEvents=\"no\"><name>RecordMediumWriteStatus</name><dataType>string</dataType></stateVariable>"
+"<stateVariable sendEvents=\"no\"><name>CurrentTransportActions</name><dataType>string</dataType></stateVariable>"
 "</serviceStateTable>"
 "</scpd>";
 
@@ -761,6 +766,7 @@ static const char CONNECTION_XML[] =
 "</scpd>";
 
 static char g_dlna_uri[1024];
+static int  g_dlna_started;
 
 static void send_response(OrbisNetId c, const char *status, const char *ctype,
                           const char *body, int bodylen);
@@ -772,6 +778,7 @@ static void xml_unescape(char *s) {
         else if (strncmp(r, "&lt;", 4) == 0) { *w++ = '<'; r += 4; }
         else if (strncmp(r, "&gt;", 4) == 0) { *w++ = '>'; r += 4; }
         else if (strncmp(r, "&quot;", 6) == 0) { *w++ = '"'; r += 6; }
+        else if (strncmp(r, "&apos;", 6) == 0) { *w++ = '\''; r += 6; }
         else { *w++ = *r++; }
     }
     *w = '\0';
@@ -792,6 +799,52 @@ static int extract_tag(const char *body, const char *tag, char *out, int outlen)
     out[n] = '\0';
     xml_unescape(out);
     return 1;
+}
+
+static void xml_escape(const char *src, char *dst, int cap) {
+    int n = 0;
+    if (cap <= 0) return;
+    while (*src && n < cap - 1) {
+        const char *rep = NULL;
+        if (*src == '&') rep = "&amp;";
+        else if (*src == '<') rep = "&lt;";
+        else if (*src == '>') rep = "&gt;";
+        else if (*src == '"') rep = "&quot;";
+        else if (*src == '\'') rep = "&apos;";
+        if (rep) {
+            int rn = (int)strlen(rep);
+            if (n + rn >= cap) break;
+            memcpy(dst + n, rep, rn);
+            n += rn;
+        } else {
+            dst[n++] = *src;
+        }
+        src++;
+    }
+    dst[n] = '\0';
+}
+
+static int parse_upnp_time(const char *s, double *seconds) {
+    char *end;
+    long h = strtol(s, &end, 10);
+    if (end == s || *end != ':' || h < 0) return 0;
+    s = end + 1;
+    long m = strtol(s, &end, 10);
+    if (end == s || *end != ':' || m < 0 || m > 59) return 0;
+    s = end + 1;
+    double sec = strtod(s, &end);
+    if (end == s || *end != '\0' || sec < 0 || sec >= 60) return 0;
+    *seconds = (double)h * 3600.0 + (double)m * 60.0 + sec;
+    return 1;
+}
+
+static void format_upnp_time(double seconds, char *out, int cap) {
+    if (seconds < 0) seconds = 0;
+    uint64_t total = (uint64_t)(seconds + 0.5);
+    snprintf(out, cap, "%llu:%02llu:%02llu",
+             (unsigned long long)(total / 3600),
+             (unsigned long long)((total / 60) % 60),
+             (unsigned long long)(total % 60));
 }
 
 static void set_pending_play(const char *url) {
@@ -815,14 +868,33 @@ static void set_pending_player(const char *url) {
 }
 
 static void send_soap_ok(OrbisNetId c, const char *action, const char *inner) {
-    char body[1024];
+    // The HTTP server is single-threaded. Keep the large SOAP scratch buffer
+    // off its stack: nesting it under handle_client's request/position buffers
+    // exhausted the default Orbis pthread stack in v04.22.
+    static char body[8192];
     int n = snprintf(body, sizeof(body),
         "<?xml version=\"1.0\"?>"
         "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
         "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
         "<s:Body><u:%sResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">%s</u:%sResponse></s:Body>"
         "</s:Envelope>", action, inner ? inner : "", action);
+    if (n < 0) n = 0;
+    if (n >= (int)sizeof(body)) n = (int)sizeof(body) - 1;
     send_response(c, "200 OK", "text/xml; charset=\"utf-8\"", body, n);
+}
+
+static void send_soap_fault(OrbisNetId c, int code, const char *description) {
+    char body[1024];
+    int n = snprintf(body, sizeof(body),
+        "<?xml version=\"1.0\"?>"
+        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
+        "<s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring>"
+        "<detail><UPnPError xmlns=\"urn:schemas-upnp-org:control-1-0\">"
+        "<errorCode>%d</errorCode><errorDescription>%s</errorDescription>"
+        "</UPnPError></detail></s:Fault></s:Body></s:Envelope>", code, description);
+    if (n < 0) n = 0;
+    if (n >= (int)sizeof(body)) n = (int)sizeof(body) - 1;
+    send_response(c, "500 Internal Server Error", "text/xml; charset=\"utf-8\"", body, n);
 }
 
 static void send_all(OrbisNetId c, const char *buf, int len) {
@@ -868,7 +940,9 @@ static const char *ci_strstr(const char *hay, const char *needle) {
 }
 
 static void handle_client(OrbisNetId c) {
-    char req[8192];
+    // One request is handled at a time by server_main, so static storage is safe
+    // and avoids spending 8 KB of the HTTP thread stack before dispatch begins.
+    static char req[8192];
     int n = sceNetRecv(c, req, sizeof(req) - 1, 0);
     if (n <= 0)
         return;
@@ -1081,41 +1155,95 @@ static void handle_client(OrbisNetId c) {
     if (strcmp(method, "POST") == 0 && strcmp(path, "/upnp/control/AVTransport") == 0) {
         if (strstr(req, "SetAVTransportURI")) {
             char uri[1024];
-            if (extract_tag(body, "CurrentURI", uri, sizeof(uri))) {
-                strncpy(g_dlna_uri, uri, sizeof(g_dlna_uri) - 1);
-                g_dlna_uri[sizeof(g_dlna_uri) - 1] = '\0';
-                strncpy(g_last_push, uri, sizeof(g_last_push) - 1);
-                g_last_push[sizeof(g_last_push) - 1] = '\0';
-                set_pending_player(g_dlna_uri);
+            if (!extract_tag(body, "CurrentURI", uri, sizeof(uri)) || !uri[0]) {
+                send_soap_fault(c, 402, "Invalid Args");
+                return;
             }
+            int changed = strcmp(g_dlna_uri, uri) != 0;
+            strncpy(g_dlna_uri, uri, sizeof(g_dlna_uri) - 1);
+            g_dlna_uri[sizeof(g_dlna_uri) - 1] = '\0';
+            strncpy(g_last_push, uri, sizeof(g_last_push) - 1);
+            g_last_push[sizeof(g_last_push) - 1] = '\0';
+            // SetAVTransportURI loads a resource; Play starts it. Starting here
+            // as well made Castify's normal SetURI->Play sequence open the same
+            // media twice and reset the audio clock.
+            if (changed) {
+                g_dlna_started = 0;
+                if (player_started()) {
+                    scePthreadMutexLock(&g_mtx);
+                    g_stop_pending = 1;
+                    scePthreadMutexUnlock(&g_mtx);
+                    player_interrupt();
+                }
+            }
+            trace_mark("dlna seturi changed=%d len=%d", changed, (int)strlen(uri));
             send_soap_ok(c, "SetAVTransportURI", "");
             return;
         }
         if (strstr(req, "Play")) {
-            if (g_dlna_uri[0])
+            if (!g_dlna_uri[0]) {
+                send_soap_fault(c, 716, "Resource not found");
+                return;
+            }
+            if (g_dlna_started && player_started()) {
+                player_pause(0);              // true resume; do not reopen media
+            } else {
                 set_pending_player(g_dlna_uri);
+                g_dlna_started = 1;
+            }
+            trace_mark("dlna play resume=%d", player_started() ? 1 : 0);
             send_soap_ok(c, "Play", "");
             return;
         }
         if (strstr(req, "Stop") || strstr(req, "Pause")) {
             if (strstr(req, "Pause")) {
+                if (!player_started()) {
+                    send_soap_fault(c, 701, "Transition not available");
+                    return;
+                }
                 player_pause(1);
+                trace_mark("dlna pause");
                 send_soap_ok(c, "Pause", "");
             } else {
                 scePthreadMutexLock(&g_mtx);
                 g_stop_pending = 1;
                 scePthreadMutexUnlock(&g_mtx);
+                g_dlna_started = 0;
                 player_interrupt();
+                trace_mark("dlna stop");
                 send_soap_ok(c, "Stop", "");
             }
             return;
         }
         if (strstr(req, "Seek")) {
+            char unit[32], target[64];
+            double seconds = 0, duration = 0;
+            player_progress(NULL, &duration);
+            if (!extract_tag(body, "Unit", unit, sizeof(unit)) ||
+                !extract_tag(body, "Target", target, sizeof(target))) {
+                send_soap_fault(c, 402, "Invalid Args");
+                return;
+            }
+            if (strcmp(unit, "ABS_TIME") != 0 && strcmp(unit, "REL_TIME") != 0) {
+                send_soap_fault(c, 710, "Seek mode not supported");
+                return;
+            }
+            if (!player_can_seek()) {
+                send_soap_fault(c, 710, "Seek mode not supported");
+                return;
+            }
+            if (!parse_upnp_time(target, &seconds) || (duration > 0 && seconds > duration + 0.5)) {
+                send_soap_fault(c, 711, "Illegal seek target");
+                return;
+            }
+            player_seek(seconds);
+            trace_mark("dlna seek %.3f", seconds);
             send_soap_ok(c, "Seek", "");
             return;
         }
         if (strstr(req, "GetTransportInfo")) {
-            const char *state = player_started() ? (player_is_paused() ? "PAUSED_PLAYBACK" : "PLAYING") : "STOPPED";
+            const char *state = player_started() ? (player_is_paused() ? "PAUSED_PLAYBACK" : "PLAYING")
+                                                 : "STOPPED";
             char inner[220];
             snprintf(inner, sizeof(inner),
                          "<CurrentTransportState>%s</CurrentTransportState>"
@@ -1126,20 +1254,43 @@ static void handle_client(OrbisNetId c) {
             return;
         }
         if (strstr(req, "GetPositionInfo")) {
-            send_soap_ok(c, "GetPositionInfo",
-                         "<Track>0</Track><TrackDuration>00:00:00</TrackDuration>"
-                         "<TrackMetaData></TrackMetaData><TrackURI></TrackURI>"
-                         "<RelTime>00:00:00</RelTime><AbsTime>00:00:00</AbsTime>"
-                         "<RelCount>0</RelCount><AbsCount>0</AbsCount>");
+            double current = 0, duration = 0;
+            char cur[32], dur[32];
+            static char uri[6144], inner[6656];
+            player_progress(&current, &duration);
+            format_upnp_time(current, cur, sizeof(cur));
+            format_upnp_time(duration, dur, sizeof(dur));
+            xml_escape(g_dlna_uri, uri, sizeof(uri));
+            snprintf(inner, sizeof(inner),
+                     "<Track>%d</Track><TrackDuration>%s</TrackDuration>"
+                     "<TrackMetaData></TrackMetaData><TrackURI>%s</TrackURI>"
+                     "<RelTime>%s</RelTime><AbsTime>%s</AbsTime>"
+                     "<RelCount>0</RelCount><AbsCount>0</AbsCount>",
+                     g_dlna_uri[0] ? 1 : 0, dur, uri, cur, cur);
+            send_soap_ok(c, "GetPositionInfo", inner);
             return;
         }
         if (strstr(req, "GetMediaInfo")) {
-            send_soap_ok(c, "GetMediaInfo",
-                         "<NrTracks>0</NrTracks><MediaDuration>00:00:00</MediaDuration>"
-                         "<CurrentURI></CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
-                         "<NextURI></NextURI><NextURIMetaData></NextURIMetaData>"
-                         "<PlayMedium>NETWORK</PlayMedium><RecordMedium>NOT_IMPLEMENTED</RecordMedium>"
-                         "<WriteStatus>NOT_IMPLEMENTED</WriteStatus>");
+            double duration = 0;
+            char dur[32];
+            static char uri[6144], inner[6656];
+            player_progress(NULL, &duration);
+            format_upnp_time(duration, dur, sizeof(dur));
+            xml_escape(g_dlna_uri, uri, sizeof(uri));
+            snprintf(inner, sizeof(inner),
+                     "<NrTracks>%d</NrTracks><MediaDuration>%s</MediaDuration>"
+                     "<CurrentURI>%s</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
+                     "<NextURI></NextURI><NextURIMetaData></NextURIMetaData>"
+                     "<PlayMedium>NETWORK</PlayMedium><RecordMedium>NOT_IMPLEMENTED</RecordMedium>"
+                     "<WriteStatus>NOT_IMPLEMENTED</WriteStatus>",
+                     g_dlna_uri[0] ? 1 : 0, dur, uri);
+            send_soap_ok(c, "GetMediaInfo", inner);
+            return;
+        }
+        if (strstr(req, "GetCurrentTransportActions")) {
+            send_soap_ok(c, "GetCurrentTransportActions",
+                         player_can_seek() ? "<Actions>Play,Stop,Pause,Seek</Actions>"
+                                           : "<Actions>Play,Stop,Pause</Actions>");
             return;
         }
     }
@@ -1457,7 +1608,18 @@ int httpd_start(int port) {
         return -3;
     }
 
-    if (scePthreadCreate(&g_thread, NULL, server_main, NULL, "ps4cast_httpd") != 0) {
+    // Explicit headroom for request parsing and future SOAP actions. The large
+    // current scratch buffers are static, but relying on the small platform
+    // default again would make this thread fragile as handlers evolve.
+    OrbisPthreadAttr attr;
+    OrbisPthreadAttr *pattr = NULL;
+    int attrInit = scePthreadAttrInit(&attr) == 0;
+    if (attrInit) {
+        if (scePthreadAttrSetstacksize(&attr, 256 * 1024) == 0) pattr = &attr;
+    }
+    int trc = scePthreadCreate(&g_thread, pattr, server_main, NULL, "ps4cast_httpd");
+    if (attrInit) scePthreadAttrDestroy(&attr);
+    if (trc != 0) {
         sceNetSocketClose(g_listen);
         g_listen = -1;
         return -4;

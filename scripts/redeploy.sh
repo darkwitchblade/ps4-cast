@@ -161,7 +161,7 @@ if [ "${PS4CAST_PAYLOAD_LAUNCH:-0}" = "1" ]; then
   echo "    payload launch didn't come up — open PS4 Cast on the console (icon)"
 else
   echo "    >> Open PS4 Cast from the home-screen ICON now (clean launch)."
-  echo "    waiting up to 90s for it to come up on v$VER…"
+  echo "    waiting up to 90s for it to come up on v${VER}..."
   wait_up && exit 0
   echo "    not up yet — open PS4 Cast on the console (icon), it is installed as v$VER"
 fi

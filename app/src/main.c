@@ -1117,6 +1117,7 @@ int main(void) {
                 notify("Sign in a PS4 user to cast");   // playing under ANONYMOUS crashes SceShellUI
             } else {
                 int wasPlaying = player_started() && everDrew;
+                player_set_startup_headstart(1);
                 int rc = player_play(url);
                 if (rc != 0 || !wasPlaying) everDrew = 0; // hold old frame across the switch
                 reconnecting = 0; reconnects = 0;
@@ -1128,6 +1129,7 @@ int main(void) {
                 notify("Sign in a PS4 user to cast");
             } else {
                 int wasPlaying = player_started() && everDrew;
+                player_set_startup_headstart(1);
                 int rc = player_play(url);
                 if (rc != 0 || !wasPlaying) everDrew = 0; // hold old frame across the switch
                 reconnecting = 0; reconnects = 0;

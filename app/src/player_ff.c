@@ -182,6 +182,9 @@ static volatile int      g_decStop = 0;
 static volatile int      g_decEof = 0;
 static volatile int      g_liveRestartPending = 0;
 static volatile int      g_rebuffering = 0;    // cache-pause: holding for buffer
+static volatile int      g_nextStartupHeadstart = 0;
+static int               g_startupHeadstart = 0;
+static uint64_t          g_startupGateAt = 0;
 static int               g_emptyCnt = 0;       // debounce queue-empty
 static int               g_rebufHits = 0;      // consecutive rebuffers (for HLS ABR)
 static int               g_rebufTotal = 0;     // total rebuffers this playback (telemetry)
@@ -348,6 +351,7 @@ void player_stop(void) {
     if (g_isHls) hls_close(); else httpsrc_close();
     g_isHls = 0;
     g_hlsSegDemux = 0;
+    g_rebuffering = 0; g_startupHeadstart = 0; g_startupGateAt = 0;
     g_vstream = -1; g_active = 0; g_started = 0; g_gotFrame = 0; g_interlaced = 0;
     g_pos = 0; g_startProc = 0; g_scaledW = g_scaledH = 0;
     g_paused = 0; g_wasPaused = 0; g_seekPending = 0; g_curSec = 0; g_durSec = 0;
@@ -377,6 +381,10 @@ static int open_sw_video(const AVCodec *dec) {
 }
 
 int player_play(const char *url) {
+    // A cast request can ask for a small startup cushion. Capture it before
+    // player_stop() resets the active playback state.
+    int requestedHeadstart = g_nextStartupHeadstart;
+    g_nextStartupHeadstart = 0;
     g_playStage = "enter";
     watchdog_set_busy(1);   // teardown + open + probe can run many seconds (esp. off a 1080i SW channel); don't let the freeze watchdog kill the switch
     uint64_t swt0 = sceKernelGetProcessTime();   // channel-switch stage timing (-> g_swDiag, shown in /status)
@@ -612,11 +620,13 @@ int player_play(const char *url) {
     // Bigger cushion for public/CDN links (4s) than LAN (1.5s) — 2s was too
     // small for remote HTTPS streams.
     g_resumeSec = (!g_isHls && httpsrc_is_lan()) ? 1.5 : 4.0;
-    g_rebuffering = g_isHls ? 1 : 0;
+    g_startupHeadstart = requestedHeadstart;
+    g_startupGateAt = sceKernelGetProcessTime();
+    g_rebuffering = (g_isHls || g_startupHeadstart) ? 1 : 0;
     g_emptyCnt = 0; g_rebufHits = 0; g_rebufTotal = 0;
 
     g_started = 1; g_active = 1; g_gotFrame = 0;
-    if (g_isHls) audio_pause(1);  // startup headstart: fill frames/audio before first presentation
+    if (g_rebuffering) audio_pause(1);  // fill video and decoded audio before first presentation
     g_playStage = "started";
     snprintf(g_status, sizeof(g_status), "buffering %s %dx%d", dec->name, g_srcW, g_srcH);
     notify_dbg("PS4 Cast: ffmpeg %s %dx%d", dec->name, g_srcW, g_srcH);
@@ -670,6 +680,12 @@ int player_play(const char *url) {
         scePthreadMutexDestroy(&g_fqMtx);
     }
 #endif
+    // The startup gate is queue-based. If thread creation failed and playback
+    // fell back to the inline renderer, do not leave audio paused indefinitely.
+    if (!g_threaded && g_rebuffering) {
+        g_rebuffering = 0;
+        audio_pause(0);
+    }
     // Hardware NV12 frames use the parallel presenter, writing directly to the
     // active framebuffer so we avoid a second full-screen blit.
     if (g_useHw) present_pool_start();
@@ -690,9 +706,11 @@ int player_is_live(void)   { return g_isHls && hls_is_live(); }   // true live (
 
 void player_pause(int paused) {
     g_paused = paused ? 1 : 0;
-    audio_pause(g_paused);
+    audio_pause(g_paused || g_rebuffering);
 }
 int  player_is_paused(void)   { return g_paused; }
+int  player_can_seek(void)    { return g_started && !g_isHls && g_durSec > 0; }
+void player_set_startup_headstart(int on) { g_nextStartupHeadstart = on ? 1 : 0; }
 // Seek by a delta from the PENDING target when one is queued, else from the
 // current position. Rapid R1/L1 presses used to all read g_curSec, which only
 // updates once the decode thread applies the seek — so a second press within
@@ -773,11 +791,21 @@ static void apply_seek(void) {
         if (g_adec) avcodec_flush_buffers(g_adec);
         if (g_swr) { swr_close(g_swr); swr_init(g_swr); }
         if (g_haveAudio) {
+            // av_seek_frame(...BACKWARD) lands on a keyframe before the requested
+            // target. Leave the clock unanchored after flushing; the first real
+            // decoded audio PTS must establish it. Forcing it to `sec` made the
+            // earlier audio content play against a later clock, so Castify seeks
+            // produced sound that visibly trailed the picture.
             audio_flush();
-            audio_reset_base(sec);
         }
+        trace_mark("seek applied target=%.3f audio=reanchor-next-pts", sec);
         g_sepAudioEof = 0;
         g_gotFrame = 0;          // re-anchor the pacing clock on the next frame
+        if (g_threaded) {
+            g_rebuffering = 1;
+            g_startupGateAt = sceKernelGetProcessTime();
+            audio_pause(1);      // refill both clocks before presenting after scrub
+        }
         g_curSec = sec;
         g_active = 1;
         snprintf(g_status, sizeof(g_status), "seeking %.0fs", sec);
@@ -798,6 +826,7 @@ static void apply_hls_reset(void) {
     g_startPts = 0;
     g_emptyCnt = 0;
     g_rebuffering = 1;
+    g_startupGateAt = sceKernelGetProcessTime();
     g_decEof = 0;
     g_lastLagUs = 0;
     snprintf(g_status, sizeof(g_status), "buffering live");
@@ -946,7 +975,12 @@ static void decode_audio_frame(AVPacket *pkt, AVRational atb) {
         if (r < 0) break;
         int64_t apts = g_aframe->best_effort_timestamp;
         if (apts == AV_NOPTS_VALUE) apts = g_aframe->pts;
-        if (apts != AV_NOPTS_VALUE) audio_set_base((double)apts * av_q2d(atb));
+        if (apts != AV_NOPTS_VALUE) {
+            double ptsSec = (double)apts * av_q2d(atb);
+            int firstAnchor = !audio_has_clock();
+            audio_set_base(ptsSec);
+            if (firstAnchor) trace_mark("audio anchor pts=%.3f", ptsSec);
+        }
         int out_max = (int)swr_get_out_samples(g_swr, g_aframe->nb_samples);
         if (out_max <= 0) continue;
         if (out_max > g_abufCap) {
@@ -969,6 +1003,7 @@ static void decode_audio_pkt(void) {
 // Separate-audio thread: pump the audio rendition demuxer independently of the
 // video decode, so HLS streams with audio in their own playlist still have sound.
 static void *audio_thread_main(void *arg) {
+    trace_mark("thread + audio self=%p", (void *)scePthreadSelf());
     (void)arg;
     AVRational atb = g_afmt->streams[g_aastream]->time_base;
     int eofStreak = 0;
@@ -1383,6 +1418,7 @@ static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
 // audio), as fast as the queue drains. Presentation/pacing happens on the main
 // thread (render_threaded) so a heavy frame/GOP never hitches the screen.
 static void *decode_thread_main(void *arg) {
+    trace_mark("thread + decode self=%p", (void *)scePthreadSelf());
     (void)arg;
     while (!g_decStop) {
         if (g_seekPending) { apply_seek(); g_decEof = 0; }
@@ -1502,6 +1538,7 @@ static void seg_ring_flush(void) {
 }
 
 static void *seg_fetch_thread_main(void *arg) {
+    trace_mark("thread + segfetch self=%p", (void *)scePthreadSelf());
     (void)arg;
     while (!g_segFetchStop) {
         if (g_paused) { sceKernelUsleep(8000); continue; }
@@ -1626,6 +1663,7 @@ static void queue_sw_frame_us(AVRational tb) {
 }
 
 static void *decode_segment_thread_main(void *arg) {
+    trace_mark("thread + decode-seg self=%p", (void *)scePthreadSelf());
     (void)arg;
     while (!g_decStop) {
         // Backpressure on the audio ring — the SAME guard decode_thread_main has.
@@ -1756,10 +1794,18 @@ static int render_threaded(Gfx *g) {
     }
     if (g_wasPaused) { g_wasPaused = 0; if (g_startProc) g_startProc += sceKernelGetProcessTime() - g_pauseAt; }
 
-    if (g_isHls && !g_gotFrame && g_rebuffering) {
-        if (g_fqCount < HLS_START_FRAMES && !g_decEof) return 0;
+    if (!g_gotFrame && g_rebuffering) {
+        uint64_t elapsed = sceKernelGetProcessTime() - g_startupGateAt;
+        int videoReady = g_fqCount >= HLS_START_FRAMES || g_decEof;
+        // A short decoded-audio cushion prevents a pushed phone URL from
+        // showing video before its audio clock exists. The timeout keeps odd or
+        // silent streams from waiting forever.
+        int audioReady = !g_haveAudio || audio_fill_ms() >= 250 ||
+                         elapsed >= 2500000ULL || g_decEof;
+        if ((!videoReady || !audioReady) && elapsed < 5000000ULL && !g_decEof)
+            return 0;
         g_rebuffering = 0;
-        audio_pause(0);
+        if (!g_paused) audio_pause(0);
     }
 
     // Cache-pause: when the queue starves (network underrun), freeze the audio

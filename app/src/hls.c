@@ -39,6 +39,19 @@ static int     g_targetDurMs;     // EXT-X-TARGETDURATION for live refresh pacin
 static int     g_mediaSeq;        // EXT-X-MEDIA-SEQUENCE for sliding live windows
 // Does the body we parsed actually belong to the URL we asked for?
 static volatile unsigned g_openGen = 0;   // bumped on every close/open
+// Retry traces fire ~3x/second and were evicting everything else from the ring
+// (that is why 'hls open' lines were never visible when diagnosing the wedge).
+static unsigned g_retryTick = 0;
+#define RETRY_TRACE (((g_retryTick++) & 15) == 0)
+// Hard ceiling on how long a read may sit retrying before it gives up.
+// A live stream legitimately waits a few seconds for the next segment, but an
+// UNBOUNDED wait let one bad channel freeze the app: the MAIN thread parks in
+// this loop inside avformat_find_stream_info (measured: probe info=97526ms,
+// 43s of retries), so it never services /chan again and every later channel
+// change is silently ignored while the player still reports "stopped".
+// It is invisible to the freeze watchdog because aseg pets it from this very
+// thread -- alive, but useless.
+#define HLS_READ_STALL_US (20ULL * 1000 * 1000)
 static char    g_dbgVarUrl[56] = "";
 static char    g_dbgSeg0[56] = "";
 static uint64_t g_lastRefreshUs;
@@ -609,6 +622,7 @@ static int apref_wait_take(int seg) {
 }
 
 void hls_close(void) {
+    trace_mark("hls close gen=%u->%u self=%p", g_openGen, g_openGen + 1, (void *)scePthreadSelf());
     g_openGen++;      // anything still looping from the previous stream is now stale
     g_active = 0;     // ...and hls_next_segment's retry loop re-checks this every pass
     watchdog_note("close/apref-stop");
@@ -1037,7 +1051,7 @@ int hls_open(const char *url) {
     hls_close();                   // raises abort + joins the prefetch threads
     aseg_resume();                 // ...so resume only AFTER they are gone, never before
     watchdog_note("open/master");
-    trace_mark("hls open %s", url);
+    trace_mark("hls open gen=%u self=%p %s", g_openGen, (void *)scePthreadSelf(), url);
     g_variantCount = 0; g_curVariant = -1; g_downshiftReq = 0; g_sepAudio = 0;
     g_vLastRc = g_vLastBytes = g_vLastMs = g_vFailCount = 0; g_vLastUrl[0] = '\0';
     g_aLastRc = g_aLastBytes = g_aLastMs = g_aFailCount = 0; g_aLastUrl[0] = '\0';
@@ -1096,7 +1110,7 @@ int hls_open(const char *url) {
 
 static int refresh_live_playlist(void) {
     if (!g_isLive || !g_mediaUrl[0]) return -1;
-    trace_mark("hls refresh begin idx=%d/%d seq=%d", g_segIdx, g_segCount, g_mediaSeq);
+    if (RETRY_TRACE) trace_mark("hls refresh begin idx=%d/%d seq=%d self=%p", g_segIdx, g_segCount, g_mediaSeq, (void *)scePthreadSelf());
     uint64_t now = sceKernelGetProcessTime();
     int waitMs = g_targetDurMs / 2;
     if (waitMs < 500) waitMs = 500;
@@ -1153,7 +1167,9 @@ static int ensure_segment(void) {
         // it. Do not advance into segCount on a fetch miss; retry briefly and
         // refresh the playlist so only a real sliding-window jump creates a gap.
         if (g_liveFetchFailStreak >= 2) refresh_live_playlist();
-        trace_mark("hls fetch retry idx=%d/%d streak=%d", g_segIdx, g_segCount, g_liveFetchFailStreak);
+        if (RETRY_TRACE) trace_mark("hls fetch retry idx=%d/%d streak=%d self=%p gen=%u act=%d",
+                                    g_segIdx, g_segCount, g_liveFetchFailStreak,
+                                    (void *)scePthreadSelf(), g_openGen, g_active);
         return -2;
     }
     short_url(u, g_vLastUrl, sizeof(g_vLastUrl));
@@ -1171,6 +1187,7 @@ static int ensure_segment(void) {
 int hls_read(uint8_t *buf, uint32_t len) {
     if (!g_active) return -1;
     const unsigned myGen = g_openGen;
+    uint64_t stall0 = 0;                 // set on the first retry, cleared on progress
     for (;;) {
         // Re-check EVERY pass, not just on entry. This retry loop is driven by
         // FFmpeg on the decode thread; with only the entry check, a thread already
@@ -1179,7 +1196,18 @@ int hls_read(uint8_t *buf, uint32_t len) {
         // every channel tuned afterwards (a post-burst /chan looked ignored).
         if (!g_active || g_openGen != myGen) return -1;
         int es = ensure_segment();
-        if (es == -2) { sceKernelUsleep(300 * 1000); continue; }
+        if (es == -2) {
+            uint64_t now = sceKernelGetProcessTime();
+            if (!stall0) stall0 = now;
+            else if (now - stall0 > HLS_READ_STALL_US) {
+                trace_mark("hls read give up after %llums idx=%d/%d",
+                           (unsigned long long)((now - stall0) / 1000), g_segIdx, g_segCount);
+                return 0;                // EOF -> the open fails cleanly and /chan works again
+            }
+            sceKernelUsleep(300 * 1000);
+            continue;
+        }
+        stall0 = 0;                      // made progress
         if (es != 0) return 0; // EOF
 
         if (g_memBuf) {
@@ -1244,6 +1272,7 @@ int hls_next_segment(uint8_t **outBuf, int *outLen, int *outResetGen) {
     if (outResetGen) *outResetGen = g_resetGen;
     if (!g_active || !hls_can_segment_demux()) return -1;
     const unsigned myGen = g_openGen;
+    uint64_t stall0 = 0;
 
     for (;;) {
         // Bail immediately on teardown. Without this, this retry loop kept
@@ -1258,6 +1287,13 @@ int hls_next_segment(uint8_t **outBuf, int *outLen, int *outResetGen) {
         if (!g_active || g_openGen != myGen) return -1;
         if (g_segIdx >= g_segCount) {
             if (!g_isLive) return -1;            // VOD: all segments played -> EOF
+            {   uint64_t now = sceKernelGetProcessTime();
+                if (!stall0) stall0 = now;
+                else if (now - stall0 > HLS_READ_STALL_US) {
+                    trace_mark("hls seg give up after %llums idx=%d/%d",
+                               (unsigned long long)((now - stall0) / 1000), g_segIdx, g_segCount);
+                    return -1;
+                } }
             if (refresh_live_playlist() != 0) {
                 if (!g_active || g_openGen != myGen) return -1;
                 sceKernelUsleep(300 * 1000);
