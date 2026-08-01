@@ -414,11 +414,16 @@ int player_play(const char *url) {
     // Probe further so the audio stream in a concatenated MPEG-TS (HLS) is
     // reliably detected — the default probe can stop before the audio PID and
     // leave HLS playing silently.
-    // Keep the demux probe SMALL so channel switching is fast: reading 8MB off a
-    // slow IPTV server meant 15-25s per switch (it fetches several segments). 1MB
-    // / 1.5s still finds the TS video+audio PIDs on normal streams.
-    g_fmt->probesize = 1 * 1024 * 1024;
-    g_fmt->max_analyze_duration = 1500 * (int64_t)(AV_TIME_BASE / 1000);
+    // Probe size is a trade between channel-switch speed and finding the audio
+    // PID. 8MB/6s (original) made switches take 15-25s on slow IPTV servers, but
+    // 1MB/1.5s was too small and reintroduced exactly the silent-HLS bug the note
+    // above warns about: a 6Mbps 1080p stream fits only ~1.3s in 1MB, so the audio
+    // PID fell outside the window and playback ran with NO AUDIO (as=-1, audio
+    // device never opened). 4MB/4s finds the audio PID on these streams while
+    // keeping switches quick. Probe reads pet the watchdog, so a longer probe
+    // cannot trip the freeze detector.
+    g_fmt->probesize = 4 * 1024 * 1024;
+    g_fmt->max_analyze_duration = 4 * (int64_t)AV_TIME_BASE;
 
     g_playStage = "demux-open";
     int rc = avformat_open_input(&g_fmt, "stream", NULL, NULL);
@@ -1016,8 +1021,23 @@ static int setup_separate_audio(void) {
 // stopping/seeking). Shared by the software and hardware decode paths.
 static int fq_push(AVFrame *cl) {
     scePthreadMutexLock(&g_fqMtx);
-    while (!g_decStop && !g_seekPending && g_fqCount >= FQ_SLOTS)
-        scePthreadCondWait(&g_fqNotFull, &g_fqMtx);
+    while (!g_decStop && !g_seekPending && g_fqCount >= FQ_SLOTS) {
+        // The decode thread is the ONLY producer of audio as well as video, so
+        // blocking here on a full video queue also stops audio being decoded and
+        // the ring drains to empty — measured as fill swinging 2048ms -> 0ms with
+        // underruns climbing ~10/s (audible drop-outs) and >2s of A/V drift from
+        // the resulting silence padding. When audio is about to run dry, drop THIS
+        // frame instead of waiting: the queue is already full of video, so losing
+        // one frame costs far less than a gap in the sound, and returning to the
+        // loop lets the next audio packets be decoded.
+        if (audio_fill_ms() < 400) {
+            g_drops++;
+            scePthreadMutexUnlock(&g_fqMtx);
+            av_frame_free(&cl);
+            return 1;
+        }
+        scePthreadCondTimedwait(&g_fqNotFull, &g_fqMtx, 20 * 1000);
+    }
     if (g_decStop || g_seekPending) { scePthreadMutexUnlock(&g_fqMtx); av_frame_free(&cl); return 0; }
     g_fq[(g_fqHead + g_fqCount) % FQ_SLOTS].frame = cl;
     g_fqCount++;
@@ -1533,6 +1553,10 @@ static int open_segment_demux(uint8_t *segBuf, int segLen, MemAvio *mem,
     if (!fmt) { av_freep(&avio->buffer); avio_context_free(&avio); return -3; }
     fmt->pb = avio;
     fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+    // MUST stay small. This demuxer probes ONE finite segment, not a continuous
+    // stream: raising it to 2MB/3s made the probe swallow the whole segment, so no
+    // packets were left to decode and playback sat at fr=0 with an empty queue.
+    // Audio-PID detection is handled by the MAIN demuxer's larger probe, not here.
     fmt->probesize = 512 * 1024;
     fmt->max_analyze_duration = 1 * (int64_t)AV_TIME_BASE;
     int rc = avformat_open_input(&fmt, "segment.ts", NULL, NULL);
