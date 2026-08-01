@@ -659,7 +659,18 @@ static void rstrip(char *s) {
 }
 
 static int has_unsupported_hls_tags(const char *body) {
-    if (strstr(body, "#EXT-X-KEY"))       { snprintf(g_dbg, sizeof(g_dbg), "hls encrypted unsupported"); return 1; }
+    // Only reject ACTUAL encryption. "#EXT-X-KEY:METHOD=NONE" explicitly means the
+    // segments are NOT encrypted (RFC 8216 4.3.2.4) and is emitted by real
+    // broadcasters (e.g. DW), so treating any EXT-X-KEY as encrypted rejected
+    // perfectly playable streams. Scan each tag and only bail on a real METHOD.
+    for (const char *k = strstr(body, "#EXT-X-KEY"); k; k = strstr(k + 1, "#EXT-X-KEY")) {
+        const char *m = strstr(k, "METHOD=");
+        const char *eol = strchr(k, '\n');
+        if (!m || (eol && m > eol)) continue;               // malformed tag: ignore
+        if (strncmp(m + 7, "NONE", 4) == 0) continue;       // not encrypted
+        snprintf(g_dbg, sizeof(g_dbg), "hls encrypted unsupported");
+        return 1;
+    }
     if (strstr(body, "#EXT-X-BYTERANGE")) { snprintf(g_dbg, sizeof(g_dbg), "hls byterange unsupported"); return 1; }
     return 0;
 }
