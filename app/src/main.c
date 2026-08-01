@@ -18,6 +18,7 @@
 #include "ssdp.h"
 #include "pad_diag.h"
 #include "sys_diag.h"
+#include "vdec_hw.h"
 #include "notify.h"
 #include "audio.h"
 #endif
@@ -143,6 +144,21 @@ static void *watchdog_main(void *arg) {
         uint64_t hb = g_heartbeat;
         if (hb == 0) continue;                            // main loop not running yet
         uint64_t now = sceKernelGetProcessTime();
+        // A blocked hardware decode does NOT stall the main loop (the heartbeat
+        // keeps ticking), so the stale-heartbeat check below cannot see it. Check
+        // it explicitly: sceVideodec2Decode is synchronous and unabortable, so the
+        // only safe response to a GPU/driver hang is to fail-close the whole
+        // process — never abandon the worker or tear the decoder down in place.
+        uint64_t hwStuck = vdec_hw_inflight_us();
+        if (hwStuck > 10ULL * 1000 * 1000) {
+            gfx_emergency_release();
+            char hb2[128];
+            int hn = snprintf(hb2, sizeof(hb2),
+                              "HWHANG v" APP_VER " sceVideodec2Decode blocked %llums\n",
+                              (unsigned long long)(hwStuck / 1000));
+            persist_crash(hb2, hn);
+            _exit(0);
+        }
         uint64_t lim = g_wdBusy ? 35ULL * 1000 * 1000     // mid channel-switch: generous
                                 : 15ULL * 1000 * 1000;    // normal: ~15s with zero progress = frozen
         if (now > hb && (now - hb) > lim) {

@@ -51,4 +51,11 @@ const char *vdec_hw_debug(void);
 // the same baseline after each vdec_hw_open/close cycle; growth = a dmem leak.
 long vdec_hw_dmem_outstanding(void);
 
+// >0 = a synchronous sceVideodec2Decode call is currently executing, and this is
+// how long it has been blocked. The call cannot be safely aborted (the GPU may
+// still be writing into the frame buffers), so a stuck decode is handled by
+// fail-closing the whole app from the watchdog, never by abandoning the worker
+// or tearing the decoder down in place.
+uint64_t vdec_hw_inflight_us(void);
+
 #endif

@@ -523,12 +523,15 @@ int player_play(const char *url) {
                        vpar->format == AV_PIX_FMT_YUVJ420P);
     int hwSizeOk    = (vpar->width > 0 && vpar->height > 0 &&
                        vpar->width <= 1920 && vpar->height <= 1088);
+    // Level bounds the decoder's DPB/bitrate assumptions; the config is opened for
+    // <= 5.1, so anything above that (or an absurd level) goes to software.
+    int hwLevelOk   = (vpar->level <= 51);
     int hwEligible = g_hwEnabled && vpar->codec_id == AV_CODEC_ID_H264 &&
-                     hwProfileOk && hwDepthOk && hwSizeOk &&
+                     hwProfileOk && hwDepthOk && hwSizeOk && hwLevelOk &&
                      (!g_isHls || g_hlsSegDemux);
     if (g_hwEnabled && vpar->codec_id == AV_CODEC_ID_H264 && !hwEligible)
-        notify_dbg("PS4 Cast: H.264 prof=%d fmt=%d %dx%d -> software (unsupported by HW)",
-                   vpar->profile, vpar->format, vpar->width, vpar->height);
+        notify_dbg("PS4 Cast: H.264 prof=%d lvl=%d fmt=%d %dx%d -> software (unsupported by HW)",
+                   vpar->profile, vpar->level, vpar->format, vpar->width, vpar->height);
     if (interlaced) notify_dbg("PS4 Cast: interlaced -> %s + bob-deinterlace", hwEligible ? "hardware" : "software");
     if (hwEligible) {
         int bsfOk = 1;

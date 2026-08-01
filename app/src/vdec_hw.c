@@ -61,6 +61,8 @@ typedef struct { off_t off; size_t size; void *va; } DMem;
 // Outstanding direct (GPU/onion/garlic) memory currently held by the HW decoder.
 // Exposed via /status so a leak across vdec_hw_open/close cycles is observable
 // (the prime suspect for the resource-accumulation hang after many casts).
+#define VDEC_MAX_AU_BYTES (4 * 1024 * 1024)   // generous for 1080p H.264; guards malformed/hostile AUs
+static volatile uint64_t g_inflightSince = 0;   // >0 while sceVideodec2Decode is executing
 static long g_dmemOutstanding;
 long vdec_hw_dmem_outstanding(void) { return g_dmemOutstanding; }
 
@@ -197,6 +199,11 @@ fail:
 
 int vdec_hw_decode(const uint8_t *au, int len, int64_t pts, int64_t dts, VdecHwFrame *out) {
     if (!g_decoder || !au || len <= 0) return -1;
+    // Reject absurd access units before handing them to the GPU decoder. A
+    // malformed or hostile stream can present a huge AU; the decoder config was
+    // opened for 1080p-class input, so anything far beyond that is refused here
+    // (caller falls back to software) rather than risking a driver fault.
+    if (len > VDEC_MAX_AU_BYTES) return -1;
     void *fb = g_pool[g_poolIdx].va;
     g_poolIdx = (g_poolIdx + 1) % g_poolN;
 
@@ -212,8 +219,16 @@ int vdec_hw_decode(const uint8_t *au, int len, int64_t pts, int64_t dts, VdecHwF
     fbi.thisSize = sizeof(fbi); fbi.frameBuffer = fb; fbi.frameBufferSize = g_fbSize;
     Vdec2Output od; memset(&od, 0, sizeof(od)); od.thisSize = sizeof(od);
 
+    // Mark the call in flight. sceVideodec2Decode is SYNCHRONOUS and cannot be
+    // safely timed out or abandoned (the GPU may still be writing into the frame
+    // buffers, and tearing the decoder down after a hang is what produces the
+    // compositor faults we are trying to avoid). So we do NOT abort the call —
+    // we only record that it started, and the app-level watchdog fail-closes the
+    // WHOLE process if it never progresses. See vdec_hw_inflight_us().
     uint64_t t0 = sceKernelGetProcessTime();
+    g_inflightSince = t0;
     int rc = pDecode(g_decoder, &in, &fbi, &od);
+    g_inflightSince = 0;                    // returned: no longer blocked in the GPU call
     uint64_t dt = sceKernelGetProcessTime() - t0;
     if (dt > 500ULL * 1000ULL) {
         g_slowCount++;
@@ -289,4 +304,15 @@ void vdec_hw_close(void) {
     trace_mark("vdec closed #%ld dmem=%ldKB", g_closeCount, g_dmemOutstanding / 1024);
     snprintf(g_dbg, sizeof(g_dbg), "hw off open=%ld close=%ld reset=%ld slow=%ld fault=%ld",
              g_openCount, g_closeCount, g_resetCount, g_slowCount, g_faultCount);
+}
+
+// Microseconds the current sceVideodec2Decode call has been executing, or 0 when
+// no call is in flight. The watchdog uses this to detect a GPU/driver hang that
+// no return code can report, and fail-closes the process rather than trying to
+// abandon the worker or tear the decoder down mid-hang.
+uint64_t vdec_hw_inflight_us(void) {
+    uint64_t t = g_inflightSince;
+    if (!t) return 0;
+    uint64_t now = sceKernelGetProcessTime();
+    return now > t ? now - t : 0;
 }
