@@ -632,13 +632,20 @@ static void resolve_url(const char *base, const char *ref, char *out, int cap) {
 }
 
 // Fetch an entire (small) resource into a malloc'd NUL-terminated buffer.
+// Last playlist-fetch failure detail. "hls fetch failed" alone was useless: the
+// same channel fetches fine one minute and fails the next, and the aseg return
+// code distinguishes DNS (-2/-3) from connect (-1), HTTP status (-4), redirect
+// exhaustion (-5) and the time budget (-12).
+static int g_lastFetchRc, g_lastFetchLen;
 static char *fetch_all(const char *url, int *outlen) {
     uint8_t *raw = NULL;
     int len = 0;
     char fetchUrl[2048];
     snprintf(fetchUrl, sizeof(fetchUrl), "%s", url);
     prefer_plain_s3(fetchUrl, sizeof(fetchUrl));
-    if (aseg_fetch(fetchUrl, &raw, &len) != 0 || !raw || len <= 0 || len >= PLAYLIST_CAP) {
+    int frc = aseg_fetch(fetchUrl, &raw, &len);
+    g_lastFetchRc = frc; g_lastFetchLen = len;
+    if (frc != 0 || !raw || len <= 0 || len >= PLAYLIST_CAP) {
         if (raw) free(raw);
         return NULL;
     }
@@ -1002,7 +1009,8 @@ int hls_open(const char *url) {
 
     int len = 0;
     char *body = fetch_all(url, &len);
-    if (!body) { snprintf(g_dbg, sizeof(g_dbg), "hls fetch failed"); { aseg_set_playlist_budget(0); return -1; } }
+    if (!body) { snprintf(g_dbg, sizeof(g_dbg), "hls fetch failed rc=%d len=%d", g_lastFetchRc, g_lastFetchLen);
+                 { aseg_set_playlist_budget(0); return -1; } }
     if (strstr(body, "#EXTM3U") == NULL) {
         snprintf(g_dbg, sizeof(g_dbg), "not a playlist");
         free(body); { aseg_set_playlist_budget(0); return -2; }
