@@ -1,7 +1,8 @@
 #include "httpsrc.h"
 #include "tls.h"
 
-extern void watchdog_kick(void);   // see aseg.c: bounded slow I/O must not look like a freeze
+extern void watchdog_kick(void);
+extern void watchdog_note(const char *w);   // see aseg.c: bounded slow I/O must not look like a freeze
 
 #include <stdio.h>
 #include <string.h>
@@ -237,7 +238,11 @@ static int resolve_host(void) {
     // resolve fine (a channel whose server answers in 0.4s from a PC reported
     // "hls fetch failed" on console). Two tries with a sane timeout covers a
     // transient DNS hiccup while staying well inside the grace.
+    watchdog_kick();
+    watchdog_note("dns");   // unabortable; the one blocking call we cannot pet through
     int rc = sceNetResolverStartNtoa(rid, g_host, &a, 4 * 1000 * 1000, 2, 0);
+    watchdog_note("");
+    watchdog_kick();
     sceNetResolverDestroy(rid);
     if (rc < 0) return -3;
     g_addr = a.s_addr;
@@ -329,7 +334,9 @@ static int request_from_ex(uint64_t pos, int *status, int64_t *total, char *loc,
         g_sock = tcp_connect();
         if (g_sock < 0) { snprintf(g_dbg, sizeof(g_dbg), "connect failed"); return -1; }
         if (g_tlsmode) {
+            watchdog_note("tls");   // handshake to a half-open host can block for seconds
             g_tls = tls_open(g_sock, g_host);
+            watchdog_note(""); watchdog_kick();
             if (!g_tls) { conn_close(); snprintf(g_dbg, sizeof(g_dbg), "tls handshake failed (%s)", g_host); return -2; }
         }
     } else {
@@ -566,6 +573,11 @@ int httpsrc_open(const char *url) {
 
     int opened = 0;
     for (int hop = 0; hop < 6 && !opened; hop++) {
+        // Pet the watchdog EVERY hop. This loop had no kick at all while calling a
+        // blocking ~8s DNS resolve per hop; six hops was ~48s of silence, past the
+        // 35s channel-switch grace -> "HANG stale=35-36s stage=source-open" while
+        // zapping. aseg's equivalent loop already kicks per hop; this one did not.
+        watchdog_kick();
         if (parse_url(cur) != 0) { snprintf(g_dbg, sizeof(g_dbg), "bad url"); return -1; }
         if (resolve_host() != 0) { snprintf(g_dbg, sizeof(g_dbg), "resolve failed (%s)", g_host); return -2; }
 

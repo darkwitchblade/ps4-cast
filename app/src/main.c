@@ -138,6 +138,14 @@ static volatile uint64_t g_heartbeat = 0;
 // 1080i software/deinterlace channel). The watchdog grants a longer grace then,
 // so a slow-but-progressing channel switch isn't killed as a freeze (CE-34878).
 static volatile int g_wdBusy = 0;
+// Names the blocking operation currently in flight (e.g. "dns"), so a HANG line
+// says WHERE it blocked instead of only which stage. Set it around unabortable
+// syscalls; clear it after. Cheap: a pointer store to a static string literal.
+static const char *volatile g_wdNote = "";
+// The main (render-loop) thread. watchdog_kick() only counts from here: the
+// heartbeat means "the main loop is alive", so letting the read-ahead / audio
+// threads refresh it would keep a frozen main loop looking healthy forever.
+static OrbisPthread g_mainTh = NULL;
 static void *watchdog_main(void *arg) {
     (void)arg;
     for (;;) {
@@ -167,11 +175,13 @@ static void *watchdog_main(void *arg) {
             // unkillable) — do this before the crash-log write, which could
             // itself stall on a frozen /data mount and gate the recovery.
             gfx_emergency_release();
-            char b[96];
+            char b[128];
             const char *stg = "?"; player_stage(&stg);
-            int n = snprintf(b, sizeof(b), "HANG v" APP_VER " stale=%llums up=%llus stage=%s\n",
+            const char *nte = (const char *)g_wdNote;
+            int n = snprintf(b, sizeof(b), "HANG v" APP_VER " stale=%llums up=%llus stage=%s at=%s\n",
                              (unsigned long long)((now - hb) / 1000),
-                             (unsigned long long)(now / 1000000ULL), stg ? stg : "?");
+                             (unsigned long long)(now / 1000000ULL), stg ? stg : "?",
+                             (nte && *nte) ? nte : "-");
             persist_crash(b, n);                          // record the hang for /crashlog
             _exit(0);                                     // force full exit; user just reopens
         }
@@ -184,8 +194,12 @@ static void *watchdog_main(void *arg) {
 // so a slow-but-alive stream switch isn't mistaken for a freeze and killed
 // (that was the CE-34878 on channel switching). Only kicks once the loop is
 // running; safe to call from anywhere.
+void watchdog_note(const char *w) { g_wdNote = w ? w : ""; }
+
 void watchdog_kick(void) {
-    if (g_heartbeat) g_heartbeat = sceKernelGetProcessTime();
+    if (!g_heartbeat) return;
+    if (g_mainTh && scePthreadSelf() != g_mainTh) return;   // worker thread: not our liveness to vouch for
+    g_heartbeat = sceKernelGetProcessTime();
 }
 
 // player_play() calls this(1) at entry; the main loop clears it (0) the moment it
@@ -731,7 +745,7 @@ static void draw_stats_overlay(Gfx *g, double netBps, int fps) {
     // subtle drop-shadow (stext draws a dark copy underneath) so it stays readable
     // over bright/white scenes. Tight line spacing. Right-aligned to one margin.
     int rh = 22, ry = 28, rx = g->width - 34;
-    char b[96];
+    char b[128];
     #define STAT(...) do { snprintf(b, sizeof(b), __VA_ARGS__); \
         stext(g, rx - gfx_text_w(b, 2), ry, b, 2, WHITE); ry += rh; } while (0)
     STAT("%s %s", s.hw ? "HW" : "SW", s.codec);
@@ -764,6 +778,7 @@ int main(void) {
     // Start the freeze watchdog (auto-recovers a frozen app instead of a reboot).
     g_heartbeat = sceKernelGetProcessTime();
     OrbisPthread wd;
+    g_mainTh = scePthreadSelf();
     scePthreadCreate(&wd, NULL, watchdog_main, NULL, "ps4cast_wd");
 
 #ifdef BOOT_MINIMAL

@@ -1,5 +1,11 @@
 #include "tls.h"
 
+// NOTE: deliberately NO watchdog_kick() in ll_read/ll_write. g_heartbeat means
+// "the main render loop is alive"; kicking it from the read-ahead / audio threads
+// lets a frozen main loop look healthy forever, and puts a syscall on the
+// per-record streaming path (measured: playback stopped being smooth). The
+// handshake is petted once, from the main thread, at the tls_open call sites.
+
 #include <stdlib.h>
 #include <string.h>
 

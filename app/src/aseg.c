@@ -7,6 +7,7 @@
 // fetch from being mistaken for one (the "HANG watchdog stale=35s" fail-close
 // seen while zapping past several unreachable channels in a row).
 extern void watchdog_kick(void);
+extern void watchdog_note(const char *w);
 
 #include <stdio.h>
 #include <string.h>
@@ -123,7 +124,11 @@ static int resolve_host(void) {
     // resolve fine (a channel whose server answers in 0.4s from a PC reported
     // "hls fetch failed" on console). Two tries with a sane timeout covers a
     // transient DNS hiccup while staying well inside the grace.
+    watchdog_kick();
+    watchdog_note("dns");   // unabortable; the one blocking call we cannot pet through
     int rc = sceNetResolverStartNtoa(rid, g_host, &a, 4 * 1000 * 1000, 2, 0);
+    watchdog_note("");
+    watchdog_kick();
     sceNetResolverDestroy(rid);
     if (rc < 0) return -3;
     g_addr = a.s_addr;
@@ -211,7 +216,9 @@ static int do_request(int reuse, int *status, char *loc, int loccap,
         g_sock = tcp_connect();
         if (g_sock < 0) return -1;
         if (g_tlsmode) {
+            watchdog_note("tls");   // handshake to a half-open host can block for seconds
             g_tls = tls_open(g_sock, g_host);
+            watchdog_note(""); watchdog_kick();
             if (!g_tls) { conn_close(); return -2; }
         }
     }
