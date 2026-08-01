@@ -55,7 +55,9 @@ static char g_fav[MAX_FAV][URL_MAX];       static int g_favN = 0;
 // (D-pad) channel zapper. g_chanCur is the channel currently tuned, -1 if none.
 #define CHAN_NAME_MAX 96
 #define CHAN_GRP_MAX  48
-#define MAX_CHAN      256
+// Real IPTV playlists routinely carry thousands of channels; 256 silently
+// truncated them (the parse loop just stopped), losing most of the list.
+#define MAX_CHAN      2000
 static char g_chanName[MAX_CHAN][CHAN_NAME_MAX];
 static char g_chanGroup[MAX_CHAN][CHAN_GRP_MAX];
 static char g_chanUrl[MAX_CHAN][URL_MAX];
@@ -114,21 +116,26 @@ static void favs_load(void) {
 static void cfg_save(void) {
     int fd = sceKernelOpen(CFG_PATH, 0x0201 /*O_WRONLY|O_CREAT*/ | 0x0400 /*O_TRUNC*/, 0666);
     if (fd < 0) return;
-    char line[32];
-    int n = snprintf(line, sizeof(line), "debug=%d\n", notify_get_debug());
+    char line[64];
+    // avsync is user-tuned for their TV/soundbar; losing it on every relaunch
+    // (while channels/recent/resume persisted) was an inconsistency.
+    int n = snprintf(line, sizeof(line), "debug=%d\navsync=%d\n",
+                     notify_get_debug(), player_get_avsync());
     sceKernelWrite(fd, line, n);
     sceKernelClose(fd);
 }
 static void cfg_load(void) {
     int fd = sceKernelOpen(CFG_PATH, 0 /*O_RDONLY*/, 0);
     if (fd < 0) return;
-    char buf[64];
+    char buf[128];
     int n = (int)sceKernelRead(fd, buf, sizeof(buf) - 1);
     sceKernelClose(fd);
     if (n <= 0) return;
     buf[n] = '\0';
     const char *d = strstr(buf, "debug=");
     if (d) notify_set_debug(atoi(d + 6));
+    const char *a = strstr(buf, "avsync=");
+    if (a) player_set_avsync(atoi(a + 7));
 }
 
 // ---- resume positions: remember where each VOD was stopped, resume on replay.
@@ -842,6 +849,7 @@ static void handle_client(OrbisNetId c) {
     // POST /hwdecode body "0"/"1"; takes effect on the next cast.
     if (strcmp(method, "POST") == 0 && strcmp(path, "/avsync") == 0) {
         player_set_avsync(atoi(body));
+        cfg_save();
         char m[48]; int n = snprintf(m, sizeof(m), "avsync %dms", player_get_avsync());
         send_response(c, "200 OK", "text/plain", m, n);
         return;

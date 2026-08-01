@@ -110,6 +110,21 @@ static int      g_swsSrcFmt = -1;  // AV_PIX_FMT_NONE
 // ref to the last shown frame and re-present it on holds/pause/EOF — otherwise a
 // held frame flips to a stale back-buffer (judder). NULL in software mode.
 static AVFrame *g_lastShown = NULL;
+// Frame-conversion cache. g_shownGen bumps whenever a NEW decoded frame becomes
+// the one on screen; g_convGen records which generation is currently sitting in
+// g_scaled. The HW present path converts NV12->RGB (expensive: ~2M pixels of YUV
+// math + scaling) ONLY when these differ, and otherwise just blits the cached
+// RGB into the rotating framebuffer. Previously every render-loop iteration
+// re-converted the same frame, so with a ~53fps loop on 24fps content more than
+// half of all conversions were wasted work.
+static unsigned g_shownGen = 0, g_convGen = 0xffffffffu;
+
+// Set by the main loop (player_request_bar_clear) when an overlay is drawing over
+// the letterbox bars, so the next few frames re-clear the bars and the overlay
+// doesn't ghost once dismissed. >0 = clear the bars this frame. The countdown
+// spans all rotating framebuffers.
+static volatile int g_barClearLeft = 0;
+void player_request_bar_clear(void) { g_barClearLeft = 4; }   // >= GFX_BUFFERS
 
 static int   g_started = 0;        // intent: from play() until stop/EOF
 static int   g_active  = 0;        // currently decoding
@@ -837,15 +852,39 @@ static int64_t frame_pts_us(AVFrame *f) {
     return (int64_t)(pts * av_q2d(g_fmt->streams[g_vstream]->time_base) * 1000000.0);
 }
 
+// Clear ONLY the letterbox/pillarbox border, and only when needed (geometry
+// change, or an overlay drew over the bars). Full-screen clears every frame were
+// the dominant render-rate sink; the video rect needs no clear since the
+// convert/blit overwrites it.
+static void clear_bars_gated(Gfx *g, int ox, int oy, int sW, int sH) {
+    int dw = g->width, dh = g->height;
+    static int s_lw = -1, s_lh = -1, s_lx = -1, s_ly = -1;
+    if (sW != s_lw || sH != s_lh || ox != s_lx || oy != s_ly) {
+        s_lw = sW; s_lh = sH; s_lx = ox; s_ly = oy;
+        g_barClearLeft = (sW != dw || sH != dh) ? 4 : 0;
+    }
+    if (g_barClearLeft <= 0) return;
+    g_barClearLeft--;
+    uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
+    const uint32_t BAR = 0x80000000u;
+    int vy0 = oy < 0 ? 0 : oy, vy1 = oy + sH > dh ? dh : oy + sH;
+    int vx0 = ox < 0 ? 0 : ox, vx1 = ox + sW > dw ? dw : ox + sW;
+    for (int yy = 0; yy < vy0; yy++)
+        { uint32_t *r = fb + (size_t)yy * dw; for (int xx = 0; xx < dw; xx++) r[xx] = BAR; }
+    for (int yy = vy1; yy < dh; yy++)
+        { uint32_t *r = fb + (size_t)yy * dw; for (int xx = 0; xx < dw; xx++) r[xx] = BAR; }
+    for (int yy = vy0; yy < vy1; yy++) {
+        uint32_t *r = fb + (size_t)yy * dw;
+        for (int xx = 0; xx < vx0; xx++)  r[xx] = BAR;
+        for (int xx = vx1; xx < dw; xx++) r[xx] = BAR;
+    }
+}
+
 static void blit_scaled(Gfx *g) {
     int dw = g->width, dh = g->height;
     int ox = (dw - g_scaledW) / 2, oy = (dh - g_scaledH) / 2;
     uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
-    // Letterbox: when the video doesn't fill the screen, black out the bars so
-    // the lobby/previous frame doesn't show through (the HW path does the same).
-    if (g_scaledW != dw || g_scaledH != dh) {
-        for (int i = 0, n = dw * dh; i < n; i++) fb[i] = 0x80000000u;
-    }
+    clear_bars_gated(g, ox, oy, g_scaledW, g_scaledH);
     // sws already produced BGRA (memory B,G,R,A == framebuffer byte order with A
     // in the top byte). The framebuffer wants the top byte = 0x80, so just force
     // it: one mask+or per pixel instead of byte-by-byte shuffling.
@@ -1216,12 +1255,6 @@ static int build_scaled_nv12(AVFrame *fr, Gfx *g) {
     return 0;
 }
 
-// Set by the main loop (player_request_bar_clear) when an overlay is drawing over
-// the letterbox bars, so the next few frames re-clear the bars and the overlay
-// doesn't ghost once dismissed. >0 = clear the bars this frame. The countdown
-// spans all rotating framebuffers.
-static volatile int g_barClearLeft = 0;
-void player_request_bar_clear(void) { g_barClearLeft = 4; }   // >= GFX_BUFFERS
 
 // NV12 -> active framebuffer directly. This fuses color conversion, scaling, and
 // final blit for the hardware path.
@@ -1614,6 +1647,21 @@ static void *decode_segment_thread_main(void *arg) {
 // Present the due frame from the queue, synced to the audio clock (or wall clock
 // if no audio). Drops earlier-due frames to hold realtime; holds the last frame
 // when nothing new is due. Never blocks on decode/network.
+// HW present with conversion caching: convert NV12->RGB only when a new frame
+// arrived, then blit the cached RGB into the (rotating) framebuffer every time.
+// The blit is a load/mask/store per pixel; the convert is YUV math + scaling, so
+// skipping it on repeat presentations is a large saving at loop rates above the
+// content frame rate.
+static int present_hw_cached(AVFrame *fr, Gfx *g) {
+    if (!fr) return -1;
+    if (g_convGen != g_shownGen || !g_scaled) {
+        if (build_scaled_nv12(fr, g) != 0) return -1;   // -> g_scaled
+        g_convGen = g_shownGen;
+    }
+    blit_scaled(g);
+    return 0;
+}
+
 static int render_threaded(Gfx *g) {
     if (g_liveRestartPending) {
         char url[sizeof(g_playUrl)];
@@ -1626,7 +1674,7 @@ static int render_threaded(Gfx *g) {
 
     if (g_paused) {
         if (!g_wasPaused) { g_wasPaused = 1; g_pauseAt = sceKernelGetProcessTime(); }
-        if (g_useHw && g_lastShown) { build_scaled_nv12_direct(g_lastShown, g); return 1; }
+        if (g_useHw && g_lastShown) { present_hw_cached(g_lastShown, g); return 1; }
         if (g_gotFrame && g_scaled) { blit_scaled(g); return 1; }
         return 0;
     }
@@ -1691,6 +1739,7 @@ static int render_threaded(Gfx *g) {
             build_scaled_nv12_direct(show, g);
             if (g_lastShown) av_frame_free(&g_lastShown);
             g_lastShown = show;                 // keep ref to re-present on holds
+            g_shownGen++;                       // invalidate the RGB conversion cache
         } else {
             build_scaled(show, g);
             blit_scaled(g);
@@ -1703,11 +1752,11 @@ static int render_threaded(Gfx *g) {
     if (g_decEof && g_fqCount == 0) {
         if (g_active) snprintf(g_status, sizeof(g_status), g_gotFrame ? "finished" : "no frames decoded");
         g_active = 0;
-        if (g_useHw && g_lastShown) { build_scaled_nv12_direct(g_lastShown, g); return 1; }
+        if (g_useHw && g_lastShown) { present_hw_cached(g_lastShown, g); return 1; }
         if (g_gotFrame && g_scaled) { blit_scaled(g); return 1; }   // keep last frame on screen
         return 0;
     }
-    if (g_useHw && g_lastShown) { build_scaled_nv12_direct(g_lastShown, g); return 1; }  // hold (HW)
+    if (g_useHw && g_lastShown) { present_hw_cached(g_lastShown, g); return 1; }  // hold (HW)
     if (g_gotFrame && g_scaled) { blit_scaled(g); return 1; }   // hold last frame (SW)
     return 0;
 }
@@ -1719,7 +1768,7 @@ int player_render(Gfx *g) {
     if (g_threaded) return render_threaded(g);
     // Hardware decode requires the (big-stack) decode thread; there is no inline
     // hardware path, so just hold the last frame if the thread isn't running.
-    if (g_useHw) { if (g_lastShown) { build_scaled_nv12_direct(g_lastShown, g); return 1; } return 0; }
+    if (g_useHw) { if (g_lastShown) { present_hw_cached(g_lastShown, g); return 1; } return 0; }
 
     // Pause: hold on the last frame (re-blit so both buffers stay stable).
     if (g_paused) {

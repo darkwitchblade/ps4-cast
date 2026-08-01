@@ -78,8 +78,25 @@ extern int sigaltstack(const stack_t *, stack_t *);
 
 // Persist a one-line crash/hang note to /data (read back via GET /crashlog).
 // Uses raw syscalls so it's safe from a signal handler.
+// APPEND crash/hang notes (bounded) instead of overwriting a single line. A
+// single truncated file meant every new fault destroyed the evidence of the
+// previous one, so intermittent crashes were impossible to correlate. Keeps the
+// file under CRASHLOG_MAX by restarting it when it grows too large, so /data
+// can't fill up. Uses raw syscalls: safe from a signal handler.
+#define CRASHLOG_PATH "/data/ps4cast_crash.log"
+#define CRASHLOG_MAX  4096
 static void persist_crash(const char *buf, int n) {
-    int fd = sceKernelOpen("/data/ps4cast_crash.log", 0x0201 /*WRONLY|CREAT*/ | 0x0400 /*TRUNC*/, 0666);
+    // O_APPEND=0x0008; drop back to truncate if the file has grown past the cap.
+    int trunc = 0;
+    int rd = sceKernelOpen(CRASHLOG_PATH, 0 /*O_RDONLY*/, 0);
+    if (rd >= 0) {
+        char probe[CRASHLOG_MAX + 1];
+        int got = (int)sceKernelRead(rd, probe, sizeof(probe));
+        sceKernelClose(rd);
+        if (got >= CRASHLOG_MAX) trunc = 1;
+    }
+    int flags = 0x0201 /*WRONLY|CREAT*/ | (trunc ? 0x0400 /*TRUNC*/ : 0x0008 /*APPEND*/);
+    int fd = sceKernelOpen(CRASHLOG_PATH, flags, 0666);
     if (fd >= 0) { sceKernelWrite(fd, buf, (size_t)n); sceKernelClose(fd); }
 }
 
@@ -87,7 +104,8 @@ static void fatal_signal(int sig, struct __siginfo *info, void *uap) {
     (void)uap;
     char b[160];
     unsigned long a = info ? (unsigned long)info->si_addr : 0;
-    int n = snprintf(b, sizeof(b), "CRASH v" APP_VER " sig=%d addr=0x%lx\n", sig, a);
+    int n = snprintf(b, sizeof(b), "CRASH v" APP_VER " sig=%d addr=0x%lx up=%llus\n", sig, a,
+                     (unsigned long long)(sceKernelGetProcessTime() / 1000000ULL));
     persist_crash(b, n);
     gfx_emergency_release();   // release display/GPU so the exit is reclaimable, not unkillable
     _exit(0);
@@ -133,8 +151,9 @@ static void *watchdog_main(void *arg) {
             // itself stall on a frozen /data mount and gate the recovery.
             gfx_emergency_release();
             char b[96];
-            int n = snprintf(b, sizeof(b), "HANG v" APP_VER " watchdog stale=%llums\n",
-                             (unsigned long long)((now - hb) / 1000));
+            int n = snprintf(b, sizeof(b), "HANG v" APP_VER " watchdog stale=%llums up=%llus\n",
+                             (unsigned long long)((now - hb) / 1000),
+                             (unsigned long long)(now / 1000000ULL));
             persist_crash(b, n);                          // record the hang for /crashlog
             _exit(0);                                     // force full exit; user just reopens
         }
