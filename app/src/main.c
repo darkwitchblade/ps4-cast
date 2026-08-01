@@ -478,9 +478,26 @@ static uint32_t pad_poll(PadState *p) {
     return pressed;
 }
 
+// Buttons currently HELD (pad_poll returns edges only). Used for continuous
+// scrubbing: holding a seek button sweeps a preview position instead of firing
+// one seek per press.
+static uint32_t pad_held(PadState *p) {
+    uint32_t m = 0;
+    if (!p->ok) return 0;
+    for (int i = 0; i < p->count; i++) if (p->readRc[i] == 0) m |= p->down[i];
+    return m;
+}
+
+// Live scrub preview: while a seek button is held the HUD shows this target and
+// NO seek is issued; the seek is committed once on release. Repeatedly seeking
+// while held would flush + refetch the network buffer on every step.
+static int    g_scrubActive = 0;
+static double g_scrubTarget = 0;
+
 static void draw_hud(Gfx *g) {
     double cur = 0, dur = 0;
     player_progress(&cur, &dur);
+    if (g_scrubActive) cur = g_scrubTarget;   // preview the position being scrubbed to
     int paused = player_is_paused();
 
     // Netflix-style: no panel/scrim blend — just shadowed text and a thin
@@ -694,6 +711,7 @@ int main(void) {
     uint64_t reconnectAt = 0, healthySince = 0;
     const int MAX_RECONNECT = 30;     // ~give up after this many attempts
     uint64_t noUserSince = 0;         // first time we saw NO valid signed-in user (debounce)
+    uint64_t scrubStart = 0, scrubStep = 0;   // continuous-scrub timing
     PadState pad;
     pad_init(&pad);
     sys_diag_update();                // prime the user/system snapshot before the loop reads it
@@ -703,6 +721,7 @@ int main(void) {
         g_wdBusy = 0;                               // loop is alive again -> back to the strict 15s grace
         uint64_t now = sceKernelGetProcessTime();
         uint32_t pressed = pad_poll(&pad);
+        uint32_t held = pad_held(&pad);
 
         // A valid PS4 user must be signed in. With an ANONYMOUS foreground user
         // (userId=0xffffffff -> sys_fg_user() <= 0) the system's VideoPlayingChecker
@@ -812,6 +831,46 @@ int main(void) {
             }
         }
 
+        // ---- continuous scrub -------------------------------------------------
+        // Holding a seek button sweeps a preview target (accelerating for L1/R1,
+        // fine for the D-pad) and commits ONE seek on release. A quick tap is
+        // just a very short hold, so single presses still step as before.
+        if (player_started()) {
+            double sc = 0, sd = 0; player_progress(&sc, &sd);
+            const uint32_t SEEKB = ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1 |
+                                   ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT |
+                                   ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN;
+            uint32_t hs = held & SEEKB;
+            // While the channel overlay is up the D-pad browses channels, so only
+            // the shoulder buttons scrub then.
+            if (nch > 0 && now < chanUntil) hs &= (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1);
+            if (hs && sd > 0) {
+                if (!g_scrubActive) { g_scrubActive = 1; g_scrubTarget = sc; scrubStart = now; scrubStep = 0; }
+                if (now - scrubStep >= 90000ULL) {          // ~11 steps/sec
+                    double heldSec = (double)(now - scrubStart) / 1e6;
+                    double step;
+                    if (hs & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1))
+                        step = 15.0 + heldSec * 60.0;       // coarse, accelerates the longer you hold
+                    else if (hs & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN))
+                        step = 5.0;                          // medium
+                    else
+                        step = 1.0;                          // fine (Left/Right)
+                    if (hs & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_DOWN)) step = -step;
+                    g_scrubTarget += step;
+                    if (g_scrubTarget < 0) g_scrubTarget = 0;
+                    if (g_scrubTarget > sd) g_scrubTarget = sd;
+                    scrubStep = now;
+                }
+                hudUntil = now + 2000000ULL;                 // keep the scrubber on screen
+            } else if (g_scrubActive) {
+                g_scrubActive = 0;
+                player_seek(g_scrubTarget);                  // commit exactly one seek
+                hudUntil = now + 3000000ULL;
+            }
+        } else if (g_scrubActive) {
+            g_scrubActive = 0;
+        }
+
         if (player_started() && pressed) {
             double cur = 0, dur = 0;
             player_progress(&cur, &dur);
@@ -824,12 +883,6 @@ int main(void) {
             // (g_curSec), which only updates once the decode thread applies the
             // seek — so a second press before that recomputed the same target and
             // did nothing. Tapping R1 three times now jumps +180s, not +60s.
-            if (pressed & ORBIS_PAD_BUTTON_LEFT)  player_seek_relative(-10.0);
-            if (pressed & ORBIS_PAD_BUTTON_RIGHT) player_seek_relative(+10.0);
-            if (pressed & ORBIS_PAD_BUTTON_DOWN)  player_seek_relative(-30.0);
-            if (pressed & ORBIS_PAD_BUTTON_UP)    player_seek_relative(+30.0);
-            if (pressed & ORBIS_PAD_BUTTON_L1)    player_seek_relative(-60.0);
-            if (pressed & ORBIS_PAD_BUTTON_R1)    player_seek_relative(+60.0);
             if (pressed & ORBIS_PAD_BUTTON_SQUARE) { player_seek(0); notify("Restarted from the beginning"); }
             if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
                 player_stop();

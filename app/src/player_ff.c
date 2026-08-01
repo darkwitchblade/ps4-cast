@@ -1647,20 +1647,15 @@ static void *decode_segment_thread_main(void *arg) {
 // Present the due frame from the queue, synced to the audio clock (or wall clock
 // if no audio). Drops earlier-due frames to hold realtime; holds the last frame
 // when nothing new is due. Never blocks on decode/network.
-// HW present with conversion caching: convert NV12->RGB only when a new frame
-// arrived, then blit the cached RGB into the (rotating) framebuffer every time.
-// The blit is a load/mask/store per pixel; the convert is YUV math + scaling, so
-// skipping it on repeat presentations is a large saving at loop rates above the
-// content frame rate.
-static int present_hw_cached(AVFrame *fr, Gfx *g) {
-    if (!fr) return -1;
-    if (g_convGen != g_shownGen || !g_scaled) {
-        if (build_scaled_nv12(fr, g) != 0) return -1;   // -> g_scaled
-        g_convGen = g_shownGen;
-    }
-    blit_scaled(g);
-    return 0;
-}
+// MEASURED DEAD END — do not retry this shape. Caching the NV12->RGB conversion
+// in g_scaled and blitting it per present was SLOWER: fps 53 -> 38-40 with video
+// drops climbing steadily. build_scaled_nv12_direct writes once, straight into
+// the framebuffer; the cached form writes to scratch and then copies, so every
+// NEW frame pays an extra full-frame write+read+write. Memory bandwidth is the
+// bottleneck, and at a ~53fps loop on 30fps content the repeat presentations
+// never outweigh that extra copy. A real win would have to skip the work
+// ENTIRELY on repeats (per-framebuffer generation tracking), which needs care
+// because overlays drawn into a buffer would otherwise go stale.
 
 static int render_threaded(Gfx *g) {
     if (g_liveRestartPending) {
@@ -1674,7 +1669,7 @@ static int render_threaded(Gfx *g) {
 
     if (g_paused) {
         if (!g_wasPaused) { g_wasPaused = 1; g_pauseAt = sceKernelGetProcessTime(); }
-        if (g_useHw && g_lastShown) { present_hw_cached(g_lastShown, g); return 1; }
+        if (g_useHw && g_lastShown) { build_scaled_nv12_direct(g_lastShown, g); return 1; }
         if (g_gotFrame && g_scaled) { blit_scaled(g); return 1; }
         return 0;
     }
@@ -1752,11 +1747,11 @@ static int render_threaded(Gfx *g) {
     if (g_decEof && g_fqCount == 0) {
         if (g_active) snprintf(g_status, sizeof(g_status), g_gotFrame ? "finished" : "no frames decoded");
         g_active = 0;
-        if (g_useHw && g_lastShown) { present_hw_cached(g_lastShown, g); return 1; }
+        if (g_useHw && g_lastShown) { build_scaled_nv12_direct(g_lastShown, g); return 1; }
         if (g_gotFrame && g_scaled) { blit_scaled(g); return 1; }   // keep last frame on screen
         return 0;
     }
-    if (g_useHw && g_lastShown) { present_hw_cached(g_lastShown, g); return 1; }  // hold (HW)
+    if (g_useHw && g_lastShown) { build_scaled_nv12_direct(g_lastShown, g); return 1; }  // hold (HW)
     if (g_gotFrame && g_scaled) { blit_scaled(g); return 1; }   // hold last frame (SW)
     return 0;
 }
@@ -1768,7 +1763,7 @@ int player_render(Gfx *g) {
     if (g_threaded) return render_threaded(g);
     // Hardware decode requires the (big-stack) decode thread; there is no inline
     // hardware path, so just hold the last frame if the thread isn't running.
-    if (g_useHw) { if (g_lastShown) { present_hw_cached(g_lastShown, g); return 1; } return 0; }
+    if (g_useHw) { if (g_lastShown) { build_scaled_nv12_direct(g_lastShown, g); return 1; } return 0; }
 
     // Pause: hold on the last frame (re-blit so both buffers stay stable).
     if (g_paused) {
