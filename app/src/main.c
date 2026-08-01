@@ -570,6 +570,92 @@ static int chan_group_jump(int sel, int dir) {
 
 // TV-box-style channel list overlay: a fast, scrollable list of the loaded
 // playlist with the highlighted selection and a live marker on the tuned one.
+
+// ---- main-screen channel / bouquet browser --------------------------------
+// Replaces the D-pad-down dropdown as the primary interface: when a playlist is
+// loaded the idle screen IS the channel browser. Left rail lists bouquets
+// (groups, plus All/Favourites), right pane lists that bouquet's channels, and a
+// bottom A-Z strip narrows very large lists. Positions are FILTERED indices, so
+// httpd_chan_filter_abs() maps back to real channel indices.
+static void draw_channel_home(Gfx *g, int sel, int railSel, int railFocus,
+                              const char *ip, int net_ok) {
+    gfx_vgrad(g, 0, 0, g->width, g->height, BG_TOP, BG_BOT);
+    int W = g->width, H = g->height;
+
+    // header
+    gfx_round(g, 56, 44, 6, 34, 3, ACCENT);
+    gtext(g, 76, 42, "Channels", 4, TXT, 0);
+    char sub[96];
+    int total = httpd_chan_count(), shown = httpd_chan_filter_count();
+    if (shown != total) snprintf(sub, sizeof(sub), "%d of %d", shown, total);
+    else                snprintf(sub, sizeof(sub), "%d channels", total);
+    gfx_text(g, W - 56 - gfx_text_w(sub, 2), 52, sub, 2, FAINT);
+    if (net_ok) {
+        char u[80]; snprintf(u, sizeof(u), "http://%s:%d", ip, PORT);
+        gfx_text(g, W - 56 - gfx_text_w(u, 2), 84, u, 2, MUT);
+    }
+    gfx_rect_a(g, 56, 96, W - 112, 1, HAIR, 30);
+
+    // ---- left rail: bouquets -------------------------------------------
+    int railX = 56, railW = 360, railY = 124, rowH = 52;
+    int railN = httpd_chan_rail_count();
+    int railRows = (H - railY - 150) / rowH;
+    int rs = railSel - railRows / 2;
+    if (rs > railN - railRows) rs = railN - railRows;
+    if (rs < 0) rs = 0;
+    for (int r = 0; r < railRows && rs + r < railN; r++) {
+        int i = rs + r, y = railY + r * rowH;
+        int on = (i == railSel);
+        if (on) gfx_round_a(g, railX, y, railW, rowH - 6, 12, railFocus ? ACCENT : SURF2, railFocus ? 235 : 170);
+        char nm[80];
+        httpd_chan_rail_name(i, nm, sizeof(nm));
+        GfxColor c = on && railFocus ? INK : TXT;
+        gfx_text(g, railX + 18, y + (rowH - 6) / 2 - 12, nm, 3, c);
+    }
+
+    // ---- right pane: channels in the selected bouquet -------------------
+    int lx = railX + railW + 28, lw = W - lx - 56, ly = railY;
+    int rows = (H - ly - 150) / rowH;
+    int start = sel - rows / 2;
+    if (start > shown - rows) start = shown - rows;
+    if (start < 0) start = 0;
+    int cur = httpd_chan_current();
+    for (int r = 0; r < rows && start + r < shown; r++) {
+        int fi = start + r, abs = httpd_chan_filter_abs(fi);
+        if (abs < 0) continue;
+        int y = ly + r * rowH, on = (fi == sel);
+        if (on) gfx_round_a(g, lx, y, lw, rowH - 6, 12, railFocus ? SURF2 : ACCENT, railFocus ? 170 : 235);
+        char nm[96];
+        httpd_chan_get(abs, nm, sizeof(nm), NULL, 0);
+        int maxch = (lw - 190) / 24; if (maxch < 6) maxch = 6;
+        if ((int)strlen(nm) > maxch) nm[maxch] = 0;
+        char num[8]; snprintf(num, sizeof(num), "%d", abs + 1);
+        GfxColor tc = (on && !railFocus) ? INK : TXT;
+        GfxColor nc = (on && !railFocus) ? INK : FAINT;
+        gfx_text(g, lx + 20, y + (rowH - 6) / 2 - 8, num, 2, nc);
+        gfx_text(g, lx + 100, y + (rowH - 6) / 2 - 12, nm, 3, tc);
+        if (httpd_chan_is_fav(abs))
+            gfx_text(g, lx + lw - 96, y + (rowH - 6) / 2 - 8, "FAV", 2, (on && !railFocus) ? INK : WARN);
+        if (abs == cur) gfx_circle(g, lx + lw - 26, y + (rowH - 6) / 2, 6, (on && !railFocus) ? INK : LIVE);
+    }
+    if (shown == 0)
+        ctext(g, ly + 60, "No channels match this filter", 3, MUT, 0);
+
+    // ---- A-Z strip -------------------------------------------------------
+    char fl = httpd_chan_filter_letter();
+    int sx = 56, sy = H - 118, cw = (W - 112) / 27;
+    for (int k = 0; k < 27; k++) {
+        char ch = k == 26 ? '#' : (char)('A' + k);
+        int has = httpd_chan_letter_has(ch);
+        int on = (fl == ch);
+        char t[2] = { ch, 0 };
+        if (on) gfx_round(g, sx + k * cw, sy - 6, cw - 4, 38, 8, ACCENT);
+        gfx_text(g, sx + k * cw + (cw - 4 - gfx_text_w(t, 2)) / 2, sy, t, 2,
+                 on ? INK : (has ? MUT : FAINT));
+    }
+    ctext(g, H - 58, "Up/Down select   Left/Right bouquet   Cross watch   Square favourite   L2/R2 letter", 2, MUT, 0);
+}
+
 static void draw_channel_overlay(Gfx *g, int sel) {
     int n = httpd_chan_count();
     if (n <= 0) return;
@@ -712,6 +798,7 @@ int main(void) {
     const int MAX_RECONNECT = 30;     // ~give up after this many attempts
     uint64_t noUserSince = 0;         // first time we saw NO valid signed-in user (debounce)
     uint64_t scrubStart = 0, scrubStep = 0;   // continuous-scrub timing
+    int homeSel = 0, railSel = 0, railFocus = 0;   // main-screen channel browser
     PadState pad;
     pad_init(&pad);
     sys_diag_update();                // prime the user/system snapshot before the loop reads it
@@ -827,6 +914,53 @@ int main(void) {
                     hudUntil = now + 6000000ULL;
                     chanUntil = now + 3500000ULL;
                     reconnecting = 0; reconnects = 0;
+                }
+            }
+        }
+
+        // ---- main-screen channel browser navigation ---------------------------
+        // Only while NOT playing: during playback the D-pad scrubs instead, so
+        // channel stepping can't fight the transport controls.
+        if (!player_started() && httpd_chan_count() > 0 && pressed) {
+            int shown = httpd_chan_filter_count();
+            if (pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT))
+                railFocus = (pressed & ORBIS_PAD_BUTTON_LEFT) ? 1 : 0;
+            if (railFocus) {
+                int rn = httpd_chan_rail_count();
+                if (pressed & ORBIS_PAD_BUTTON_UP)   railSel = (railSel - 1 + rn) % rn;
+                if (pressed & ORBIS_PAD_BUTTON_DOWN) railSel = (railSel + 1) % rn;
+                if (pressed & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN)) {
+                    httpd_chan_rail_select(railSel); homeSel = 0;
+                }
+            } else {
+                if (shown > 0) {
+                    if (pressed & ORBIS_PAD_BUTTON_UP)   homeSel = (homeSel - 1 + shown) % shown;
+                    if (pressed & ORBIS_PAD_BUTTON_DOWN) homeSel = (homeSel + 1) % shown;
+                }
+            }
+            // L2/R2 step the A-Z letter filter; Square toggles favourite.
+            if (pressed & (ORBIS_PAD_BUTTON_L2 | ORBIS_PAD_BUTTON_R2)) {
+                char fl = httpd_chan_filter_letter();
+                int k = fl == 0 ? -1 : (fl == '#' ? 26 : fl - 'A');
+                k += (pressed & ORBIS_PAD_BUTTON_R2) ? 1 : -1;
+                if (k < -1) k = 26; if (k > 26) k = -1;
+                char nl = k < 0 ? 0 : (k == 26 ? '#' : (char)('A' + k));
+                httpd_chan_filter(nl, httpd_chan_filter_fav());
+                if (railSel >= 2) httpd_chan_rail_select(railSel);
+                homeSel = 0;
+            }
+            if (pressed & ORBIS_PAD_BUTTON_SQUARE) {
+                int abs = httpd_chan_filter_abs(homeSel);
+                if (abs >= 0) { httpd_chan_toggle_fav(abs); notify(httpd_chan_is_fav(abs) ? "Added to favourites" : "Removed from favourites"); }
+            }
+            if (pressed & ORBIS_PAD_BUTTON_CROSS) {
+                int abs = httpd_chan_filter_abs(homeSel);
+                char curl[1024];
+                if (abs >= 0 && httpd_chan_get(abs, NULL, 0, curl, sizeof(curl))) {
+                    httpd_chan_set_current(abs);
+                    player_play(curl);
+                    everDrew = 0; reconnecting = 0; reconnects = 0;
+                    hudUntil = now + 6000000ULL;
                 }
             }
         }
@@ -1030,7 +1164,10 @@ int main(void) {
                 player_request_bar_clear();   // HUD scrubber/times sit on the bottom bar
             }
         } else if (!reconnecting) {
-            draw_lobby(&g, ip, net_ok);
+            if (httpd_chan_count() > 0)
+                draw_channel_home(&g, homeSel, railSel, railFocus, ip, net_ok);
+            else
+                draw_lobby(&g, ip, net_ok);
             everDrew = 0;
         }
         // (while reconnecting with no live player, the last frame is kept on screen)

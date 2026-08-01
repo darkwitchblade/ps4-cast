@@ -66,6 +66,7 @@ static char g_filtLetter = 0;      // 0 = no letter filter
 static int  g_filtFav = 0;         // 1 = favourites only
 static int  g_filt[MAX_CHAN];
 static int  g_filtN = 0;
+static int  g_railRow = 0;      // selected bouquet row (0=All,1=Favourites,2+=groups)
 // Favourites + an on-screen filter. With thousands of channels the flat zapper
 // list is unusable, so the overlay can narrow to a starting letter (A-Z, '#' for
 // non-alphabetic) and/or favourites only. The filter maps filtered positions ->
@@ -428,14 +429,14 @@ static void filter_rebuild(void) {
 }
 
 void httpd_chan_filter(char letter, int favOnly) {
-    g_filtLetter = letter; g_filtFav = favOnly ? 1 : 0;
+    g_filtLetter = letter; g_filtFav = favOnly ? 1 : 0; g_railRow = favOnly ? 1 : 0;
     scePthreadMutexLock(&g_mtx); filter_rebuild(); scePthreadMutexUnlock(&g_mtx);
 }
 char httpd_chan_filter_letter(void) { return g_filtLetter; }
 int  httpd_chan_filter_fav(void)    { return g_filtFav; }
-int  httpd_chan_filter_count(void)  { return (g_filtLetter || g_filtFav) ? g_filtN : g_chanN; }
+int  httpd_chan_filter_count(void)  { return (g_filtLetter || g_filtFav || g_railRow >= 2) ? g_filtN : g_chanN; }
 int  httpd_chan_filter_abs(int n) {
-    if (!(g_filtLetter || g_filtFav)) return (n >= 0 && n < g_chanN) ? n : -1;
+    if (!(g_filtLetter || g_filtFav || g_railRow >= 2)) return (n >= 0 && n < g_chanN) ? n : -1;
     return (n >= 0 && n < g_filtN) ? g_filt[n] : -1;
 }
 int  httpd_chan_is_fav(int i) { return (i >= 0 && i < g_chanN) ? g_chanFav[i] : 0; }
@@ -457,6 +458,62 @@ int httpd_chan_letter_has(char letter) {
         else if (c == letter) return 1;
     }
     return 0;
+}
+
+// ---- bouquet rail ---------------------------------------------------------
+// Row 0 = All, row 1 = Favourites, then each distinct group ("bouquet") in
+// playlist order. Selecting a row just drives httpd_chan_filter().
+int httpd_chan_rail_count(void) {
+    int n = 2;
+    for (int i = 0; i < g_chanN; i++) {
+        if (!g_chanGroup[i][0]) continue;
+        int seen = 0;
+        for (int j = 0; j < i; j++)
+            if (g_chanGroup[j][0] && strcmp(g_chanGroup[j], g_chanGroup[i]) == 0) { seen = 1; break; }
+        if (!seen) n++;
+    }
+    return n;
+}
+
+void httpd_chan_rail_name(int row, char *out, int cap) {
+    if (cap <= 0) return;
+    out[0] = 0;
+    if (row == 0) { snprintf(out, cap, "All"); return; }
+    if (row == 1) { snprintf(out, cap, "Favourites"); return; }
+    int n = 2;
+    for (int i = 0; i < g_chanN; i++) {
+        if (!g_chanGroup[i][0]) continue;
+        int seen = 0;
+        for (int j = 0; j < i; j++)
+            if (g_chanGroup[j][0] && strcmp(g_chanGroup[j], g_chanGroup[i]) == 0) { seen = 1; break; }
+        if (seen) continue;
+        if (n == row) { snprintf(out, cap, "%s", g_chanGroup[i]); return; }
+        n++;
+    }
+    snprintf(out, cap, "Group %d", row - 1);
+}
+
+// Apply a rail row as the active filter (keeps any A-Z letter narrowing).
+void httpd_chan_rail_select(int row) {
+    char letter = httpd_chan_filter_letter();
+    if (row == 1) { httpd_chan_filter(letter, 1); return; }
+    if (row <= 0) { httpd_chan_filter(letter, 0); return; }
+    char grp[CHAN_GRP_MAX]; httpd_chan_rail_name(row, grp, sizeof(grp));
+    scePthreadMutexLock(&g_mtx);
+    g_filtFav = 0; g_filtLetter = letter;
+    g_filtN = 0;
+    for (int i = 0; i < g_chanN; i++) {
+        if (strcmp(g_chanGroup[i], grp) != 0) continue;
+        if (g_filtLetter) {
+            char c = g_chanName[i][0];
+            if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+            if (g_filtLetter == '#') { if (c >= 'A' && c <= 'Z') continue; }
+            else if (c != g_filtLetter) continue;
+        }
+        g_filt[g_filtN++] = i;
+    }
+    g_railRow = row;
+    scePthreadMutexUnlock(&g_mtx);
 }
 
 int httpd_chan_count(void) { return g_chanN; }

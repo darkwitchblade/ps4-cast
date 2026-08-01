@@ -29,6 +29,10 @@ int  httpd_chan_filter_abs(int n);
 int  httpd_chan_is_fav(int i);
 void httpd_chan_toggle_fav(int i);
 int  httpd_chan_letter_has(char letter);
+// Bouquet rail: row 0 = All, 1 = Favourites, 2+ = playlist groups.
+int  httpd_chan_rail_count(void);
+void httpd_chan_rail_name(int row, char *out, int cap);
+void httpd_chan_rail_select(int row);
 
 // Per-URL resume positions (VOD): remember where playback stopped.
 void httpd_resume_save(const char *url, int pos, int dur);
