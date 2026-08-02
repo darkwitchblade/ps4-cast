@@ -34,7 +34,22 @@ fi
 # Clear stale pkgs and force a full object rebuild so APP_VER (baked into objects
 # from the Makefile VERSION) is always current.
 rm -f "$HERE/app/"*.pkg "$HERE/app/build/"*.o
-make "$@"
+if ! make "$@"; then
+    # The bundled x86_64 macOS PkgTool uses an old AppleCrypto bridge that no
+    # longer imports its RSA key on macOS 26. Compilation/linking and GP4
+    # generation have already succeeded at this point, so retry only the signer
+    # with OpenOrbis's matching Linux binary in its required .NET 3.1 runtime.
+    if [ "$(uname -s)" = "Darwin" ] && [ -f pkg.gp4 ] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        echo "macOS PkgTool failed; retrying package signing in Docker..."
+        docker run --platform linux/amd64 --rm \
+          -e DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
+          -v "$HERE:/work" -w /work/app \
+          mcr.microsoft.com/dotnet/runtime:3.1-buster-slim \
+          /work/oo/OpenOrbis/PS4Toolchain/bin/linux/PkgTool.Core pkg_build pkg.gp4 .
+    else
+        exit 1
+    fi
+fi
 
 VER="$(awk -F':= *' '/^VERSION/{gsub(/[ \t]/,"",$2); print $2}' "$HERE/app/Makefile")"
 OUT="PS4-Cast-v${VER}.pkg"

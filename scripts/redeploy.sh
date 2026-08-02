@@ -21,7 +21,11 @@ free_ports(){ for p in 8000 9898; do lsof -ti :$p 2>/dev/null | xargs kill -9 2>
 # Patiently POST a payload to :9090 until it lands (it re-arms slowly).
 send_payload(){ # $1 = built .bin
   local bin="$1" i out
-  make -C "$CTRL" CALLBACK_IP="$CB_IP_HEX" "$bin" >/tmp/ctrl_build.log 2>&1 || true
+  if ! make -C "$CTRL" CALLBACK_IP="$CB_IP_HEX" "$bin" >/tmp/ctrl_build.log 2>&1; then
+    echo "    payload build failed: $bin"
+    tail -8 /tmp/ctrl_build.log
+    return 1
+  fi
   for i in $(seq 1 18); do
     out=$(python3 scripts/send-goldhen-payload.py "$CTRL/$bin" --ps4 "$PS4" 2>&1)
     echo "$out" | grep -qiE "HTTP 200" && { echo "    ok (try $i)"; return 0; }
@@ -36,7 +40,12 @@ payload_callback(){ # $1 = built .bin, stdout = callback text
   nc -l 9899 >"$log" &
   pid=$!
   sleep 1
-  make -C "$CTRL" CALLBACK_IP="$CB_IP_HEX" "$bin" >/tmp/ctrl_build.log 2>&1 || true
+  if ! make -C "$CTRL" CALLBACK_IP="$CB_IP_HEX" "$bin" >/tmp/ctrl_build.log 2>&1; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$log"
+    return 1
+  fi
   out=$(python3 scripts/send-goldhen-payload.py "$CTRL/$bin" --ps4 "$PS4" 2>&1 || true)
   if ! echo "$out" | grep -qiE "HTTP 200"; then
     kill "$pid" 2>/dev/null || true
@@ -75,6 +84,12 @@ if [ "${1:-}" != "nobuild" ]; then
   echo "[1/5] build v$VER"
   ./build.sh >/tmp/redeploy_build.log 2>&1 || { echo "BUILD FAILED:"; tail -8 /tmp/redeploy_build.log; exit 1; }
 fi
+
+"$ROOT/scripts/setup-payload-deps.sh" >/tmp/ps4cast_payload_deps.log 2>&1 || {
+  echo "PAYLOAD TOOLCHAIN SETUP FAILED:"
+  tail -8 /tmp/ps4cast_payload_deps.log
+  exit 1
+}
 
 echo "[2/5] close running app cleanly + verify"
 # Best practice: close the OLD version cleanly, VERIFY it's gone, then proceed.

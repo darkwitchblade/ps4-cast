@@ -1,7 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
-#include "/private/tmp/dpi-src/DirectPackageInstaller-DN6/Payload/ps4-libjbc/jailbreak.h"
-#include "/private/tmp/dpi-src/DirectPackageInstaller-DN6/Payload/ps4-libjbc/kernelrw.h"
+#include "jailbreak.h"
+#include "kernelrw.h"
 
 #if defined(CONTROL_LAUNCH_MEDIA)
 #define TARGET_TITLE_ID "CUSA02012"

@@ -29,6 +29,8 @@ static int     g_segCount;
 // segment that FOLLOWS the tag so the seg-demux path can bump the reset
 // generation exactly there.
 static unsigned char g_segDisc[HLS_MAX_SEGMENTS];
+static int     g_segDurMs[HLS_MAX_SEGMENTS]; // EXTINF duration for VOD seeking
+static int64_t g_totalDurMs;
 static int     g_pendDisc;        // next segment starts a discontinuity
 static int     g_segIdx;          // current segment being read
 static char   *g_initSeg;         // fMP4 init segment URL (EXT-X-MAP), or NULL
@@ -60,6 +62,7 @@ static volatile int g_segGen;     // increments when advancing to the next media
 static volatile int g_resetGen;   // increments when live HLS skips/jumps and player must re-anchor
 static int     g_open;            // a segment is open in httpsrc
 static int     g_active;
+static int     g_externalSegFetch; // player segment-demux owns video fetching
 static volatile int *g_segStopFlag = NULL;   // points at the fetch thread's stop flag; checked in hls_next_segment's retry loop
 void hls_set_seg_stop_flag(volatile int *p) { g_segStopFlag = p; }
 static char    g_dbg[360] = "idle";   // holds open errors; live status built in hls_debug
@@ -238,6 +241,13 @@ int hls_can_segment_demux(void) {
     // rebuild if a specific VOD stream ever misbehaves on HW.
     return g_active && !g_initSeg;
 }
+int hls_can_seek(void) {
+    return g_active && !g_isLive && !g_initSeg && !g_sepAudio &&
+           g_segCount > 0 && g_totalDurMs > 0;
+}
+double hls_duration(void) {
+    return g_totalDurMs > 0 ? (double)g_totalDurMs / 1000.0 : 0.0;
+}
 // VOD playback has consumed every segment -> a clean end-of-stream.
 int hls_at_eof(void) { return g_active && !g_isLive && g_segIdx >= g_segCount; }
 
@@ -263,7 +273,7 @@ static void free_segs(void) {
         g_segs = NULL;
     }
     free(g_initSeg); g_initSeg = NULL; g_mediaUrl[0] = '\0';
-    g_segCount = 0; g_segIdx = 0;
+    g_segCount = 0; g_segIdx = 0; g_totalDurMs = 0;
 }
 
 // free_asegs is defined alongside the audio path below.
@@ -382,7 +392,7 @@ static void *prefetch_main(void *arg) {
 }
 
 static void prefetch_start(void) {
-    if (g_prefUp) return;
+    if (g_prefUp || g_externalSegFetch) return;
     aseg_resume();   // a mid-playback variant switch stops then restarts us; without this the sticky abort would wedge the new worker
     // Live prefetch needs its own sequence-numbered queue. Reusing the VOD
     // index cache can race tiny sliding windows and was observed to crash at
@@ -399,6 +409,50 @@ static void prefetch_start(void) {
         scePthreadCondDestroy(&g_prefCond);
         scePthreadMutexDestroy(&g_prefMtx);
     }
+}
+
+void hls_set_external_segment_fetch(int on) {
+    g_externalSegFetch = on ? 1 : 0;
+    if (g_externalSegFetch) {
+        prefetch_stop();
+        aseg_resume(); // prefetch_stop raises the sticky abort; external owner starts next
+    }
+    else if (g_active) prefetch_start();
+}
+
+// Move a finite muxed TS playlist to the segment containing `seconds`. The
+// player stops its segment-fetch thread before calling us, so this function is
+// the sole owner of g_segIdx while the prefetch cache is rebuilt.
+int hls_seek_time(double seconds, double *actual) {
+    if (!hls_can_seek()) return -1;
+    if (seconds < 0) seconds = 0;
+    if (seconds > hls_duration()) seconds = hls_duration();
+
+    prefetch_stop();
+    aseg_resume(); // external segment fetch resumes after the old cache is joined
+    if (g_open) { httpsrc_close(); g_open = 0; }
+    if (g_memBuf) { free(g_memBuf); g_memBuf = NULL; }
+    g_memSeg = -1; g_memLen = g_memPos = 0;
+
+    int target = g_segCount;
+    int64_t startMs = 0;
+    int64_t wantMs = (int64_t)(seconds * 1000.0);
+    for (int i = 0; i < g_segCount; i++) {
+        int dur = g_segDurMs[i] > 0 ? g_segDurMs[i] : g_targetDurMs;
+        if (wantMs < startMs + dur) { target = i; break; }
+        startMs += dur;
+    }
+    if (target >= g_segCount) startMs = g_totalDurMs;
+    g_segIdx = target;
+    g_segPos = 0;
+    g_initPending = 0; // hls_can_seek excludes EXT-X-MAP; kept explicit here
+    g_segGen++;
+    g_resetGen++;
+    if (actual) *actual = (double)startMs / 1000.0;
+    trace_mark("hls seek req=%.3f seg=%d/%d actual=%.3f reset=%d",
+               seconds, target, g_segCount, (double)startMs / 1000.0, g_resetGen);
+    prefetch_start();
+    return 0;
 }
 
 static int prefetch_take(int seg) {
@@ -634,7 +688,7 @@ void hls_close(void) {
     watchdog_note("close/free");
     free_segs();
     free_asegs();
-    g_active = 0; g_segPos = 0; g_initPending = 0;
+    g_active = 0; g_segPos = 0; g_initPending = 0; g_externalSegFetch = 0;
 }
 
 // Resolve a possibly-relative URL `ref` against `base` into out[cap].
@@ -728,6 +782,8 @@ static int parse_media(char *body, const char *base) {
     g_targetDurMs = 3000;
     g_mediaSeq = 0;
     g_pendDisc = 0;
+    g_totalDurMs = 0;
+    int pendingDurMs = 0;
 
     char resolved[2048];
     char *save = NULL;
@@ -742,6 +798,12 @@ static int parse_media(char *body, const char *base) {
             }
             const char *ms = strstr(line, "#EXT-X-MEDIA-SEQUENCE:");
             if (ms) g_mediaSeq = atoi(ms + 22);
+            const char *inf = strstr(line, "#EXTINF:");
+            if (inf) {
+                double sec = strtod(inf + 8, NULL);
+                if (sec > 0.0 && sec < 36000.0)
+                    pendingDurMs = (int)(sec * 1000.0 + 0.5);
+            }
             if (strstr(line, "#EXT-X-DISCONTINUITY")) g_pendDisc = 1;
             // fMP4 init segment.
             const char *map = strstr(line, "#EXT-X-MAP:");
@@ -766,56 +828,17 @@ static int parse_media(char *body, const char *base) {
         if (g_segCount >= HLS_MAX_SEGMENTS) break;
         resolve_url(base, line, resolved, sizeof(resolved));
         g_segs[g_segCount] = strdup(resolved);
-        if (g_segs[g_segCount]) { g_segDisc[g_segCount] = (unsigned char)g_pendDisc; g_pendDisc = 0; g_segCount++; }
+        if (g_segs[g_segCount]) {
+            int dur = pendingDurMs > 0 ? pendingDurMs : g_targetDurMs;
+            g_segDisc[g_segCount] = (unsigned char)g_pendDisc;
+            g_segDurMs[g_segCount] = dur;
+            g_totalDurMs += dur;
+            g_pendDisc = 0;
+            pendingDurMs = 0;
+            g_segCount++;
+        }
     }
     return g_segCount > 0 ? 0 : -1;
-}
-
-// From a master playlist, pick a smooth PS4 software-decode variant. Prefer
-// <=720p and <=5Mbps when available; fall back to the lowest variant above that
-// rather than blindly taking a 1080p/60 high-bitrate stream.
-static int pick_variant(const char *body, const char *base, char *out, int cap) {
-    int best_score = 0x7fffffff, found = 0;
-    char bestref[2048] = {0};
-    const char *p = body;
-    while ((p = strstr(p, "#EXT-X-STREAM-INF")) != NULL) {
-        int bw = 0, height = 0;
-        const char *bwp = strstr(p, "BANDWIDTH=");
-        if (bwp) bw = atoi(bwp + 10);
-        const char *rp = strstr(p, "RESOLUTION=");
-        if (rp) {
-            const char *x = strchr(rp, 'x');
-            if (x) height = atoi(x + 1);
-        }
-        // the URI is on the next non-empty, non-# line
-        const char *nl = strchr(p, '\n');
-        while (nl) {
-            const char *ls = nl + 1;
-            const char *le = strchr(ls, '\n');
-            int llen = le ? (int)(le - ls) : (int)strlen(ls);
-            while (llen > 0 && (ls[llen-1] == '\r' || ls[llen-1] == ' ')) llen--;
-            if (llen > 0 && ls[0] != '#') {
-                int over = 0;
-                if (height > 720) over += (height - 720) * 10000;
-                if (bw > 5000000) over += (bw - 5000000) / 100;
-                int under = (720 - height) > 0 ? (720 - height) * 50 : 0;
-                int score = over ? (100000000 + over)
-                                 : (under + (bw > 0 ? (5000000 - bw) / 10000 : 500));
-                if (score < best_score) {
-                    best_score = score;
-                    int l = llen < (int)sizeof(bestref) ? llen : (int)sizeof(bestref) - 1;
-                    memcpy(bestref, ls, l); bestref[l] = '\0';
-                    found = 1;
-                }
-                break;
-            }
-            nl = le;
-        }
-        p += 17;
-    }
-    if (!found) return -1;
-    resolve_url(base, bestref, out, cap);
-    return 0;
 }
 
 static int g_downshiftReq = 0;   // set by the player when the buffer keeps draining
@@ -1049,6 +1072,7 @@ int hls_open(const char *url) {
     aseg_set_playlist_budget(1);   // small fetches: fail fast so a dead channel can't block the switch
     watchdog_note("open/close");
     hls_close();                   // raises abort + joins the prefetch threads
+    g_externalSegFetch = 0;
     aseg_resume();                 // ...so resume only AFTER they are gone, never before
     watchdog_note("open/master");
     trace_mark("hls open gen=%u self=%p %s", g_openGen, (void *)scePthreadSelf(), url);

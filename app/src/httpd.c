@@ -1,7 +1,6 @@
 #include "httpd.h"
 #include "web_ui.h"
 #include "player.h"
-#include "escalate.h"
 #include "goldhen.h"
 #include "ssdp.h"
 #include "pad_diag.h"
@@ -29,17 +28,36 @@ typedef struct {
 
 #define SOL_SOCKET_PS4   0xffff
 #define SO_REUSEADDR_PS4 0x0004
+#define SO_SNDTIMEO_PS4  0x1005
+#define SO_RCVTIMEO_PS4  0x1006
+#define SO_NBIO_PS4      0x1200
 
 static OrbisNetId        g_listen = -1;
 static OrbisPthread      g_thread;
+static OrbisPthread      g_event_thread;
 static OrbisPthreadMutex g_mtx;
 static int               g_started = 0;
+static int               g_event_thread_up = 0;
 
 static char g_pending_url[1024];
 static int  g_player_pending = 0;
 static int  g_play_pending = 0;
 static int  g_stop_pending = 0;
 static int  g_quit_pending = 0;
+
+#define AVT_SUBS 4
+typedef struct {
+    int used;
+    char sid[80];
+    char host[64];
+    char path[256];
+    uint16_t port;
+    uint32_t seq;
+    uint64_t expires_at;
+} AvtSubscription;
+static AvtSubscription g_avt_subs[AVT_SUBS];
+static volatile int g_avt_event_dirty = 1;
+static void *event_main(void *arg);
 
 // ---- recents / play-next queue / favorites --------------------------------
 #define URL_MAX    1024
@@ -670,7 +688,8 @@ static const char AVTRANSPORT_XML[] =
 "<stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_InstanceID</name><dataType>ui4</dataType></stateVariable>"
 "<stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_SeekMode</name><dataType>string</dataType><allowedValueList><allowedValue>ABS_TIME</allowedValue><allowedValue>REL_TIME</allowedValue><allowedValue>TRACK_NR</allowedValue></allowedValueList></stateVariable>"
 "<stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_SeekTarget</name><dataType>string</dataType></stateVariable>"
-"<stateVariable sendEvents=\"yes\"><name>TransportState</name><dataType>string</dataType></stateVariable>"
+"<stateVariable sendEvents=\"no\"><name>TransportState</name><dataType>string</dataType></stateVariable>"
+"<stateVariable sendEvents=\"yes\"><name>LastChange</name><dataType>string</dataType></stateVariable>"
 "<stateVariable sendEvents=\"no\"><name>TransportPlaySpeed</name><dataType>string</dataType></stateVariable>"
 "<stateVariable sendEvents=\"no\"><name>AVTransportURI</name><dataType>string</dataType></stateVariable>"
 "<stateVariable sendEvents=\"no\"><name>AVTransportURIMetaData</name><dataType>string</dataType></stateVariable>"
@@ -939,6 +958,251 @@ static const char *ci_strstr(const char *hay, const char *needle) {
     return NULL;
 }
 
+static int header_value(const char *req, const char *name, char *out, int cap) {
+    const char *p = ci_strstr(req, name);
+    if (!p || cap <= 0) return 0;
+    p += strlen(name);
+    while (*p == ' ' || *p == '\t') p++;
+    const char *e = strstr(p, "\r\n");
+    if (!e) return 0;
+    int n = (int)(e - p);
+    while (n > 0 && (p[n - 1] == ' ' || p[n - 1] == '\t')) n--;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return n > 0;
+}
+
+static int parse_callback(const char *value, char *host, int hostcap,
+                          uint16_t *port, char *path, int pathcap) {
+    const char *p = value;
+    if (*p == '<') p++;
+    if (strncmp(p, "http://", 7) != 0) return 0;
+    p += 7;
+    const char *end = strchr(p, '>');
+    if (!end) end = p + strlen(p);
+    const char *slash = memchr(p, '/', (size_t)(end - p));
+    const char *hostend = slash ? slash : end;
+    const char *colon = memchr(p, ':', (size_t)(hostend - p));
+    int hn = (int)((colon ? colon : hostend) - p);
+    if (hn <= 0 || hn >= hostcap) return 0;
+    memcpy(host, p, hn); host[hn] = '\0';
+    int pn = colon ? atoi(colon + 1) : 80;
+    if (pn <= 0 || pn > 65535) return 0;
+    *port = (uint16_t)pn;
+    if (slash) {
+        int n = (int)(end - slash);
+        if (n >= pathcap) n = pathcap - 1;
+        memcpy(path, slash, n); path[n] = '\0';
+    } else {
+        strncpy(path, "/", pathcap);
+        path[pathcap - 1] = '\0';
+    }
+    return 1;
+}
+
+static int subscription_timeout(const char *req) {
+    char value[64];
+    if (!header_value(req, "TIMEOUT:", value, sizeof(value))) return 300;
+    const char *p = ci_strstr(value, "Second-");
+    if (!p) return 300;
+    int sec = atoi(p + 7);
+    if (sec < 60) sec = 60;
+    if (sec > 1800) sec = 1800;
+    return sec;
+}
+
+static void send_subscription_response(OrbisNetId c, const char *sid, int timeout) {
+    char hdr[320];
+    int n = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "SID: %s\r\n"
+        "TIMEOUT: Second-%d\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n\r\n", sid, timeout);
+    send_all(c, hdr, n);
+}
+
+static int handle_avt_subscription(OrbisNetId c, const char *method, const char *req) {
+    if (strcmp(method, "UNSUBSCRIBE") == 0) {
+        char sid[80];
+        if (!header_value(req, "SID:", sid, sizeof(sid))) {
+            send_response(c, "412 Precondition Failed", "text/plain", "missing sid", 11);
+            return 1;
+        }
+        scePthreadMutexLock(&g_mtx);
+        for (int i = 0; i < AVT_SUBS; i++)
+            if (g_avt_subs[i].used && strcmp(g_avt_subs[i].sid, sid) == 0)
+                memset(&g_avt_subs[i], 0, sizeof(g_avt_subs[i]));
+        scePthreadMutexUnlock(&g_mtx);
+        send_response(c, "200 OK", "text/plain", "", 0);
+        return 1;
+    }
+    if (strcmp(method, "SUBSCRIBE") != 0) return 0;
+    if (!g_event_thread_up) {
+        send_response(c, "503 Service Unavailable", "text/plain", "event thread unavailable", 24);
+        return 1;
+    }
+
+    int timeout = subscription_timeout(req);
+    uint64_t expires = sceKernelGetProcessTime() + (uint64_t)timeout * 1000000ULL;
+    char sid[80];
+    if (header_value(req, "SID:", sid, sizeof(sid))) {
+        int found = 0;
+        scePthreadMutexLock(&g_mtx);
+        for (int i = 0; i < AVT_SUBS; i++) {
+            if (g_avt_subs[i].used && strcmp(g_avt_subs[i].sid, sid) == 0) {
+                g_avt_subs[i].expires_at = expires;
+                found = 1;
+                break;
+            }
+        }
+        scePthreadMutexUnlock(&g_mtx);
+        if (!found) send_response(c, "412 Precondition Failed", "text/plain", "unknown sid", 11);
+        else send_subscription_response(c, sid, timeout);
+        return 1;
+    }
+
+    char callback[384], host[64], path[256];
+    uint16_t port;
+    if (!header_value(req, "CALLBACK:", callback, sizeof(callback)) ||
+        !parse_callback(callback, host, sizeof(host), &port, path, sizeof(path))) {
+        send_response(c, "412 Precondition Failed", "text/plain", "bad callback", 12);
+        return 1;
+    }
+
+    int slot = -1;
+    scePthreadMutexLock(&g_mtx);
+    uint64_t now = sceKernelGetProcessTime();
+    for (int i = 0; i < AVT_SUBS; i++) {
+        if (g_avt_subs[i].used && g_avt_subs[i].expires_at <= now)
+            memset(&g_avt_subs[i], 0, sizeof(g_avt_subs[i]));
+        if (slot < 0 && !g_avt_subs[i].used) slot = i;
+    }
+    if (slot >= 0) {
+        AvtSubscription *s = &g_avt_subs[slot];
+        memset(s, 0, sizeof(*s));
+        s->used = 1; s->port = port; s->expires_at = expires;
+        snprintf(s->sid, sizeof(s->sid), "uuid:ps4cast-%08x-%08x",
+                 (unsigned)(now >> 32), (unsigned)now ^ (unsigned)slot);
+        strncpy(s->host, host, sizeof(s->host) - 1);
+        strncpy(s->path, path, sizeof(s->path) - 1);
+        strncpy(sid, s->sid, sizeof(sid) - 1); sid[sizeof(sid) - 1] = '\0';
+        g_avt_event_dirty = 1;
+    }
+    scePthreadMutexUnlock(&g_mtx);
+    if (slot < 0) send_response(c, "503 Service Unavailable", "text/plain", "subscriber limit", 16);
+    else send_subscription_response(c, sid, timeout);
+    return 1;
+}
+
+static int notify_connect(const AvtSubscription *sub) {
+    OrbisNetInAddr in;
+    if (sceNetInetPton(ORBIS_NET_AF_INET, sub->host, &in.s_addr) <= 0) return -1;
+    OrbisNetId s = sceNetSocket("ps4cast_evt", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_STREAM, 0);
+    if (s < 0) return -1;
+    int tmo = 1000 * 1000;
+    sceNetSetsockopt(s, SOL_SOCKET_PS4, SO_RCVTIMEO_PS4, &tmo, sizeof(tmo));
+    sceNetSetsockopt(s, SOL_SOCKET_PS4, SO_SNDTIMEO_PS4, &tmo, sizeof(tmo));
+    ps4_sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.len = sizeof(sa); sa.family = ORBIS_NET_AF_INET;
+    sa.port = sceNetHtons(sub->port); sa.addr = in.s_addr;
+    int nb = 1;
+    sceNetSetsockopt(s, SOL_SOCKET_PS4, SO_NBIO_PS4, &nb, sizeof(nb));
+    sceNetConnect(s, (const OrbisNetSockaddr *)&sa, sizeof(sa));
+    int connected = 0;
+    uint64_t start = sceKernelGetProcessTime();
+    sceKernelUsleep(10000);
+    while (sceKernelGetProcessTime() - start < 1000000ULL) {
+        if (sceNetSend(s, "", 0, 0) >= 0) { connected = 1; break; }
+        sceKernelUsleep(20000);
+    }
+    nb = 0;
+    sceNetSetsockopt(s, SOL_SOCKET_PS4, SO_NBIO_PS4, &nb, sizeof(nb));
+    if (!connected) { sceNetSocketClose(s); return -1; }
+    return s;
+}
+
+static void notify_avt(const AvtSubscription *sub, const char *state,
+                       const char *uri, double duration, int canSeek) {
+    static char uriEsc[6144], inner[7168], lastChange[14336], body[15360], req[16384];
+    char dur[32];
+    format_upnp_time(duration, dur, sizeof(dur));
+    xml_escape(uri, uriEsc, sizeof(uriEsc));
+    int in = snprintf(inner, sizeof(inner),
+        "<Event xmlns=\"urn:schemas-upnp-org:metadata-1-0/AVT/\">"
+        "<InstanceID val=\"0\"><TransportState val=\"%s\"/>"
+        "<TransportStatus val=\"OK\"/><TransportPlaySpeed val=\"1\"/>"
+        "<CurrentTrack val=\"%d\"/><CurrentTrackDuration val=\"%s\"/>"
+        "<AVTransportURI val=\"%s\"/><CurrentTrackURI val=\"%s\"/>"
+        "<CurrentTransportActions val=\"%s\"/></InstanceID></Event>",
+        state, uri[0] ? 1 : 0, dur, uriEsc, uriEsc,
+        canSeek ? "Play,Stop,Pause,Seek" : "Play,Stop,Pause");
+    if (in < 0 || in >= (int)sizeof(inner)) return;
+    xml_escape(inner, lastChange, sizeof(lastChange));
+    int bn = snprintf(body, sizeof(body),
+        "<?xml version=\"1.0\"?>"
+        "<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">"
+        "<e:property><LastChange>%s</LastChange></e:property></e:propertyset>",
+        lastChange);
+    if (bn < 0 || bn >= (int)sizeof(body)) return;
+    int rn = snprintf(req, sizeof(req),
+        "NOTIFY %s HTTP/1.1\r\nHost: %s:%u\r\n"
+        "Content-Type: text/xml; charset=\"utf-8\"\r\n"
+        "NT: upnp:event\r\nNTS: upnp:propchange\r\nSID: %s\r\nSEQ: %u\r\n"
+        "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
+        sub->path, sub->host, sub->port, sub->sid, sub->seq, bn, body);
+    if (rn < 0 || rn >= (int)sizeof(req)) return;
+    OrbisNetId s = notify_connect(sub);
+    if (s < 0) { trace_mark("upnp event connect fail sid=%s host=%s", sub->sid, sub->host); return; }
+    send_all(s, req, rn);
+    sceNetSocketClose(s);
+    trace_mark("upnp event state=%s seq=%u sid=%s", state, sub->seq, sub->sid);
+}
+
+static void *event_main(void *arg) {
+    (void)arg;
+    char lastState[24] = "";
+    char lastUri[1024] = "";
+    int lastSeek = -1, lastDur = -1;
+    for (;;) {
+        const char *stateNow = player_started()
+            ? (player_is_paused() ? "PAUSED_PLAYBACK" : "PLAYING") : "STOPPED";
+        char state[24], uri[1024];
+        strncpy(state, stateNow, sizeof(state) - 1); state[sizeof(state) - 1] = '\0';
+        scePthreadMutexLock(&g_mtx);
+        strncpy(uri, g_dlna_uri, sizeof(uri) - 1); uri[sizeof(uri) - 1] = '\0';
+        scePthreadMutexUnlock(&g_mtx);
+        double duration = 0;
+        player_progress(NULL, &duration);
+        int canSeek = player_can_seek();
+        int durSec = (int)(duration + 0.5);
+        if (strcmp(state, lastState) != 0 || strcmp(uri, lastUri) != 0 ||
+            canSeek != lastSeek || durSec != lastDur) g_avt_event_dirty = 1;
+
+        AvtSubscription pending[AVT_SUBS];
+        int count = 0;
+        if (g_avt_event_dirty) {
+            uint64_t now = sceKernelGetProcessTime();
+            scePthreadMutexLock(&g_mtx);
+            g_avt_event_dirty = 0;
+            for (int i = 0; i < AVT_SUBS; i++) {
+                AvtSubscription *s = &g_avt_subs[i];
+                if (s->used && s->expires_at <= now) memset(s, 0, sizeof(*s));
+                if (s->used) { pending[count++] = *s; s->seq++; }
+            }
+            scePthreadMutexUnlock(&g_mtx);
+            for (int i = 0; i < count; i++) notify_avt(&pending[i], state, uri, duration, canSeek);
+            strncpy(lastState, state, sizeof(lastState) - 1); lastState[sizeof(lastState) - 1] = '\0';
+            strncpy(lastUri, uri, sizeof(lastUri) - 1); lastUri[sizeof(lastUri) - 1] = '\0';
+            lastSeek = canSeek; lastDur = durSec;
+        }
+        sceKernelUsleep(250000);
+    }
+    return NULL;
+}
+
 static void handle_client(OrbisNetId c) {
     // One request is handled at a time by server_main, so static storage is safe
     // and avoids spending 8 KB of the HTTP thread stack before dispatch begins.
@@ -973,11 +1237,14 @@ static void handle_client(OrbisNetId c) {
     }
 
     // Method + path
-    char method[8] = {0}, path[256] = {0};
-    sscanf(req, "%7s %255s", method, path);
+    char method[16] = {0}, path[256] = {0};
+    sscanf(req, "%15s %255s", method, path);
 
     const char *body = strstr(req, "\r\n\r\n");
     body = body ? body + 4 : "";
+
+    if (strcmp(path, "/upnp/event/AVTransport") == 0 &&
+        handle_avt_subscription(c, method, req)) return;
 
     if (strcmp(method, "GET") == 0 &&
         (strcmp(path, "/") == 0 || strncmp(path, "/index", 6) == 0)) {
@@ -1014,8 +1281,8 @@ static void handle_client(OrbisNetId c) {
         double cur = 0, dur = 0;
         player_progress(&cur, &dur);
         int j = snprintf(json, sizeof(json),
-                         "{\"ver\":\"%s\",\"jb\":%d,\"goldhen\":\"%s\",\"status\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"diag\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d,\"debug\":%d,\"chan_n\":%d,\"chan_cur\":%d,\"buf\":%d,\"rx\":%llu,\"sys\":\"%s\",\"fps\":%d,\"avsync\":%d}",
-                         APP_VER, jb_result(), goldhen_status(), player_status(), ssdp_status(),
+                         "{\"ver\":\"%s\",\"goldhen\":\"%s\",\"status\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"diag\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d,\"debug\":%d,\"chan_n\":%d,\"chan_cur\":%d,\"buf\":%d,\"rx\":%llu,\"sys\":\"%s\",\"fps\":%d,\"avsync\":%d}",
+                         APP_VER, goldhen_status(), player_status(), ssdp_status(),
                          active, player_is_paused(), (int)(cur + 0.5), (int)(dur + 0.5), g_last_push, dbg, pad_diag_get(),
                          player_hw_enabled(), notify_get_debug(), g_chanN, g_chanCur,
                          player_buffer_pct(), (unsigned long long)player_rx_total(), sys_diag_get(), sys_get_fps(), player_get_avsync());
@@ -1089,6 +1356,7 @@ static void handle_client(OrbisNetId c) {
         else if (body[0] == '0') want = 0;
         else                     want = !player_is_paused();   // toggle
         player_pause(want);
+        g_avt_event_dirty = 1;
         send_response(c, "200 OK", "text/plain", want ? "paused" : "playing", want ? 6 : 7);
         return;
     }
@@ -1100,6 +1368,7 @@ static void handle_client(OrbisNetId c) {
         sec = whole;
         if (ok) {
             player_seek(sec);
+            g_avt_event_dirty = 1;
             send_response(c, "200 OK", "text/plain", "ok", 2);
         } else {
             send_response(c, "400 Bad Request", "text/plain", "bad seconds", 11);
@@ -1159,9 +1428,11 @@ static void handle_client(OrbisNetId c) {
                 send_soap_fault(c, 402, "Invalid Args");
                 return;
             }
+            scePthreadMutexLock(&g_mtx);
             int changed = strcmp(g_dlna_uri, uri) != 0;
             strncpy(g_dlna_uri, uri, sizeof(g_dlna_uri) - 1);
             g_dlna_uri[sizeof(g_dlna_uri) - 1] = '\0';
+            scePthreadMutexUnlock(&g_mtx);
             strncpy(g_last_push, uri, sizeof(g_last_push) - 1);
             g_last_push[sizeof(g_last_push) - 1] = '\0';
             // SetAVTransportURI loads a resource; Play starts it. Starting here
@@ -1176,6 +1447,7 @@ static void handle_client(OrbisNetId c) {
                     player_interrupt();
                 }
             }
+            g_avt_event_dirty = 1;
             trace_mark("dlna seturi changed=%d len=%d", changed, (int)strlen(uri));
             send_soap_ok(c, "SetAVTransportURI", "");
             return;
@@ -1191,6 +1463,7 @@ static void handle_client(OrbisNetId c) {
                 set_pending_player(g_dlna_uri);
                 g_dlna_started = 1;
             }
+            g_avt_event_dirty = 1;
             trace_mark("dlna play resume=%d", player_started() ? 1 : 0);
             send_soap_ok(c, "Play", "");
             return;
@@ -1202,6 +1475,7 @@ static void handle_client(OrbisNetId c) {
                     return;
                 }
                 player_pause(1);
+                g_avt_event_dirty = 1;
                 trace_mark("dlna pause");
                 send_soap_ok(c, "Pause", "");
             } else {
@@ -1210,6 +1484,7 @@ static void handle_client(OrbisNetId c) {
                 scePthreadMutexUnlock(&g_mtx);
                 g_dlna_started = 0;
                 player_interrupt();
+                g_avt_event_dirty = 1;
                 trace_mark("dlna stop");
                 send_soap_ok(c, "Stop", "");
             }
@@ -1237,6 +1512,7 @@ static void handle_client(OrbisNetId c) {
                 return;
             }
             player_seek(seconds);
+            g_avt_event_dirty = 1;
             trace_mark("dlna seek %.3f", seconds);
             send_soap_ok(c, "Seek", "");
             return;
@@ -1625,6 +1901,8 @@ int httpd_start(int port) {
         return -4;
     }
     g_started = 1;
+    if (scePthreadCreate(&g_event_thread, NULL, event_main, NULL, "ps4cast_event") == 0)
+        g_event_thread_up = 1;
     return 0;
 }
 

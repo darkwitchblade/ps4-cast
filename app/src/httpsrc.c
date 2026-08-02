@@ -45,7 +45,6 @@ static int      g_pool = -1;
 
 static int      g_ready = 0;
 static uint64_t g_total = 0;
-static uint64_t g_pos = 0;         // next byte the connection will deliver
 static char     g_dbg[200] = "idle";
 
 // leftover body bytes captured while reading the response header block
@@ -439,6 +438,13 @@ static int request_from_ex(uint64_t pos, int *status, int64_t *total, char *loc,
             discard -= (uint32_t)r;
         }
     }
+    // A failed reconnect used to remain in g_dbg forever even after the reader
+    // recovered and playback continued, making /status report a dead network
+    // path while bytes and frames were advancing normally.
+    if (!status && !total && !loc)
+        snprintf(g_dbg, sizeof(g_dbg), "%s recovered %s:%u at=%llu st=%d",
+                 g_tlsmode ? "https" : "http", g_host, g_port,
+                 (unsigned long long)pos, st);
     return 0;
 }
 

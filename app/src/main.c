@@ -15,7 +15,6 @@
 #include "httpd.h"
 #include "player.h"
 #include "httpsrc.h"
-#include "escalate.h"
 #include "ssdp.h"
 #include "pad_diag.h"
 #include "sys_diag.h"
@@ -237,25 +236,17 @@ static const GfxColor HAIR   = { 0x8a, 0x99, 0xd8 };
 static const GfxColor ACCENT = { 0x5b, 0x8c, 0xff };
 static const GfxColor ACC_LT = { 0x9d, 0xb8, 0xff };
 static const GfxColor LIVE   = { 0x2e, 0xe6, 0xa6 };
-static const GfxColor DANGER = { 0xff, 0x5d, 0x7a };
 static const GfxColor WARN   = { 0xff, 0xc4, 0x4a };
 static const GfxColor TXT    = { 0xf3, 0xf6, 0xff };
 static const GfxColor MUT    = { 0x9a, 0xa4, 0xc8 };
 static const GfxColor FAINT  = { 0x6b, 0x73, 0x98 };
 static const GfxColor INK    = { 0x07, 0x0a, 0x14 };
 static const GfxColor PAPER  = { 0xf4, 0xf7, 0xff };
-static const GfxColor BLACK  = { 0x00, 0x00, 0x00 };
 static const GfxColor BTN_X  = { 0x86, 0xa9, 0xff };
 static const GfxColor BTN_O  = { 0xff, 0x73, 0x88 };
 static const GfxColor BTN_T  = { 0x44, 0xe0, 0xa6 };
 // Kept for the (compiled-out) BOOT_MINIMAL diagnostic path.
 static const GfxColor WHITE  = { 0xf3, 0xf6, 0xff };
-static const GfxColor MUTED  = { 0x9a, 0xa4, 0xc8 };
-
-static void text_centered(Gfx *g, int cy, const char *s, int scale, GfxColor c) {
-    int w = gfx_text_w(s, scale);
-    gfx_text(g, (g->width - w) / 2, cy, s, scale, c);
-}
 
 static void fmt_time(double sec, char *out, int cap) {
     if (sec < 0) sec = 0;
@@ -308,16 +299,6 @@ static void ctext(Gfx *g, int cy, const char *s, int sc, GfxColor c, int tr) {
 static void panel(Gfx *g, int x, int y, int w, int h, int r, GfxColor c, int a) {
     gfx_round_a(g, x, y, w, h, r, c, a);
     gfx_rect_a(g, x + r, y, w - 2 * r, 1, HAIR, 36);   // top hairline highlight
-}
-static void icon_play(Gfx *g, int cx, int cy, int s, GfxColor c) {
-    gfx_tri(g, cx - (int)(s * 0.28f), cy - (int)(s * 0.5f),
-               cx - (int)(s * 0.28f), cy + (int)(s * 0.5f),
-               cx + (int)(s * 0.50f), cy, c);
-}
-static void icon_pause(Gfx *g, int cx, int cy, int s, GfxColor c) {
-    int bw = (int)(s * 0.28f), bh = s, gap = (int)(s * 0.26f), r = bw / 2;
-    gfx_round(g, cx - gap / 2 - bw, cy - bh / 2, bw, bh, r, c);
-    gfx_round(g, cx + gap / 2, cy - bh / 2, bw, bh, r, c);
 }
 static void icon_cast(Gfx *g, int cx, int cy, int box) {
     panel(g, cx - box / 2, cy - box / 2, box, box, box / 4, SURF2, 255);

@@ -13,6 +13,7 @@ nc -l 9899 >"$CALLBACK_LOG" &
 echo $! >"$CALLBACK_PID"
 sleep 1
 
+"$ROOT/scripts/setup-payload-deps.sh" >/tmp/ps4cast_payload_deps.log
 make -C "$ROOT/payloads/ps4cast-control" CALLBACK_IP="$CB_IP_HEX" build/ps4cast-app-status.bin >/tmp/ps4cast_control_build.log
 python3 "$ROOT/scripts/send-goldhen-payload.py" "$ROOT/payloads/ps4cast-control/build/ps4cast-app-status.bin" --ps4 "$PS4"
 

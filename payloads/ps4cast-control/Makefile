@@ -1,9 +1,10 @@
-DPI_PAYLOAD_DIR ?= /private/tmp/dpi-src/DirectPackageInstaller-DN6/Payload
+ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
+DPI_PAYLOAD_DIR ?= $(ROOT)/third_party/DirectPackageInstaller/Payload
 CC := /opt/homebrew/opt/llvm/bin/clang
 LD := /opt/homebrew/opt/lld/bin/ld.lld
 OBJCOPY := /opt/homebrew/opt/llvm/bin/llvm-objcopy
 YASM := yasm
-CFLAGS := --target=x86_64-pc-freebsd12-elf -fuse-ld=$(LD) -g -mcmodel=small -isystem $(DPI_PAYLOAD_DIR)/freebsd-headers -nostdinc -nostdlib -fno-stack-protector -static -fPIE -ffreestanding
+CFLAGS := --target=x86_64-pc-freebsd12-elf -fuse-ld=$(LD) -g -mcmodel=small -isystem $(DPI_PAYLOAD_DIR)/freebsd-headers -I$(DPI_PAYLOAD_DIR)/ps4-libjbc -nostdinc -nostdlib -fno-stack-protector -static -fPIE -ffreestanding
 CALLBACK_IP ?= 0x8B01A8C0U
 CFLAGS += -DCALLBACK_IP_ADDR=$(CALLBACK_IP)
 LDFLAGS := -Wl,-T,payload.ld -Wl,-gc-sections
@@ -36,10 +37,7 @@ build:
 build/crt.o: $(DPI_PAYLOAD_DIR)/lib/crt.asm | build
 	$(YASM) -f elf64 $< -o $@
 
-build/syscalls.asm: $(DPI_PAYLOAD_DIR)/lib/syscalls.py | build
-	python3 $< > $@
-
-build/syscalls.o: build/syscalls.asm | build
+build/syscalls.o: $(DPI_PAYLOAD_DIR)/lib/syscalls.asm | build
 	$(YASM) -f elf64 $< -o $@
 
 build/dl.o: $(DPI_PAYLOAD_DIR)/lib/dl.c | build

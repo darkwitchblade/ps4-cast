@@ -116,14 +116,8 @@ static int      g_swsSrcFmt = -1;  // AV_PIX_FMT_NONE
 // ref to the last shown frame and re-present it on holds/pause/EOF — otherwise a
 // held frame flips to a stale back-buffer (judder). NULL in software mode.
 static AVFrame *g_lastShown = NULL;
-// Frame-conversion cache. g_shownGen bumps whenever a NEW decoded frame becomes
-// the one on screen; g_convGen records which generation is currently sitting in
-// g_scaled. The HW present path converts NV12->RGB (expensive: ~2M pixels of YUV
-// math + scaling) ONLY when these differ, and otherwise just blits the cached
-// RGB into the rotating framebuffer. Previously every render-loop iteration
-// re-converted the same frame, so with a ~53fps loop on 24fps content more than
-// half of all conversions were wasted work.
-static unsigned g_shownGen = 0, g_convGen = 0xffffffffu;
+// Bumped whenever a newly decoded frame becomes the frame on screen.
+static unsigned g_shownGen = 0;
 
 // Set by the main loop (player_request_bar_clear) when an overlay is drawing over
 // the letterbox bars, so the next few frames re-clear the bars and the overlay
@@ -148,6 +142,7 @@ static int             g_wasPaused = 0;
 static uint64_t        g_pauseAt = 0;
 static volatile int    g_seekPending = 0;
 static volatile double g_seekTo = 0;
+static volatile uint64_t g_seekRequestedAt = 0;
 static double          g_curSec = 0;   // current playback position
 static double          g_durSec = 0;   // total duration
 
@@ -157,7 +152,7 @@ static long g_drops = 0, g_audioPkts = 0, g_videoPkts = 0;
 static char g_codecLabel[24] = "";
 static int  g_lastErr = 0;
 static int64_t g_lastLagUs = 0;
-static int  g_isHls = 0;   // HLS (m3u8): non-seekable concatenated segments
+static int  g_isHls = 0;
 static int  g_hlsSegGen = 0;
 static int  g_hlsResetGen = 0;
 static int  g_hlsSegDemux = 0;
@@ -354,7 +349,8 @@ void player_stop(void) {
     g_rebuffering = 0; g_startupHeadstart = 0; g_startupGateAt = 0;
     g_vstream = -1; g_active = 0; g_started = 0; g_gotFrame = 0; g_interlaced = 0;
     g_pos = 0; g_startProc = 0; g_scaledW = g_scaledH = 0;
-    g_paused = 0; g_wasPaused = 0; g_seekPending = 0; g_curSec = 0; g_durSec = 0;
+    g_paused = 0; g_wasPaused = 0; g_seekPending = 0; g_seekRequestedAt = 0;
+    g_curSec = 0; g_durSec = 0;
     snprintf(g_status, sizeof(g_status), "stopped");
 }
 
@@ -536,6 +532,7 @@ int player_play(const char *url) {
     AVCodecParameters *vpar = g_fmt->streams[g_vstream]->codecpar;
     g_useHw = 0;
     g_hlsSegDemux = g_isHls && hls_can_segment_demux();
+    if (g_isHls) hls_set_external_segment_fetch(g_hlsSegDemux);
     // Hardware H.264: direct MP4 (needs the mp4->annexb bitstream filter) or live
     // HLS via the segment-demux path (MPEG-TS packets are already annex-b, so no
     // bsf). The plain AVIO-concatenated HLS path (no seg-demux) stays software.
@@ -611,6 +608,7 @@ int player_play(const char *url) {
     g_srcH = g_useHw ? vpar->height : g_vdec->height;
     snprintf(g_codecLabel, sizeof(g_codecLabel), "%s%s", dec->name ? dec->name : "video", g_interlaced ? " deint" : "");
     g_durSec = (g_fmt->duration > 0) ? (double)g_fmt->duration / AV_TIME_BASE : 0;
+    if (g_isHls && hls_duration() > 0) g_durSec = hls_duration();
     g_hlsSegGen = g_isHls ? hls_generation() : 0;
     g_hlsResetGen = g_isHls ? hls_reset_generation() : 0;
     g_hlsSegDemux = g_isHls && hls_can_segment_demux();
@@ -709,7 +707,9 @@ void player_pause(int paused) {
     audio_pause(g_paused || g_rebuffering);
 }
 int  player_is_paused(void)   { return g_paused; }
-int  player_can_seek(void)    { return g_started && !g_isHls && g_durSec > 0; }
+int  player_can_seek(void)    {
+    return g_started && g_durSec > 0 && (!g_isHls || hls_can_seek());
+}
 void player_set_startup_headstart(int on) { g_nextStartupHeadstart = on ? 1 : 0; }
 // Seek by a delta from the PENDING target when one is queued, else from the
 // current position. Rapid R1/L1 presses used to all read g_curSec, which only
@@ -721,10 +721,17 @@ void player_seek_relative(double delta) {
 }
 
 void player_seek(double seconds) {
+    if (!player_can_seek()) return;
     if (seconds < 0) seconds = 0;
     if (g_durSec > 0 && seconds > g_durSec) seconds = g_durSec;
     g_seekTo = seconds;
+    g_seekRequestedAt = sceKernelGetProcessTime();
     g_seekPending = 1;
+}
+
+static int seek_debounce_elapsed(void) {
+    if (!g_seekPending) return 0;
+    return sceKernelGetProcessTime() - g_seekRequestedAt >= 200000ULL;
 }
 // Unblock a stuck network read (called from the http thread on Stop / new cast)
 // so an underrun stall never traps the app.
@@ -781,9 +788,25 @@ static void fq_flush(void) {
 // the caller.
 static void apply_seek(void) {
     double sec = g_seekTo;
+    uint64_t requestAt = g_seekRequestedAt;
     g_seekPending = 0;
-    int64_t ts = (int64_t)(sec * AV_TIME_BASE);
-    if (av_seek_frame(g_fmt, -1, ts, AVSEEK_FLAG_BACKWARD) >= 0) {
+    double actual = sec;
+    int seekOk = 0;
+    if (g_isHls && hls_can_seek()) {
+        // Exactly one thread may advance g_segIdx. Stop the read-ahead owner,
+        // reposition HLS, then recreate the ring around the new segment.
+        seg_readahead_stop();
+        seekOk = (hls_seek_time(sec, &actual) == 0);
+        if (seekOk) {
+            g_hlsResetGen = hls_reset_generation();
+            g_hlsSegGen = hls_generation();
+            seg_readahead_start();
+        }
+    } else {
+        int64_t ts = (int64_t)(sec * AV_TIME_BASE);
+        seekOk = (av_seek_frame(g_fmt, -1, ts, AVSEEK_FLAG_BACKWARD) >= 0);
+    }
+    if (seekOk) {
         fq_flush();
         if (g_vdec) avcodec_flush_buffers(g_vdec);
         if (g_useHw && g_bsf) av_bsf_flush(g_bsf);   // next AU after seek is a keyframe
@@ -798,7 +821,8 @@ static void apply_seek(void) {
             // produced sound that visibly trailed the picture.
             audio_flush();
         }
-        trace_mark("seek applied target=%.3f audio=reanchor-next-pts", sec);
+        trace_mark("seek applied target=%.3f actual=%.3f hls=%d audio=reanchor-next-pts",
+                   sec, actual, g_isHls);
         g_sepAudioEof = 0;
         g_gotFrame = 0;          // re-anchor the pacing clock on the next frame
         if (g_threaded) {
@@ -806,10 +830,13 @@ static void apply_seek(void) {
             g_startupGateAt = sceKernelGetProcessTime();
             audio_pause(1);      // refill both clocks before presenting after scrub
         }
-        g_curSec = sec;
+        g_curSec = actual;
         g_active = 1;
         snprintf(g_status, sizeof(g_status), "seeking %.0fs", sec);
     }
+    // Do not erase the timestamp of a newer request that arrived while this
+    // seek was resetting demux/decoder state; it gets its own debounce window.
+    if (!g_seekPending && g_seekRequestedAt == requestAt) g_seekRequestedAt = 0;
 }
 
 static void apply_hls_reset(void) {
@@ -1318,35 +1345,6 @@ static void present_pool_stop(void) {
     g_pwUp = 0;
 }
 
-// NV12 -> g_scaled (BGRA), parallel when the pool is up, serial otherwise.
-static int build_scaled_nv12(AVFrame *fr, Gfx *g) {
-    int dw = g->width, dh = g->height, sw = fr->width, sh = fr->height;
-    if (sw <= 0 || sh <= 0) return -1;
-    int scaledW = dw, scaledH = (int)((int64_t)dw * sh / sw);
-    if (scaledH > dh) { scaledH = dh; scaledW = (int)((int64_t)dh * sw / sh); }
-    if (scaledW < 1) scaledW = 1; if (scaledH < 1) scaledH = 1;
-    if (scaledW != g_scaledW || scaledH != g_scaledH || !g_scaled) {
-        free(g_scaled);
-        g_scaled = malloc((size_t)scaledW * scaledH * 4);
-        if (!g_scaled) { g_scaledW = g_scaledH = 0; return -1; }
-        g_scaledW = scaledW; g_scaledH = scaledH;
-        if (g_sws) { sws_freeContext(g_sws); g_sws = NULL; }
-    }
-    PresentJob job = { fr->data[0], fr->data[1], sw, sh, fr->linesize[0], fr->linesize[1],
-                       (uint32_t *)g_scaled, scaledW, 0, 0, scaledW, scaledH };
-    if (g_pwUp) {
-        scePthreadMutexLock(&g_pwMtx);
-        g_pwJob = job; g_pwDoneCount = 0; g_pwGen++;
-        scePthreadCondBroadcast(&g_pwGo);
-        while (g_pwDoneCount < PRESENT_WORKERS) scePthreadCondWait(&g_pwDone, &g_pwMtx);
-        scePthreadMutexUnlock(&g_pwMtx);
-    } else {
-        convert_band(&job, 0, scaledH);
-    }
-    return 0;
-}
-
-
 // NV12 -> active framebuffer directly. This fuses color conversion, scaling, and
 // final blit for the hardware path.
 static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
@@ -1421,7 +1419,11 @@ static void *decode_thread_main(void *arg) {
     trace_mark("thread + decode self=%p", (void *)scePthreadSelf());
     (void)arg;
     while (!g_decStop) {
-        if (g_seekPending) { apply_seek(); g_decEof = 0; }
+        if (g_seekPending) {
+            if (seek_debounce_elapsed()) { apply_seek(); g_decEof = 0; }
+            else sceKernelUsleep(5000);
+            continue;
+        }
         if (g_paused)      { sceKernelUsleep(8000); continue; }
 
         if (g_isHls) {
@@ -1509,9 +1511,9 @@ static int seg_ring_push(uint8_t *buf, int len, int gen) {
 // Blocks until a segment is ready. Returns 0 (out params set) or -1 on stop.
 static int seg_ring_pop(uint8_t **buf, int *len, int *gen) {
     scePthreadMutexLock(&g_srMtx);
-    while (!g_decStop && g_srCount == 0)
-        scePthreadCondWait(&g_srNotEmpty, &g_srMtx);
-    if (g_srCount == 0) { scePthreadMutexUnlock(&g_srMtx); return -1; }
+    while (!g_decStop && !g_seekPending && g_srCount == 0)
+        scePthreadCondTimedwait(&g_srNotEmpty, &g_srMtx, 50 * 1000);
+    if (g_seekPending || g_srCount == 0) { scePthreadMutexUnlock(&g_srMtx); return -1; }
     SegSlot s = g_segRing[g_srHead];
     g_segRing[g_srHead].buf = NULL;
     g_srHead = (g_srHead + 1) % SEG_RING;
@@ -1666,6 +1668,11 @@ static void *decode_segment_thread_main(void *arg) {
     trace_mark("thread + decode-seg self=%p", (void *)scePthreadSelf());
     (void)arg;
     while (!g_decStop) {
+        if (g_seekPending) {
+            if (seek_debounce_elapsed()) { apply_seek(); g_decEof = 0; }
+            else sceKernelUsleep(5000);
+            continue;
+        }
         // Backpressure on the audio ring — the SAME guard decode_thread_main has.
         // Live HLS/IPTV runs through THIS loop, so without it the decoder races
         // ahead, the ring overflows and audio_write() discards samples, which
@@ -1732,7 +1739,7 @@ static void *decode_segment_thread_main(void *arg) {
         AVRational atb = (sa >= 0) ? sfmt->streams[sa]->time_base : (AVRational){1, 90000};
         int segPkts = 0, segVideo = 0, segAudio = 0;
 
-        while (!g_decStop) {
+        while (!g_decStop && !g_seekPending) {
             rc = av_read_frame(sfmt, g_pkt);
             if (rc < 0) break;
             g_pkts++;
@@ -1904,7 +1911,10 @@ int player_render(Gfx *g) {
         if (g_startProc) g_startProc += sceKernelGetProcessTime() - g_pauseAt;
     }
 
-    if (g_seekPending) apply_seek();
+    if (g_seekPending) {
+        if (seek_debounce_elapsed()) apply_seek();
+        else return g_gotFrame && g_scaled ? (blit_scaled(g), 1) : 0;
+    }
 
     for (;;) {
         int rc = av_read_frame(g_fmt, g_pkt);

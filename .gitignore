@@ -15,6 +15,7 @@ portlibs/bearssl/
 # outputs
 dist/*.pkg
 /tmp/
+third_party/DirectPackageInstaller/
 dist/*.mp4
 portlibs/src/ffmpeg-6.1.6/
 portlibs/ffmpeg-611-known-good/

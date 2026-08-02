@@ -93,6 +93,14 @@ There's no way to reset the PS4 GPU from the Mac directly. The practical refresh
 ## Deploy best practice (v-bump on console) — CODIFIED in redeploy.sh
 Every new version: **close previous cleanly → verify closed → delete cleanly → install safely.** redeploy.sh [2/5] now: tries clean `/quit` (LoadExec exit, no dialog) first, then force-kill, retries up to 5×, and VERIFIES truly closed (unreachable on 3 consecutive checks) before uninstall/install — never installs over a running/frozen app, and gives a clear "clear it on the console" message if `:9090` won't accept the kill. Then [3/5] uninstall (delete) → [4/5] DPI install → [5/5] launch+verify.
 
+Control-payload builds are reproducible and must never use a deleted `/private/tmp`
+tree or a stale `.bin`. `scripts/setup-payload-deps.sh` checks out the pinned official
+DirectPackageInstaller **DN6** payload source under ignored `third_party/`, and both
+`redeploy.sh` and `app-status.sh` run it before compiling. The payload Makefile
+uses upstream's checked-in `lib/syscalls.asm`, so rebuilds do not download syscall
+tables. A control-payload compile failure is fatal for that deploy step; never add
+`|| true` around it.
+
 ## Clean close (v03.05) — IMPLEMENTED & VERIFIED
 `/quit` (and exit) now call `sceSystemServiceLoadExec("exit", NULL)` → klog shows `GameStopped(PCST00001) ... LoadExec => 0`, NO notifyAppCrash/coredump/CrashReport dialog. Fixes the "fake crash dialog on /quit". (Returning from main/_exit was read as abnormal.) Removed the temporary `/forcecrash` test endpoint.
 

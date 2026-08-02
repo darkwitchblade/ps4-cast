@@ -7,7 +7,8 @@
 // (BearSSL) segments both work because all I/O goes through httpsrc.
 //
 // Scope: VOD and live media playlists, and master playlists (a variant is
-// chosen automatically). Sequential playback; seeking restarts.
+// chosen automatically). Finite muxed MPEG-TS VOD playlists can seek at segment
+// boundaries; live, fMP4 and separate-audio playlists remain non-seekable.
 #ifndef PS4CAST_HLS_H
 #define PS4CAST_HLS_H
 
@@ -26,6 +27,10 @@ int  hls_generation(void);                         // increments at media segmen
 int  hls_reset_generation(void);                   // increments when live HLS jumps/skips
 int  hls_is_live(void);
 int  hls_can_segment_demux(void);                  // TS media playlist (live or VOD)
+void hls_set_external_segment_fetch(int on);       // player owns TS read-ahead
+int  hls_can_seek(void);                           // finite muxed TS VOD only
+double hls_duration(void);                         // EXTINF sum, seconds (0 unknown)
+int  hls_seek_time(double seconds, double *actual);// move to containing segment
 int  hls_at_eof(void);                             // VOD: all segments consumed
 uint64_t hls_rx_total(void);                       // total bytes fetched (stats)
 int  hls_buffer_pct(void);                          // read-ahead fill 0-100
