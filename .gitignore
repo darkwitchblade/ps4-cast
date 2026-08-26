@@ -37,6 +37,9 @@ oo/
 toolchain/
 toolchain-llvm*.tar.gz
 .DS_Store
-tests/host/test_*
+tests/host/test_hls_parse
+tests/host/test_urlopt
+tests/host/test_resolve
+tests/host/test_qr
 tests/host/*.dSYM
 .impeccable.md
