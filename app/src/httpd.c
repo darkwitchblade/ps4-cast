@@ -128,6 +128,7 @@ static int g_cfgPair = 1;              // require the pairing token on mutations
 #define TOKEN_PATH "/data/ps4cast_token.txt"
 static char g_token[9] = "";        // 8 chars + NUL
 
+static void token_generate(void);
 static void token_load_or_create(void) {
     int fd = sceKernelOpen(TOKEN_PATH, 0 /*O_RDONLY*/, 0);
     if (fd >= 0) {
@@ -136,13 +137,18 @@ static void token_load_or_create(void) {
         sceKernelClose(fd);
         if (n == 8) { memcpy(g_token, buf, 8); g_token[8] = '\0'; return; }
     }
-    // 8 unambiguous chars from a high-resolution clock stir; the PS4 has no
-    // /dev/urandom in homebrew, and this only needs to be unique per install.
+    token_generate();
+}
+
+// Mint a fresh token and persist it. Shared by first run and POST /token/regen.
+// 8 unambiguous chars (no O/0/I/1) from a high-resolution clock stir; the PS4 has
+// no /dev/urandom in homebrew, and this only needs to be unique per install.
+static void token_generate(void) {
     static const char cs[] = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
     uint64_t t = sceKernelGetProcessTime() ^ (uint64_t)(uintptr_t)&g_token;
     for (int i = 0; i < 8; i++) { g_token[i] = cs[t & 31]; t ^= t >> 7; t *= 0x9E3779B97F4A7C15ULL; t >>= 9; }
     g_token[8] = '\0';
-    fd = sceKernelOpen(TOKEN_PATH, 0x0201 | 0x0400, 0666);
+    int fd = sceKernelOpen(TOKEN_PATH, 0x0201 | 0x0400, 0666);
     if (fd >= 0) { sceKernelWrite(fd, g_token, 8); sceKernelClose(fd); }
 }
 
@@ -1259,8 +1265,11 @@ static void handle_client(OrbisNetId c) {
 
     // Parse the route as soon as headers are complete. /upload owns its body as
     // a byte stream; all normal command bodies remain bounded by req[].
-    char method[16] = {0}, path[256] = {0};
-    sscanf(req, "%15s %255s", method, path);
+    char method[16] = {0}, target[256] = {0}, path[256] = {0};
+    sscanf(req, "%15s %255s", method, target);
+    snprintf(path, sizeof(path), "%s", target);
+    char *query = strchr(path, '?');
+    if (query) *query = '\0';
     uint64_t contentLen = 0;
     {
         const char *cl = ci_strstr(req, "Content-Length:");
@@ -1290,7 +1299,7 @@ static void handle_client(OrbisNetId c) {
 
     // Pairing gate: mutations and UI pages need the token shown on the TV.
     // DLNA/UPnP and read-only /status + /trace stay open (token_exempt).
-    if (!token_exempt(path) && !token_ok(path, req)) {
+    if (!token_exempt(path) && !token_ok(target, req)) {
         send_response(c, "401 Unauthorized", "text/plain",
                       "missing pairing token (see the TV screen)", 41);
         return;
@@ -1474,6 +1483,15 @@ static void handle_client(OrbisNetId c) {
     // The token itself, so an already-paired phone can show it in Settings and
     // the Chrome extension popup can copy it. Read-only, token-gated above.
     if (strcmp(method, "GET") == 0 && strcmp(path, "/token") == 0) {
+        send_response(c, "200 OK", "text/plain", g_token, 8);
+        return;
+    }
+
+    // Roll the pairing token. Deliberately NOT token-exempt: proving you already
+    // hold the current token is what stops anyone on the LAN rolling it and
+    // locking the owner out. Paired clients that now 401 simply re-pair.
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/token/regen") == 0) {
+        token_generate();
         send_response(c, "200 OK", "text/plain", g_token, 8);
         return;
     }

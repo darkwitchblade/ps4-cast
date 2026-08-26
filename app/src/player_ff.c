@@ -188,6 +188,9 @@ static int               g_threaded = 0;      // decode-thread path active
 static volatile int      g_decStop = 0;
 static volatile int      g_decEof = 0;
 static volatile int      g_liveRestartPending = 0;
+// Seek target carried across the reopen an fMP4 scrub needs: hls_open() rewinds
+// to segment 0, so it must be re-applied after it and BEFORE the demuxer opens.
+static volatile double   g_hlsResumeSec = -1.0;
 static volatile int      g_rebuffering = 0;    // cache-pause: holding for buffer
 static volatile int      g_nextStartupHeadstart = 0;
 static int               g_startupHeadstart = 0;
@@ -493,6 +496,14 @@ int player_play(const char *url) {
         return -1;
     }
     g_pos = 0;
+    // Re-apply a target carried across an fMP4 scrub's reopen. Must run BEFORE
+    // the demuxer opens so it reads init + the target segment, not the file start.
+    if (g_isHls && g_hlsResumeSec >= 0) {
+        double actual = 0;
+        int src = hls_seek_clamped(g_hlsResumeSec, &actual);
+        trace_mark("seek fmp4 resume target=%.3f rc=%d actual=%.3f", g_hlsResumeSec, src, actual);
+        g_hlsResumeSec = -1.0;
+    }
 
     uint8_t *aviobuf = av_malloc(AVIO_BUFSZ);
     if (!aviobuf) {
@@ -896,6 +907,17 @@ static void apply_seek(void) {
     g_seekPending = 0;
     double actual = sec;
     int seekOk = 0;
+    if (g_isHls && hls_is_fmp4() && hls_can_seek_clamped()) {
+        // fMP4 runs on the continuous AVIO/MOV demuxer: moov is already consumed
+        // and a concatenated byte stream has no rewind, so seeking in place is
+        // impossible. Rebuild at the target instead -- the fresh demuxer then
+        // reads the re-armed init segment followed by the TARGET media segment.
+        g_hlsResumeSec = sec;
+        g_liveRestartPending = 1;
+        snprintf(g_status, sizeof(g_status), "seeking %ds", (int)(sec + 0.5));
+        trace_mark("seek fmp4 reopen target=%.3f", sec);
+        return;
+    }
     if (g_isHls && hls_can_seek()) {
         // Exactly one thread may advance g_segIdx. Stop the read-ahead owner,
         // reposition HLS, then recreate the ring around the new segment.
@@ -920,6 +942,12 @@ static void apply_seek(void) {
     } else {
         int64_t ts = (int64_t)(sec * AV_TIME_BASE);
         seekOk = (av_seek_frame(g_fmt, -1, ts, AVSEEK_FLAG_BACKWARD) >= 0);
+        // Never fail silently: av_seek_frame cannot work on a concatenated HLS
+        // stream, and a scrub bar that moves while nothing happens is impossible
+        // to diagnose from the couch.
+        if (!seekOk && g_isHls)
+            snprintf(g_status, sizeof(g_status), "seek unavailable (%s)",
+                     hls_has_separate_audio() ? "separate audio track" : "stream not seekable");
     }
     if (seekOk) {
         fq_flush();
@@ -1637,6 +1665,16 @@ static void *decode_thread_main(void *arg) {
         }
         if (g_paused)      { sceKernelUsleep(8000); continue; }
 
+        if (g_isHls && hls_take_variant_switch()) {
+            // fMP4 quality change: reopen at the current position with the new
+            // variant (it needs that variant's own init segment and a fresh demuxer).
+            double cur = 0; player_progress(&cur, NULL);
+            g_hlsResumeSec = cur > 1.0 ? cur : 0.0;
+            g_liveRestartPending = 1;
+            snprintf(g_status, sizeof(g_status), "switching quality");
+            trace_mark("variant switch reopen at %.2f", cur);
+            return NULL;
+        }
         if (g_isHls) {
             int rgen = hls_reset_generation();
             if (rgen != g_hlsResetGen) {

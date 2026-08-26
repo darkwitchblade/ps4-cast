@@ -35,6 +35,8 @@ int  hls_can_seek_clamped(void);                   // any non-fMP4 HLS incl. fak
 double hls_duration(void);                         // EXTINF sum, seconds (0 unknown)
 int  hls_seek_time(double seconds, double *actual);// move to containing segment
 int  hls_seek_clamped(double seconds, double *actual); // live-flagged playlists
+int  hls_has_separate_audio(void);                // seek refused: no audio index
+int  hls_take_variant_switch(void);               // fMP4 quality change wants a reopen
 int  hls_at_eof(void);                             // VOD: all segments consumed
 uint64_t hls_rx_total(void);                       // total bytes fetched (stats)
 int  hls_buffer_pct(void);                          // read-ahead fill 0-100

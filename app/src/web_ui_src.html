@@ -216,6 +216,10 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
 .sw::after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#cdd6f4;transition:.2s}
 .sw.on{background:var(--acc);border-color:transparent}
 .sw.on::after{left:23px;background:#fff}
+.mini{flex:none;border-radius:999px;border:1px solid var(--line2);background:#0c1226;color:var(--txt);
+ font-family:inherit;font-size:12.5px;font-weight:700;padding:8px 14px;cursor:pointer;transition:.14s}
+.mini:active{transform:scale(.97)}
+.tokval{font-variant-numeric:tabular-nums;font-feature-settings:"tnum";letter-spacing:.09em}
 .exit{width:100%;height:48px;margin-top:18px;border-radius:13px;border:1px solid rgba(255,93,122,.32);
  background:rgba(255,93,122,.1);color:#ffabbc;font-family:inherit;font-size:14px;font-weight:700;cursor:pointer;transition:.14s}
 .exit:active{transform:scale(.98)}
@@ -344,6 +348,10 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
   <div class="txt"><div class="a">Pairing required</div><div class="b">Reject cast and settings commands without the token shown on the TV. DLNA stays available either way.</div></div>
   <div class="sw" id="swPair" onclick="togglePair()"></div>
  </div>
+ <div class="set">
+  <div class="txt"><div class="a">Pairing token <span class="tokval" id="tokVal">—</span></div><div class="b">Regenerate if you have shared the link. Paired devices re-pair themselves; the Chrome extension does it on its next cast.</div></div>
+  <button class="mini" id="btnRegen" onclick="regenToken()">Regenerate</button>
+ </div>
  <button class="setup-link" onclick="openHelper()">
   <svg viewBox="0 0 24 24" fill="none"><rect x="6.5" y="2.5" width="11" height="19" rx="2.2" stroke="currentColor" stroke-width="1.8"/><path d="M10 18h4M3 8.5a4 4 0 0 1 4-4M3 13a8.5 8.5 0 0 1 8.5-8.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
   <span class="st"><span class="a">Phone browser helper</span><span class="b">Send a playing Safari or Chrome video.</span></span><span class="chev">›</span>
@@ -402,6 +410,19 @@ try{TOKEN=localStorage.getItem('ps4cast-token')||''}catch(e){}
 function withT(p){if(!TOKEN||p.indexOf('t=')>0)return p;return p+(p.indexOf('?')<0?'?':'&')+'t='+TOKEN}
 var pair=1;
 async function togglePair(){pair=pair?0:1;setSw('swPair',pair);await post('/pairing',''+pair);msg(pair?'Pairing required':'Pairing off — open receiver')}
+/* Show the receiver's CURRENT token, not just whatever this browser remembers:
+   they diverge as soon as another device regenerates it. */
+async function showToken(){try{var r=await fetch(withT('/token'),{headers:{'X-PS4Cast-Token':TOKEN||''}});if(!r.ok)return;var t=(await r.text()).trim();var el=document.getElementById('tokVal');if(el&&/^[A-Z2-9]{8}$/.test(t))el.textContent=t}catch(e){}}
+async function regenToken(){
+ if(!confirm('Regenerate the pairing token?\n\nThis browser stays paired. Other devices re-pair automatically on their next command.'))return;
+ var r=await post('/token/regen','');
+ if(!r||!r.ok){msg(r&&r.status===401?'Pair this browser first':'Could not regenerate');return}
+ var t=(await r.text()).trim();
+ if(!/^[A-Z2-9]{8}$/.test(t)){msg('Receiver returned an unexpected token');return}
+ TOKEN=t;try{localStorage.setItem('ps4cast-token',t)}catch(e){}
+ var el=document.getElementById('tokVal');if(el)el.textContent=t;
+ msg('New token '+t)
+}
 function setMode(mode){webMode=mode==='iptv'?'iptv':'cast';$('viewCast').hidden=webMode!=='cast';$('viewIptv').hidden=webMode!=='iptv';
  $('modeCast').classList.toggle('on',webMode==='cast');$('modeIptv').classList.toggle('on',webMode==='iptv');
  try{localStorage.setItem('ps4cast-mode',webMode)}catch(e){}
@@ -680,6 +701,7 @@ async function poll(){if(uploading)return;var j=await getj('/status');
  if(j.hw_enabled!=null){hw=j.hw_enabled;setSw('swHw',hw)}
  if(j.debug!=null){dbg=j.debug;setSw('swDbg',dbg)}
  if(j.pair!=null){pair=j.pair;setSw('swPair',pair)}
+ if(document.getElementById('tokVal')&&document.getElementById('tokVal').textContent==='—')showToken()
  if(j.chan_cur!=null&&j.chan_cur!=chanCur){chanCur=j.chan_cur;if(plData.length)renderPane('pl')}
  if(j.error_code)showFailure(j);else if(on)$('failure').hidden=true;
 }

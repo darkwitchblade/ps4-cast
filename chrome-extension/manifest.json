@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Cast to PS4",
   "description": "Detect non-DRM video playing in Chrome and send it directly to PS4 Cast on your LAN.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "minimum_chrome_version": "119",
   "permissions": ["storage", "webRequest"],
   "host_permissions": ["http://*/*", "https://*/*"],

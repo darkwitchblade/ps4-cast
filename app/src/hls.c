@@ -96,6 +96,13 @@ static uint64_t          g_vOpenUs;
 static int        g_curVariant = -1;   // index into g_variants
 static int        g_sepAudio = 0;      // master has a separate audio rendition (EXT-X-MEDIA)
 static volatile int g_upshiftReq;
+// fMP4 cannot switch variant in place: each variant has its OWN init segment and
+// the continuous AVIO/MOV demuxer cannot take a codec/resolution change mid-stream.
+// So a switch is recorded here and applied by reopening at the current position
+// (the same machinery an fMP4 seek uses). Sticky across that reopen by design.
+static int        g_preferVariant = -1;
+static volatile int g_variantSwitchPending = 0;
+static char       g_lastMasterUrl[2048];
 static int        g_fastFetchStreak;
 static int        g_estBandwidth;
 static int        g_autoMaxHeight = 720;
@@ -215,6 +222,9 @@ int hls_generation(void) { return g_segGen; }
 int hls_reset_generation(void) { return g_resetGen; }
 int hls_is_live(void) { return g_isLive; }
 int hls_is_fmp4(void) { return g_active && g_initSeg != NULL; }
+// Seek is refused for these: there is no audio segment index to move in step,
+// so repositioning video alone would desync A/V.
+int hls_has_separate_audio(void) { return g_active && g_sepAudio; }
 int hls_can_segment_demux(void) {
     // Segment-demux feeds TS (Annex-B) media playlists straight to the hardware
     // H.264 decoder. Enabled for BOTH live and VOD: the "VOD GPU-fault after ~30s"
@@ -233,7 +243,11 @@ void hls_set_decode_cap(int max_height) {
     g_autoMaxHeight = max_height;
 }
 int hls_can_seek(void) {
-    return g_active && !g_isLive && !g_initSeg && !g_sepAudio &&
+    // fMP4 (EXT-X-MAP) IS seekable: the init segment just has to be re-sent
+    // before the target media segment, which hls_seek_clamped now does. Separate
+    // audio still blocks it -- there is no audio segment index to move in step,
+    // so seeking video alone would desync A/V.
+    return g_active && !g_isLive && !g_sepAudio &&
            g_segCount > 0 && g_totalDurMs > 0;
 }
 
@@ -242,7 +256,7 @@ int hls_can_seek(void) {
 // segment-index seek clamped to the currently known window; on a genuine live
 // sliding window this simply clamps to the oldest retained segment.
 int hls_can_seek_clamped(void) {
-    return g_active && !g_initSeg && !g_sepAudio && g_segCount > 0;
+    return g_active && !g_sepAudio && g_segCount > 0;
 }
 double hls_duration(void) {
     return g_totalDurMs > 0 ? (double)g_totalDurMs / 1000.0 : 0.0;
@@ -470,7 +484,11 @@ int hls_seek_clamped(double seconds, double *actual) {
     if (target >= g_segCount) startMs = g_totalDurMs;
     g_segIdx = target;
     g_segPos = 0;
-    g_initPending = 0; // hls_can_seek excludes EXT-X-MAP; kept explicit here
+    // Re-arm the fMP4 init segment: after a reposition the demuxer is rebuilt
+    // from scratch, so it needs ftyp/moov again before the media segment or it
+    // has no codec configuration. Leaving this at 0 is why fMP4 seek was gated
+    // off entirely (scrubbing was a silent no-op on every EXT-X-MAP playlist).
+    g_initPending = (g_initSeg != NULL);
     g_segGen++;
     g_resetGen++;
     if (actual) *actual = (double)startMs / 1000.0;
@@ -748,7 +766,6 @@ static int g_downshiftReq = 0;   // set by the player when the buffer keeps drai
 
 static int next_higher_variant(int current) {
     if (current < 0 || current >= g_variantCount) return -1;
-    if (g_initSeg) return -1;
     int next = -1;
     for (int i = 0; i < g_variantCount; i++) {
         HlsVariant *v = &g_variants[i];
@@ -902,10 +919,23 @@ static int load_variant(int idx) {
 
 // Request a one-step bitrate downshift (applied at the next segment boundary).
 void hls_request_downshift(void) {
-    if (!g_initSeg) g_downshiftReq = 1;
+    g_downshiftReq = 1;
+}
+
+// 1 exactly once when a quality switch is waiting; the player then reopens at the
+// current position with g_preferVariant applied.
+int hls_take_variant_switch(void) {
+    if (!g_variantSwitchPending) return 0;
+    g_variantSwitchPending = 0;
+    return 1;
 }
 
 int hls_open(const char *url) {
+    if (strncmp(url ? url : "", g_lastMasterUrl, sizeof(g_lastMasterUrl)) != 0) {
+        g_preferVariant = -1;               // different title: start fresh
+        snprintf(g_lastMasterUrl, sizeof(g_lastMasterUrl), "%s", url ? url : "");
+    }
+    g_variantSwitchPending = 0;
     aseg_set_playlist_budget(1);   // small fetches: fail fast so a dead channel can't block the switch
     watchdog_note("open/close");
     hls_close();                   // raises abort + joins the prefetch threads
@@ -942,7 +972,10 @@ int hls_open(const char *url) {
         if (g_variantCount == 0) { free(body); snprintf(g_dbg, sizeof(g_dbg), "no variant"); { aseg_set_playlist_budget(0); return -3; } }
         g_segIdx = 0;
         watchdog_note("open/load-variant");
-        if (load_variant(hlspl_pick_start_variant(&g_pl)) != 0) {
+        int startVar = hlspl_pick_start_variant(&g_pl);
+        if (g_preferVariant >= 0 && g_preferVariant < g_pl.variantCount)
+            startVar = g_preferVariant;       // carried across a quality-switch reopen
+        if (load_variant(startVar) != 0) {
             free(body);
             snprintf(g_dbg, sizeof(g_dbg), "variant fetch failed st=%d[%s] at=%s %s",
                      aseg_last_status(), aseg_last_line(), aseg_bad_stage(),
@@ -1157,19 +1190,25 @@ int hls_read(uint8_t *buf, uint32_t len) {
                 g_upshiftReq = 0; g_fastFetchStreak = 0;
                 int lower = hlspl_pick_best(&g_pl, g_variants[g_curVariant].bw);
                 if (lower >= 0 && lower != g_curVariant) {
-                    prefetch_stop();
-                    aseg_resume();
-                    load_variant(lower);
-                    prefetch_start();
+                    if (g_initSeg) { g_preferVariant = lower; g_variantSwitchPending = 1; }
+                    else {
+                        prefetch_stop();
+                        aseg_resume();
+                        load_variant(lower);
+                        prefetch_start();
+                    }
                 }
             } else if (g_upshiftReq && g_curVariant >= 0) {
                 g_upshiftReq = 0;
                 int higher = next_higher_variant(g_curVariant);
                 if (higher >= 0) {
-                    prefetch_stop();
-                    aseg_resume();
-                    load_variant(higher);
-                    prefetch_start();
+                    if (g_initSeg) { g_preferVariant = higher; g_variantSwitchPending = 1; }
+                    else {
+                        prefetch_stop();
+                        aseg_resume();
+                        load_variant(higher);
+                        prefetch_start();
+                    }
                 }
             }
         }
