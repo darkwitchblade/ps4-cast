@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 export PS4_IP=${PS4_IP:-192.168.1.4}
-export PS4_USER_ID=${PS4_USER_ID:?set PS4_USER_ID to your console's local user id}
+export PS4_USER_ID=${PS4_USER_ID:?"set PS4_USER_ID to your console local user id"}
 if [ -z "${HOST_IP:-}" ]; then
   HOST_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
   [ -n "$HOST_IP" ] || { echo "Cannot determine Mac LAN IP; set HOST_IP." >&2; exit 2; }

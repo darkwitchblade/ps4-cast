@@ -7,7 +7,7 @@ cd "$ROOT"
 
 PS4=${PS4_IP:-192.168.1.4}
 HOST=${HOST_IP:-}
-USER_ID=${PS4_USER_ID:?set PS4_USER_ID to your console's local user id}
+USER_ID=${PS4_USER_ID:?"set PS4_USER_ID to your console local user id"}
 CTRL="$ROOT/payloads/ps4cast-control"
 ACCOUNT_CACHE=${PS4CAST_ACCOUNT_ID_CACHE:-$ROOT/.chiaki-account-id}
 if [ -z "$HOST" ]; then
