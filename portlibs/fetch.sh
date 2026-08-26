@@ -25,12 +25,8 @@ fetch() { # url expected_sha256 out
 fetch https://bearssl.org/bearssl-0.6.tar.gz \
     6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14 bearssl.tar.gz
 
-if [ ! -f "$SRC/ffmpeg.tar.xz" ]; then
-    echo "ffmpeg.tar.xz: place the pinned FFmpeg 6.1.x tarball in $SRC (see portlibs/README-ffmpeg-staging.md)" >&2
-    [ -f "$SRC/ffmpeg.tar.xz" ] || exit 1
-else
-    echo "have ffmpeg.tar.xz"
-fi
+fetch https://ffmpeg.org/releases/ffmpeg-6.1.6.tar.xz \
+    d4fcb164028dd3beee5d92c0ac72e46aac6973c75ea12dc14de07bf8f407370a ffmpeg.tar.xz
 
 if [ ! -f "$SRC/mbedtls.tar.bz2" ]; then
     echo "mbedtls.tar.bz2: optional; only needed by the native HTTP experiments" >&2
@@ -38,6 +34,6 @@ fi
 
 # Extract pinned trees if the build scripts' expected directories are missing.
 [ -d "$SRC/bearssl-0.6" ]  || tar -xzf "$SRC/bearssl.tar.gz"  -C "$SRC"
-[ -d "$SRC/ffmpeg-6.1.6" ] || tar -xJf "$SRC/ffmpeg.tar.xz"   -C "$SRC"
+[ -d "$SRC/ffmpeg-6.1.6" ] || tar -xJf "$SRC/ffmpeg.tar.xz" -C "$SRC"
 
 echo "portlibs sources ready"
