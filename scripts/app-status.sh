@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CALLBACK_LOG=${CALLBACK_LOG:-/tmp/ps4cast_app_status.txt}
 CALLBACK_PID=${CALLBACK_PID:-/tmp/ps4cast_app_status.pid}
 CB_IP_HEX="$(awk -F. '{printf "0x%02X%02X%02X%02XU", $4, $3, $2, $1}' <<<"$HOST")"
-USER_ID=${PS4_USER_ID:-0x168a0466}
+USER_ID=${PS4_USER_ID:?set PS4_USER_ID to your console's local user id}
 
 rm -f "$CALLBACK_LOG" "$CALLBACK_PID"
 nc -l 9899 >"$CALLBACK_LOG" &

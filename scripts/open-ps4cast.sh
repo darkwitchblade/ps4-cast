@@ -81,7 +81,7 @@ if [ "${PS4CAST_UNSAFE_PAYLOAD_LAUNCH:-0}" = "1" ]; then
   # Diagnostic only. On FW 11 an injected payload has no authenticated user
   # session; even a copied numeric user id launched PCST00001 as ANONYMOUS and
   # crashed SceShellUI. Never enter this branch during normal development.
-  USER_ID=${PS4_USER_ID:-0x168a0466}
+  USER_ID=${PS4_USER_ID:?set PS4_USER_ID to your console's local user id}
   "$ROOT/scripts/setup-payload-deps.sh" >/tmp/ps4cast_payload_deps.log
   make -B -C "$CTRL" CALLBACK_IP="$CB_IP_HEX" USER_ID="$USER_ID" build/ps4cast-launch.bin >/tmp/ps4cast_launch_build.log
   echo "WARNING: using unsafe unauthenticated payload launch" >&2

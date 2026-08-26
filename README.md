@@ -1,5 +1,10 @@
 # PS4 Cast
 
+> [!WARNING]
+> **For educational purposes only.** Homebrew for a jailbroken console you own.
+> No content is provided or endorsed — you are responsible for what you play
+> and its legality in your jurisdiction. See [DISCLAIMER.md](DISCLAIMER.md).
+
 Turn a **jailbroken PS4** into a media receiver. Launch the app, then from any
 phone or PC on the same Wi-Fi open the URL shown on the TV and cast a video link
 or upload a local video. Eligible H.264 plays through `sceVideodec2`; FFmpeg

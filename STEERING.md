@@ -51,7 +51,7 @@ Things the autonomous loop can't decide or do alone. Revisit these together.
   record their reason in /status (`segfail=`) and automatically fall back to
   fetching that segment through aseg (which carries the native SceHttp
   fallback), pinned per stream. This is the fix for the "playlist opens, video
-  never starts" failure class seen with zenithianzephyr.space.
+  never starts" failure class seen with a Cloudflare-fronted movie CDN.
 - **Module splits**: pure HLS parsing/variant selection moved to
   hls_parse.c (host-testable); the channel store + M3U parsing + /channels and
   /channel/* endpoints moved to httpd_channels.c. httpd.c shrinks to routing,
@@ -186,7 +186,7 @@ Things the autonomous loop can't decide or do alone. Revisit these together.
   where segment-boundary switching is safe. Telemetry marks this as `FMP4LOCK`.
 
 ## v04.38: exact request context and clean-header recovery
-- Live testing proved the `moon.peakstorm.top` URL and chunked transport are
+- Live testing proved the `an earlier Cloudflare-fronted test source` URL and chunked transport are
   valid: the same master plays for minutes with full audio/buffer when sent
   without page headers, while the guessed outer-page Referer/Origin produces a
   deterministic 403 from both BearSSL and native SceHttp.
@@ -248,7 +248,7 @@ Things the autonomous loop can't decide or do alone. Revisit these together.
 - The decoder reads across arbitrary TLS/socket boundaries, enforces the existing
   16 MB resource and fetch-time budgets, honors aborts, and fully consumes the
   terminating chunk so same-host keep-alive remains safe.
-- This directly addresses the `moon.peakstorm.top` failure from the Chrome
+- This directly addresses the `an earlier Cloudflare-fronted test source` failure from the Chrome
   extension: its media playlist is served without Content-Length using
   `Transfer-Encoding: chunked`, and v04.33 tried to fetch the hexadecimal chunk
   size (`dff9`) as segment zero.
