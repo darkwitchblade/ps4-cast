@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#define QR_SIZE 25
+#define QR_SIZE 29   // fits QR version 3 (tokened URLs); v2 codes are centered with a quiet border
 
 typedef struct {
     uint8_t m[QR_SIZE][QR_SIZE];

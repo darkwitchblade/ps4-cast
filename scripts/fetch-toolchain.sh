@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CACHE="${PS4CAST_ARTIFACTS:-$ROOT/../ps4-cast-artifacts}"
 TARBALL="$CACHE/toolchain-llvm-18.tar.gz"
-URL="https://github.com/OpenOrbis/OpenOrbisToolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz"
+URL="https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz"
 WANT="3c7cd5bb593ca74fa1c13fd59f3938dc0fc07985167f7275063019e63abe4526"
 
 mkdir -p "$CACHE" "$ROOT/oo"
