@@ -34,3 +34,14 @@ than one candidate or receiver settings need to be changed.
   cookies are reported as unsupported instead of being bypassed.
 
 Use the extension only with media you are authorized to access.
+
+## Pairing
+
+The receiver requires an 8-character pairing token on every command it accepts.
+You do not need to type it: `GET /token` is exempt from that check, so the
+extension asks the console for it the first time you save or test a receiver and
+remembers it. If the receiver ever regenerates its token, the next cast gets a
+401, and the extension re-pairs and retries once on its own.
+
+Pasting the TV's URL with `?t=` still works and takes precedence -- useful if you
+ever want to pin a specific token by hand.

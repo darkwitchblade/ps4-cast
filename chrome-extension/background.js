@@ -110,6 +110,34 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
   }
 });
 
+// The receiver requires a pairing token on every mutating request. GET /token is
+// deliberately exempt from that check, so the extension can fetch it itself over
+// the LAN instead of making you read an 8-character code off the TV and retype it.
+const TOKEN_RE = /^[A-Z2-9]{8}$/;
+
+async function fetchToken(receiver) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
+  try {
+    const response = await fetch(`http://${receiver}/token`, { signal: controller.signal });
+    if (!response.ok) return "";
+    const value = (await response.text()).trim();
+    return TOKEN_RE.test(value) ? value : "";
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Return a usable token, pairing on demand and remembering the result.
+async function ensureToken(receiver, existing = "") {
+  if (TOKEN_RE.test(existing)) return existing;
+  const token = await fetchToken(receiver);
+  if (token) await chrome.storage.local.set({ token });
+  return token;
+}
+
 async function receiverConfig() {
   const saved = await chrome.storage.local.get({ receiver: "192.168.1.4:8080", token: "", overlay: true });
   return { receiver: normalizeReceiver(saved.receiver), token: saved.token || "", overlay: saved.overlay !== false };
@@ -119,21 +147,35 @@ async function castCandidate(candidate, frame) {
   if (!candidate) throw new Error("No playable stream detected yet");
   if (!candidate.supported) throw new Error("DASH streams are not supported by PS4 Cast yet");
   if (frame?.drm) throw new Error("This player reported DRM-protected playback");
-  const { receiver, token } = await receiverConfig();
+  const { receiver, token: saved } = await receiverConfig();
   if (!receiver) throw new Error("Enter a private LAN PS4 address first");
+  let token = await ensureToken(receiver, saved);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 6000);
+  const send = (t) => fetch(`http://${receiver}/cast`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+               ...(t ? { "X-PS4Cast-Token": t } : {}) },
+    body: buildCastForm(candidate, frame, navigator.userAgent),
+    signal: controller.signal
+  });
   try {
-    const response = await fetch(`http://${receiver}/cast`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-                 ...(token ? { "X-PS4Cast-Token": token } : {}) },
-      body: buildCastForm(candidate, frame, navigator.userAgent),
-      signal: controller.signal
-    });
+    let response = await send(token);
+    // A stored token goes stale if the receiver regenerates one. Re-pair once and
+    // retry rather than making the user notice and fix it by hand.
+    if (response.status === 401 || response.status === 403) {
+      const fresh = await fetchToken(receiver);
+      if (fresh && fresh !== token) {
+        await chrome.storage.local.set({ token: fresh });
+        token = fresh;
+        response = await send(token);
+      }
+    }
     if (!response.ok) {
       if (response.status === 404) throw new Error("Install the PS4 Cast build that includes extension support");
+      if (response.status === 401 || response.status === 403)
+        throw new Error("PS4 Cast refused the pairing token. Open the app on the console and try again.");
       throw new Error(`PS4 rejected the cast (${response.status})`);
     }
     return { ok: true, message: `Sent ${candidate.kind.toUpperCase()} from ${displayHost(candidate.url)}` };
@@ -206,7 +248,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const { receiver, token } = parseReceiverInput(message.receiver);
       if (!receiver) throw new Error("Use a private LAN address such as 192.168.1.4:8080");
       await chrome.storage.local.set({ receiver, token, overlay: message.overlay !== false });
-      sendResponse({ ok: true, receiver });
+      // Pair straight away so the first cast works: a pasted ?t= wins, otherwise
+      // ask the receiver for its token.
+      const paired = await ensureToken(receiver, token);
+      sendResponse({ ok: true, receiver, paired: Boolean(paired) });
       return;
     }
     if (message.type === "PING") {
@@ -218,7 +263,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const response = await fetch(`http://${receiver}/status`, { signal: controller.signal });
         if (!response.ok) throw new Error(`Receiver answered ${response.status}`);
         const status = await response.json();
-        sendResponse({ ok: true, version: status.ver || "online" });
+        const paired = Boolean(await ensureToken(receiver));
+        sendResponse({ ok: true, version: status.ver || "online", paired });
       } finally { clearTimeout(timer); }
       return;
     }

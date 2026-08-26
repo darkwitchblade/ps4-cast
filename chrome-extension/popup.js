@@ -87,7 +87,7 @@ $("test").addEventListener("click", async () => {
   setNotice(""); connection("Checking…");
   if (!await save()) { connection("Invalid address", "error"); return; }
   const result = await chrome.runtime.sendMessage({ type: "PING", receiver: receiver.value });
-  if (result?.ok) connection(`PS4 Cast ${result.version}`, "online");
+  if (result?.ok) connection(`PS4 Cast ${result.version}${result.paired ? " · paired" : " · not paired"}`, "online");
   else { connection("Offline", "error"); setNotice(result?.error || "Receiver did not answer", "error"); }
 });
 receiver.addEventListener("change", save);
