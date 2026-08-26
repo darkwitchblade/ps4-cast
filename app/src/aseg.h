@@ -23,6 +23,8 @@ void aseg_resume(void);
 // the generous SEGMENT budget (0). A single budget for both either starves slow
 // segments (continuous rebuffering) or lets a dead host block a channel switch.
 void aseg_set_playlist_budget(int on);
+// Reset stale HTTP failure telemetry when a new HLS source starts.
+void aseg_clear_error(void);
 
 // Last HTTP status seen (0 = status line unparseable) and its first bytes.
 int aseg_last_status(void);
@@ -31,5 +33,8 @@ int aseg_bad_reuse(void);   // 1 if the failing request went out on a REUSED kee
 int aseg_bad_hop(void);
 const char *aseg_bad_path(void);
 int aseg_bad_pathlen(void);
+// Which stage the failing request died in: "dns", "connect", "tls", "req", "hdr".
+const char *aseg_bad_stage(void);
+const char *aseg_native_debug(void);
 
 #endif

@@ -16,6 +16,7 @@
 # Usage: PS4_IP=192.168.1.4 scripts/add-free-channels.sh
 set -uo pipefail
 PS4=${PS4_IP:-192.168.1.4}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"/ps4-api.sh
 
 if ! curl -sS -m5 "http://$PS4:8080/status" >/dev/null 2>&1; then
   echo "PS4 Cast is not responding on $PS4:8080 — open the app first." >&2
@@ -28,7 +29,7 @@ while IFS=$'\t' read -r grp name url; do
   [ -z "${url:-}" ] && continue
   case "$grp" in \#*) continue;; esac
   if printf '%s\t%s\t%s' "$name" "$grp" "$url" \
-       | curl -sS -m8 -X POST --data-binary @- "http://$PS4:8080/channel/add" >/dev/null; then
+       | curl -sS -m8 -X POST --data-binary @- "http://$PS4:8080/channel/add?t=$(ps4_token)" >/dev/null; then
     n=$((n+1)); printf '  + %-14s %s\n' "$grp" "$name"
   else
     printf '  ! failed        %s\n' "$name"

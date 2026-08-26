@@ -6,6 +6,7 @@
 int  httpd_start(int port);                       // 0 on success
 void httpd_poll(void);                            // service pending clients
 int  httpd_take_play_request(char *out, int len); // 1 if a new URL was posted
+// Returns 1 for a normal cast/local file and 2 for an IPTV channel selection.
 int  httpd_take_player_request(char *out, int len);
 int  httpd_take_stop_request(void);               // 1 if stop was posted
 int  httpd_take_quit_request(void);               // 1 if quit was posted
@@ -37,5 +38,9 @@ void httpd_chan_rail_select(int row);
 // Per-URL resume positions (VOD): remember where playback stopped.
 void httpd_resume_save(const char *url, int pos, int dur);
 int  httpd_resume_get(const char *url);
+
+// Pairing token shown on the TV; gates state-changing HTTP endpoints.
+const char *httpd_token(void);
+int  httpd_pairing_required(void);
 
 #endif

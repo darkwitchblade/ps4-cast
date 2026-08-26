@@ -26,11 +26,15 @@ int  hls_read(uint8_t *buf, uint32_t len);
 int  hls_generation(void);                         // increments at media segment boundaries
 int  hls_reset_generation(void);                   // increments when live HLS jumps/skips
 int  hls_is_live(void);
+int  hls_is_fmp4(void);                            // media playlist uses EXT-X-MAP
 int  hls_can_segment_demux(void);                  // TS media playlist (live or VOD)
+void hls_set_decode_cap(int max_height);           // startup/ABR ceiling selected by player backend
 void hls_set_external_segment_fetch(int on);       // player owns TS read-ahead
 int  hls_can_seek(void);                           // finite muxed TS VOD only
+int  hls_can_seek_clamped(void);                   // any non-fMP4 HLS incl. fake-live
 double hls_duration(void);                         // EXTINF sum, seconds (0 unknown)
 int  hls_seek_time(double seconds, double *actual);// move to containing segment
+int  hls_seek_clamped(double seconds, double *actual); // live-flagged playlists
 int  hls_at_eof(void);                             // VOD: all segments consumed
 uint64_t hls_rx_total(void);                       // total bytes fetched (stats)
 int  hls_buffer_pct(void);                          // read-ahead fill 0-100

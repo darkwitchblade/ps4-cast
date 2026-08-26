@@ -1,0 +1,56 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pkg:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain deps
+        run: brew install llvm lld
+
+      - name: Fetch OpenOrbis toolchain
+        run: scripts/fetch-toolchain.sh
+
+      - name: Restore portlibs sources
+        uses: actions/cache@v4
+        with:
+          path: portlibs/src
+          key: portlibs-src-v1
+
+      - name: Fetch portlibs sources
+        run: ./portlibs/fetch.sh
+
+      - name: Restore built portlibs
+        uses: actions/cache@v4
+        with:
+          path: |
+            portlibs/bearssl
+            portlibs/ffmpeg
+          key: portlibs-build-${{ runner.os }}-${{ hashFiles('portlibs/build-*.sh', 'portlibs/src/*.tar.*') }}
+
+      - name: Build BearSSL
+        run: ./portlibs/build-bearssl.sh
+
+      - name: Build FFmpeg
+        run: ./portlibs/build-ffmpeg-616.sh
+
+      - name: Build PS4 Cast pkg
+        run: ./build.sh
+
+      - name: Run host unit tests
+        run: make -C tests/host test
+
+      - name: Upload pkg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PS4-Cast-pkg
+          path: dist/*.pkg
+          if-no-files-found: error

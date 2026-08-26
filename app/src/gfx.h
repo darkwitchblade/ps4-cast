@@ -8,6 +8,8 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#define GFX_BUFFER_COUNT 3
+
 typedef struct {
     uint8_t r, g, b;
 } GfxColor;
@@ -18,12 +20,13 @@ typedef struct {
     int depth;          // bytes per pixel (4)
     int video;          // sceVideoOut handle
     int activeIdx;      // current render target (cycles over the buffers)
+    int lastSubmitted[GFX_BUFFER_COUNT]; // frame id last scanned from each surface
     int frameBufferSize;
     off_t directMemOff;
     size_t directMemSize;
     uintptr_t videoMemSP;
     void *videoMem;
-    void *frameBuffers[3];   // triple-buffered: pipeline CPU convert with scanout
+    void *frameBuffers[GFX_BUFFER_COUNT]; // pipeline CPU conversion with scanout
     void *flipQueue;    // OrbisKernelEqueue (pointer-sized opaque handle)
     char attr[64];      // OrbisVideoOutBufferAttribute storage (over-sized, safe)
 } Gfx;

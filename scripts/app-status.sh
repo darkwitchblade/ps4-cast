@@ -7,6 +7,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CALLBACK_LOG=${CALLBACK_LOG:-/tmp/ps4cast_app_status.txt}
 CALLBACK_PID=${CALLBACK_PID:-/tmp/ps4cast_app_status.pid}
 CB_IP_HEX="$(awk -F. '{printf "0x%02X%02X%02X%02XU", $4, $3, $2, $1}' <<<"$HOST")"
+USER_ID=${PS4_USER_ID:-0x168a0466}
 
 rm -f "$CALLBACK_LOG" "$CALLBACK_PID"
 nc -l 9899 >"$CALLBACK_LOG" &
@@ -14,7 +15,7 @@ echo $! >"$CALLBACK_PID"
 sleep 1
 
 "$ROOT/scripts/setup-payload-deps.sh" >/tmp/ps4cast_payload_deps.log
-make -C "$ROOT/payloads/ps4cast-control" CALLBACK_IP="$CB_IP_HEX" build/ps4cast-app-status.bin >/tmp/ps4cast_control_build.log
+make -B -C "$ROOT/payloads/ps4cast-control" CALLBACK_IP="$CB_IP_HEX" USER_ID="$USER_ID" build/ps4cast-app-status.bin >/tmp/ps4cast_control_build.log
 python3 "$ROOT/scripts/send-goldhen-payload.py" "$ROOT/payloads/ps4cast-control/build/ps4cast-app-status.bin" --ps4 "$PS4"
 
 for _ in $(seq 1 10); do

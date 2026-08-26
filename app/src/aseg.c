@@ -1,5 +1,7 @@
 #include "aseg.h"
 #include "tls.h"
+#include "urlopt.h"
+#include "native_http.h"
 
 // main.c: pet the freeze watchdog during a legitimately-progressing blocking op.
 // Safe here because every fetch is bounded by ASEG_FETCH_BUDGET_US, so this can
@@ -53,6 +55,8 @@ static int  g_badReuse = -1, g_badHop = -1;   // was the failing request on a RE
 static char g_badLine[28] = "";              // status line OF THE FAILING request
 static char g_badPath[64] = "";              // request path we sent
 static int  g_badPathLen = -1;               // full length before truncation into g_badPath
+static char g_badStage[16] = "";             // where the failing request died: dns/connect/tls/req/hdr
+static char g_nativeHost[256] = "";          // host whose CDN rejected BearSSL but accepted SceHttp
 #define ASEG_FETCH_BUDGET_US (g_fetchBudgetUs)
 
 static char     g_host[256];
@@ -175,8 +179,16 @@ static int tcp_connect(void) {
     sceNetConnect(s, (const OrbisNetSockaddr *)&sa, sizeof(sa));   // returns in-progress
     int connected = 0;
     uint64_t t0 = sceKernelGetProcessTime();
+    uint64_t connectBudgetUs = g_fetchBudgetUs == ASEG_BUDGET_SEGMENT_US
+                             ? 6000ULL * 1000 : 2500ULL * 1000;
+    if (g_fetchT0) {
+        uint64_t elapsed = t0 - g_fetchT0;
+        if (elapsed >= g_fetchBudgetUs) connectBudgetUs = 0;
+        else if (connectBudgetUs > g_fetchBudgetUs - elapsed)
+            connectBudgetUs = g_fetchBudgetUs - elapsed;
+    }
     sceKernelUsleep(15000);                                        // let the handshake start before probing
-    while (sceKernelGetProcessTime() - t0 < 2500ULL * 1000) {       // ~2.5s connect budget
+    while (sceKernelGetProcessTime() - t0 < connectBudgetUs) {
         if (g_abort) break;
         if (sceNetSend(s, "", 0, 0) >= 0) { connected = 1; break; } // writable -> connected
         sceKernelUsleep(20000);
@@ -200,6 +212,7 @@ static int aseg_past_budget(void) {
 static int conn_read(uint8_t *buf, int len) {
     if (g_tls) return tls_read(g_tls, buf, len);
     uint64_t t0 = sceKernelGetProcessTime();
+    int spins = 0;
     for (;;) {
         if (g_abort) return -1;
         int n = sceNetRecv(g_sock, buf, len, 0);
@@ -208,7 +221,10 @@ static int conn_read(uint8_t *buf, int len) {
         if (sceKernelGetProcessTime() - t0 > ASEG_STALL_US) return -1;
         if (aseg_past_budget()) return -1;
         watchdog_kick();
-        sceKernelUsleep(3000);
+        // Adaptive: a flat 3ms sleep per not-ready read throttled throughput badly
+        // (TLS reassembles a record over many small reads). Spin first, then back off.
+        if (spins < 64) { spins++; sceKernelUsleep(200); }
+        else sceKernelUsleep(2000);
     }
 }
 static int conn_write(const uint8_t *buf, int len) {
@@ -236,6 +252,7 @@ void aseg_abort(void) {
     // failure exactly: only after a burst, only on the first tune.
     g_kaAlive = 0;
     if (g_sock >= 0) sceNetSocketAbort(g_sock, 0);
+    native_http_abort();
 }
 
 // Clear a STALE abort at the start of a new stream. player_stop() raises g_abort
@@ -250,45 +267,66 @@ void aseg_abort(void) {
 // entirely, because aseg_abort() is also raised from live-playback paths.
 void aseg_resume(void) { g_abort = 0; }
 
+void aseg_clear_error(void) {
+    g_lastStatus = -1; g_lastLine[0] = '\0';
+    g_badReuse = g_badHop = g_badPathLen = -1;
+    g_badLine[0] = g_badPath[0] = '\0';
+    g_badStage[0] = '\0';
+}
+
+static int preferred_native_url(const char *url) {
+    if (!g_nativeHost[0] || !url) return 0;
+    const char *p = strstr(url, "://");
+    if (!p) return 0;
+    p += 3;
+    size_t n = strlen(g_nativeHost);
+    return strncasecmp(p, g_nativeHost, n) == 0 &&
+           (p[n] == '/' || p[n] == ':' || p[n] == '\0');
+}
+
 // One request: connect, GET (Connection: close), parse headers. On 3xx returns
 // 1 and copies Location into `loc`. On 2xx returns 0 and leaves the connection
 // positioned at the first body byte, with header-adjacent body bytes in *lead.
 static int do_request(int reuse, int *status, char *loc, int loccap,
-                      uint8_t *lead, int *leadLen, long *clen) {
+                      uint8_t *lead, int *leadLen, long *clen, int *chunked) {
     if (!reuse) {
         conn_close();
         watchdog_note("aseg/connect");
         g_sock = tcp_connect();
-        if (g_sock < 0) return -1;
+        if (g_sock < 0) { snprintf(g_badStage, sizeof(g_badStage), "connect"); return -1; }
         if (g_tlsmode) {
             const char *pv_tls = watchdog_note("tls");   // handshake to a half-open host can block for seconds
             g_tls = tls_open_bounded(g_sock, g_host, g_fetchT0 + ASEG_FETCH_BUDGET_US);
             watchdog_note(pv_tls); watchdog_kick();
-            if (!g_tls) { conn_close(); return -2; }
+            if (!g_tls) { conn_close(); snprintf(g_badStage, sizeof(g_badStage), "tls"); return -2; }
         }
     }
 
     char req[1600];
+    const char *xh = urlopt_headers();
     int n = snprintf(req, sizeof(req),
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
-        "User-Agent: PS4Cast/1.0\r\n"
+        "%s"
+        "%s"
         "Accept: */*\r\n"
         "Connection: keep-alive\r\n"
         "\r\n",
-        g_path, g_host);
+        g_path, g_host, xh,
+        strstr(xh, "User-Agent:") ? "" : "User-Agent: PS4Cast/1.0\r\n");
+    if (n <= 0 || n >= (int)sizeof(req)) { conn_close(); snprintf(g_badStage, sizeof(g_badStage), "req"); return -3; }
     // Re-arm every request: a kept-alive TLS context outlives the fetch that
     // created it, so a deadline set at handshake time would already be in the
     // past on the next fetch and fail every read instantly.
     if (g_tls) tls_set_read_deadline(g_tls, g_fetchT0 + ASEG_FETCH_BUDGET_US);
     watchdog_note("aseg/req-send");
-    if (conn_write((const uint8_t *)req, n) != 0) { conn_close(); return -3; }
+    if (conn_write((const uint8_t *)req, n) != 0) { conn_close(); snprintf(g_badStage, sizeof(g_badStage), "req"); return -3; }
     watchdog_note("aseg/hdr-read");
 
     char hdr[4096];
     int hl = 0, end = -1;
     while (hl < (int)sizeof(hdr) - 1) {
-        if (g_abort) { conn_close(); return -9; }
+        if (g_abort) { conn_close(); snprintf(g_badStage, sizeof(g_badStage), "hdr"); return -9; }
         // Budget + watchdog, same as the body loops. Without them a server that
         // TRICKLES its response headers blocks the main thread indefinitely: each
         // conn_read can sit for the 2s RCVTIMEO and still return a byte, so r<=0
@@ -296,7 +334,7 @@ static int do_request(int reuse, int *status, char *loc, int loccap,
         // hops. Nothing here petted the watchdog, which is the
         // "HANG stale=35s stage=source-open at=open/load-variant" fail-close.
         if (sceKernelGetProcessTime() - g_fetchT0 > ASEG_FETCH_BUDGET_US) {
-            conn_close(); return -4;
+            conn_close(); snprintf(g_badStage, sizeof(g_badStage), "hdr"); return -4;
         }
         watchdog_kick();
         int r = conn_read((uint8_t *)hdr + hl, (int)sizeof(hdr) - 1 - hl);
@@ -305,7 +343,7 @@ static int do_request(int reuse, int *status, char *loc, int loccap,
         char *e = strstr(hdr, "\r\n\r\n");
         if (e) { end = (int)(e - hdr) + 4; break; }
     }
-    if (end < 0) { conn_close(); return -4; }
+    if (end < 0) { conn_close(); snprintf(g_badStage, sizeof(g_badStage), "hdr"); return -4; }
 
     int st = 0;
     if (strncmp(hdr, "HTTP/", 5) == 0) { const char *sp = strchr(hdr, ' '); if (sp) st = atoi(sp + 1); }
@@ -316,6 +354,13 @@ static int do_request(int reuse, int *status, char *loc, int loccap,
         *clen = -1;
         const char *cl = ci_strstr(hdr, "Content-Length:");
         if (cl) *clen = atol(cl + (int)strlen("Content-Length:"));
+    }
+    if (chunked) {
+        const char *te = ci_strstr(hdr, "Transfer-Encoding:");
+        const char *eol = te ? strstr(te, "\r\n") : NULL;
+        const char *coding = te ? ci_strstr(te, "chunked") : NULL;
+        *chunked = coding && (!eol || coding < eol);
+        if (*chunked && clen) *clen = -1;  // Transfer-Encoding wins over Content-Length.
     }
 
     if (st >= 300 && st < 400 && loc && loccap) {
@@ -334,6 +379,114 @@ static int do_request(int reuse, int *status, char *loc, int loccap,
     int avail = hl - end;
     if (avail > 0) { memcpy(lead, hdr + end, avail); }
     *leadLen = avail > 0 ? avail : 0;
+    return 0;
+}
+
+typedef struct {
+    const uint8_t *lead;
+    int leadLen;
+    int leadPos;
+} ChunkReader;
+
+static int chunk_read_some(ChunkReader *r, uint8_t *out, int len) {
+    if (r->leadPos < r->leadLen) {
+        int n = r->leadLen - r->leadPos;
+        if (n > len) n = len;
+        memcpy(out, r->lead + r->leadPos, (size_t)n);
+        r->leadPos += n;
+        return n;
+    }
+    return conn_read(out, len);
+}
+
+static int chunk_read_exact(ChunkReader *r, uint8_t *out, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+        if (g_abort || sceKernelGetProcessTime() - g_fetchT0 > ASEG_FETCH_BUDGET_US) return -1;
+        watchdog_kick();
+        int want = (len - done) > INT32_MAX ? INT32_MAX : (int)(len - done);
+        int got = chunk_read_some(r, out + done, want);
+        if (got <= 0) return -1;
+        done += (size_t)got;
+    }
+    return 0;
+}
+
+static int chunk_read_line(ChunkReader *r, char *line, int cap) {
+    int n = 0;
+    for (;;) {
+        uint8_t c;
+        if (chunk_read_exact(r, &c, 1) != 0) return -1;
+        if (c == '\n') {
+            if (n > 0 && line[n - 1] == '\r') n--;
+            line[n] = '\0';
+            return n;
+        }
+        if (n >= cap - 1) return -1;
+        line[n++] = (char)c;
+    }
+}
+
+// Decode RFC 7230 chunk framing while reading, so a chunk-size line can never
+// leak into the HLS parser as a fake segment URI. The terminating chunk and all
+// trailers are consumed, leaving same-host connections safe for keep-alive.
+static int read_chunked_body(const uint8_t *lead, int leadLen, uint8_t **outBuf, int *outLen) {
+    ChunkReader reader = { lead, leadLen, 0 };
+    size_t cap = 256 * 1024, used = 0;
+    uint8_t *buf = malloc(cap);
+    if (!buf) return -6;
+
+    for (;;) {
+        char line[128];
+        int lineLen = chunk_read_line(&reader, line, sizeof(line));
+        if (lineLen < 0) { free(buf); return -11; }
+
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        char *end = NULL;
+        unsigned long long chunk = strtoull(p, &end, 16);
+        if (end == p) { free(buf); return -13; }
+        while (*end == ' ' || *end == '\t') end++;
+        if (*end && *end != ';') { free(buf); return -13; }
+
+        if (chunk == 0) {
+            // Optional trailer fields end at the first blank line.
+            do {
+                lineLen = chunk_read_line(&reader, line, sizeof(line));
+                if (lineLen < 0) { free(buf); return -11; }
+            } while (lineLen != 0);
+            break;
+        }
+        if (chunk > ASEG_FETCH_CAP || used > ASEG_FETCH_CAP - (size_t)chunk) {
+            free(buf); return -10;
+        }
+
+        size_t need = used + (size_t)chunk;
+        if (need > cap) {
+            size_t next = cap;
+            while (next < need && next < ASEG_FETCH_CAP) {
+                size_t grown = next * 2;
+                next = grown > ASEG_FETCH_CAP ? ASEG_FETCH_CAP : grown;
+            }
+            if (next < need) { free(buf); return -10; }
+            uint8_t *larger = realloc(buf, next);
+            if (!larger) { free(buf); return -7; }
+            buf = larger; cap = next;
+        }
+        if (chunk_read_exact(&reader, buf + used, (size_t)chunk) != 0) {
+            free(buf); return -11;
+        }
+        used += (size_t)chunk;
+
+        uint8_t crlf[2];
+        if (chunk_read_exact(&reader, crlf, sizeof(crlf)) != 0 || crlf[0] != '\r' || crlf[1] != '\n') {
+            free(buf); return -13;
+        }
+    }
+
+    if (used == 0) { free(buf); return -8; }
+    *outBuf = buf;
+    *outLen = (int)used;
     return 0;
 }
 
@@ -371,10 +524,26 @@ static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
     if (g_abort) { *outBuf = NULL; *outLen = 0; return -9; }
     *outBuf = NULL; *outLen = 0;
 
+    // Some Cloudflare configurations reject BearSSL's TLS fingerprint even when
+    // the URL and browser compatibility headers are valid. Once SceHttp proves
+    // itself for a host, keep using the PS4's native TLS stack for that host.
+    if (preferred_native_url(url)) {
+        int status = 0;
+        int rc = native_http_fetch(url, outBuf, outLen, &status, ASEG_FETCH_BUDGET_US);
+        if (rc == 0 && (status == 200 || status == 206)) {
+            aseg_clear_error();
+            g_lastStatus = status;
+            snprintf(g_lastLine, sizeof(g_lastLine), "native HTTP");
+            return 0;
+        }
+        if (*outBuf) { free(*outBuf); *outBuf = NULL; *outLen = 0; }
+        g_nativeHost[0] = '\0';
+    }
+
     char cur[1400];
     strncpy(cur, url, sizeof(cur) - 1); cur[sizeof(cur) - 1] = '\0';
 
-    uint8_t lead[4096]; int leadLen = 0; long clen = -1;
+    uint8_t lead[4096]; int leadLen = 0; long clen = -1; int chunked = 0;
     int opened = 0;
     for (int hop = 0; hop < 5 && !opened; hop++) {
         if (g_abort) { conn_close(); g_kaAlive = 0; return -9; }   // bail between redirect hops on teardown
@@ -383,38 +552,104 @@ static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
         }
         watchdog_kick();
         if (parse_url(cur) != 0) { conn_close(); g_kaAlive = 0; return -1; }
-        if (resolve_host() != 0) { conn_close(); g_kaAlive = 0; return -2; }
-        // Keep-alive reuse is DISABLED. aseg has a single global socket shared by
-        // the main thread and both prefetch threads; a burst leaves partial and
-        // aborted reads behind, and a later fetch then read the TAIL of an earlier
-        // response -- proven in the field: we requested DW's variant playlist and
-        // parsed a 306-entry DVR playlist from a different channel, then asked for
-        // its segment names against DW's base URL and got HTTP 400.
-        //
-        // Correctness beats the saved handshake here. Re-enabling this needs the
-        // response to be validated against the request (or a per-caller connection,
-        // which is the proper fix), not just a host:port match.
-        int reuse = 0;
-        (void)g_kaAlive; (void)g_kaPort; (void)g_kaTlsmode; (void)g_kaHost;
+        if (resolve_host() != 0) { conn_close(); g_kaAlive = 0; snprintf(g_badStage, sizeof(g_badStage), "dns"); return -2; }
+        // Reuse the kept-alive socket if it's to the same host:port:tls.
+        // This was disabled in v04.12 to test a response-desync theory. That theory
+        // was disproved (the wrong-playlist symptom turned out to be the main thread
+        // stuck in a retry loop), and leaving it off costs a full TCP+TLS handshake
+        // on EVERY segment -- measured open=1.6-3.4s against 0.3s from a PC.
+        int reuse = (g_kaAlive && g_sock >= 0 && g_kaPort == g_port &&
+                     g_kaTlsmode == g_tlsmode && strcmp(g_kaHost, g_host) == 0);
         int status = 0; char loc[1400];
-        int rc = do_request(reuse, &status, loc, sizeof(loc), lead, &leadLen, &clen);
+        int rc = do_request(reuse, &status, loc, sizeof(loc), lead, &leadLen, &clen, &chunked);
         if (rc != 0 && reuse) {            // stale keep-alive socket -> fresh connect once
             conn_close(); g_kaAlive = 0;
-            rc = do_request(0, &status, loc, sizeof(loc), lead, &leadLen, &clen);
+            rc = do_request(0, &status, loc, sizeof(loc), lead, &leadLen, &clen, &chunked);
         }
         if (rc == 1 && loc[0]) { strncpy(cur, loc, sizeof(cur) - 1); cur[sizeof(cur) - 1] = '\0'; g_kaAlive = 0; continue; }
-        if (rc != 0) { conn_close(); g_kaAlive = 0; return -3; }
+        if (rc != 0) {
+            conn_close(); g_kaAlive = 0;
+            // A hard failure BEFORE any HTTP status — connect refused/timeout,
+            // TLS handshake stall or rejection, request write stall — on an
+            // HTTPS origin gets one bounded retry through the PS4's native
+            // SceHttp stack. Cloudflare edges were observed hanging BearSSL
+            // handshakes instead of answering 403, which left this fetch with
+            // no fallback at all (rc=-3 len=0 st=-1). Same pinning rule as the
+            // 403 path: success keeps using SceHttp for exactly this host.
+            if (!g_abort && g_tlsmode) {
+                int nstatus = 0;
+                int nrc = native_http_fetch(cur, outBuf, outLen, &nstatus,
+                                            ASEG_FETCH_BUDGET_US);
+                if (nrc == 0 && (nstatus == 200 || nstatus == 206)) {
+                    snprintf(g_nativeHost, sizeof(g_nativeHost), "%s", g_host);
+                    aseg_clear_error();
+                    g_lastStatus = nstatus;
+                    snprintf(g_lastLine, sizeof(g_lastLine), "native HTTP");
+                    return 0;
+                }
+                if (*outBuf) { free(*outBuf); *outBuf = NULL; *outLen = 0; }
+            }
+            return -3;
+        }
+        if (status == 403 && urlopt_has_page_headers()) {
+            // Browser extensions can observe the outer page before the exact
+            // manifest request headers arrive. Some CDNs reject that incorrect
+            // context but intentionally accept no Referer/Origin. Retry clean
+            // once, retaining UA/Cookie, and keep the winning policy for all
+            // variant and segment requests in this stream.
+            conn_close(); g_kaAlive = 0;
+            urlopt_set_page_headers_enabled(0);
+            leadLen = 0; clen = -1; chunked = 0;
+            int clean_status = 0;
+            int clean_rc = do_request(0, &clean_status, loc, sizeof(loc),
+                                      lead, &leadLen, &clen, &chunked);
+            if (clean_rc == 0 && (clean_status == 200 || clean_status == 206)) {
+                status = clean_status;
+                aseg_clear_error();
+                g_lastStatus = status;
+                snprintf(g_lastLine, sizeof(g_lastLine), "clean-header HTTP");
+            } else {
+                urlopt_set_page_headers_enabled(1);
+                status = clean_status ? clean_status : status;
+            }
+        }
         if (status != 200 && status != 206) {
             g_lastStatus = status;           // capture HERE: a later OK fetch must not overwrite it
             g_badReuse = reuse; g_badHop = hop;
             snprintf(g_badLine, sizeof(g_badLine), "%s", g_lastLine);
             g_badPathLen = (int)strlen(g_path);
             snprintf(g_badPath, sizeof(g_badPath), "%s", g_path);
-            conn_close(); g_kaAlive = 0; return -4;
+            conn_close(); g_kaAlive = 0;
+            // Retry an HTTPS 403 once through the native PS4 HTTP/TLS stack. A
+            // successful retry pins only this host to SceHttp; all other origins
+            // stay on the established BearSSL path.
+            if (g_tlsmode && status == 403) {
+                int native_status = 0;
+                int native_rc = native_http_fetch(cur, outBuf, outLen, &native_status,
+                                                  ASEG_FETCH_BUDGET_US);
+                if (native_rc == 0 && (native_status == 200 || native_status == 206)) {
+                    snprintf(g_nativeHost, sizeof(g_nativeHost), "%s", g_host);
+                    aseg_clear_error();
+                    g_lastStatus = native_status;
+                    snprintf(g_lastLine, sizeof(g_lastLine), "native HTTP");
+                    return 0;
+                }
+                if (*outBuf) { free(*outBuf); *outBuf = NULL; *outLen = 0; }
+            }
+            return -4;
         }
         opened = 1;
     }
     if (!opened) { conn_close(); g_kaAlive = 0; return -5; }
+
+    if (chunked) {
+        watchdog_note("aseg/body-chunked");
+        int rc = read_chunked_body(lead, leadLen, outBuf, outLen);
+        if (rc != 0) { conn_close(); g_kaAlive = 0; return rc; }
+        g_kaAlive = 1; g_kaPort = g_port; g_kaTlsmode = g_tlsmode;
+        strncpy(g_kaHost, g_host, sizeof(g_kaHost) - 1); g_kaHost[sizeof(g_kaHost) - 1] = '\0';
+        return 0;
+    }
 
     watchdog_note("aseg/alloc");
     size_t cap = 256 * 1024, used = 0;
@@ -507,6 +742,8 @@ int aseg_bad_hop(void) { return g_badHop; }
 const char *aseg_last_line(void) { return g_badLine[0] ? g_badLine : g_lastLine; }
 const char *aseg_bad_path(void) { return g_badPath; }
 int aseg_bad_pathlen(void) { return g_badPathLen; }
+const char *aseg_bad_stage(void) { return g_badStage; }
+const char *aseg_native_debug(void) { return native_http_debug(); }
 
 void aseg_init(void) {
     if (g_fetchMtxInit) return;

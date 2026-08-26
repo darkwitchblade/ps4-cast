@@ -13,6 +13,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PS4=${PS4_IP:-192.168.1.33}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"/ps4-api.sh
 KILL="$ROOT/payloads/ps4cast-control/build/ps4cast-kill.bin"
 LAUNCH="$ROOT/payloads/ps4cast-control/build/ps4cast-launch.bin"
 

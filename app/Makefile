@@ -2,7 +2,7 @@
 # STABLE title id: DirectPackageInstaller updates it in place (one icon). The
 # display TITLE carries the version, and /status reports APP_VER so we always
 # know which build is actually running.
-VERSION     := 04.25
+VERSION     := 04.49
 TITLE       := PS4 Cast $(VERSION)
 TITLE_ID    := PCST00001
 CONTENT_ID  := IV0000-PCST00001_00-PS4CAST000000001
@@ -50,7 +50,8 @@ OBJS        := $(patsubst src/%.c, $(INTDIR)/%.o, $(CFILES)) \
                $(patsubst src/%.cpp, $(INTDIR)/%.o, $(CPPFILES))
 
 # Flags
-CFLAGS      := --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -c $(EXTRAFLAGS) \
+CFLAGS      := --target=x86_64-pc-freebsd12-elf -O2 -fno-strict-aliasing \
+               -fPIC -funwind-tables -c $(EXTRAFLAGS) \
                -DAPP_VER='"$(VERSION)"' \
                $(if $(filter 1,$(BOOT_MINIMAL)),-DBOOT_MINIMAL,) \
                -I$(FFMPEG)/include \

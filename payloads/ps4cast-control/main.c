@@ -18,6 +18,9 @@
 #ifndef CALLBACK_IP_ADDR
 #define CALLBACK_IP_ADDR 0x8B01A8C0U
 #endif
+#ifndef FALLBACK_USER_ID
+#define FALLBACK_USER_ID 0U
+#endif
 #define CALLBACK_PORT 0xAB26U
 
 void *dlopen(const char *, int);
@@ -87,6 +90,13 @@ static int slen(const char *s)
     int n = 0;
     while (s[n]) n++;
     return n;
+}
+
+static int streq(const char *a, const char *b)
+{
+    int i = 0;
+    while (a[i] && b[i] && a[i] == b[i]) i++;
+    return a[i] == 0 && b[i] == 0;
 }
 
 static void append_inplace(char *out, const char *s)
@@ -422,32 +432,94 @@ int main(void)
     void *usersrv = dlopen("/system/common/lib/libSceUserService.sprx", 0);
     int (*user_init)(OrbisUserServiceInitializeParams *) = dlsym(usersrv, "sceUserServiceInitialize");
     int (*foreground_user)(int *) = dlsym(usersrv, "sceUserServiceGetForegroundUser");
+    int (*initial_user)(int *) = dlsym(usersrv, "sceUserServiceGetInitialUser");
     int (*login_list)(int *) = dlsym(usersrv, "sceUserServiceGetLoginUserIdList"); // -> { int userId[4]; }
+    int (*user_name)(int, char *, size_t) = dlsym(usersrv, "sceUserServiceGetUserName");
     int (*user_term)(void) = dlsym(usersrv, "sceUserServiceTerminate");
     int uid = -1;
     if (user_init && user_term) {
         OrbisUserServiceInitializeParams params = { .priority = ORBIS_KERNEL_PRIO_FIFO_NORMAL };
         user_init(&params);
-        // Prefer the system-wide LOGIN-user list: it returns the signed-in user even
-        // in this injected payload context, where GetForegroundUser comes back
-        // ANONYMOUS (0xffffffff) -> the launched app then crashed SceShellUI.
-        if (login_list) { int ll[4] = { -1, -1, -1, -1 }; login_list(ll); uid = ll[0]; }
-        if (uid < 0 && foreground_user) foreground_user(&uid);   // fallback
-        user_term();
+        if (foreground_user) foreground_user(&uid);
+        if (uid <= 0 && initial_user) initial_user(&uid);
+        if (uid <= 0 && login_list) {
+            int ll[4] = { -1, -1, -1, -1 };
+            login_list(ll);
+            uid = ll[0];
+        }
     }
-    if (uid < 0) uid = 0;
+    // GoldHEN's injected payload context returns ANONYMOUS from UserService on
+    // some firmware/build combinations. The development pipeline supplies the
+    // last user ID observed from a clean icon launch; redeploy refreshes it from
+    // /status before closing the old build.
+    if ((uid <= 0 || (uint32_t)uid == 0xffffffffU) &&
+        FALLBACK_USER_ID > 0U && FALLBACK_USER_ID != 0xffffffffU)
+        uid = (int)FALLBACK_USER_ID;
+    // Never silently turn ANONYMOUS (0xffffffff / -1) into user zero for an
+    // app launch. A payload-launched big app with no real user can make
+    // SceShellUI's VideoPlayingChecker fault as soon as playback starts.
+    int valid_uid = (uid > 0 && (uint32_t)uid != 0xffffffffU);
+    if (!valid_uid) uid = 0;
+    char active_name[32] = {0};
+    if (valid_uid && user_name) user_name(uid, active_name, sizeof(active_name));
+    if (user_term) user_term();
+
+    // sceUserServiceGetNpAccountId faults from GoldHEN's injected payload
+    // context on FW 11. Read the same 8-byte value from RegMgr instead, using
+    // the established Apollo/offline-activation key layout. Match the active
+    // username when possible; with a single account, accept the first non-zero
+    // activated slot as a fallback.
+    uint64_t account_id = 0;
+    int account_rv = -1;
+    int account_slot = 0;
+    uint64_t fallback_account = 0;
+    int fallback_slot = 0;
+    void *regmgr = dlopen("/system/common/lib/libSceRegMgr.sprx", 0);
+    int (*reg_get_str)(uint32_t, char *, size_t) = dlsym(regmgr, "sceRegMgrGetStr");
+    int (*reg_get_bin)(uint32_t, void *, size_t) = dlsym(regmgr, "sceRegMgrGetBin");
+    if (reg_get_str && reg_get_bin) {
+        for (int n = 1; n <= 16; n++) {
+            uint32_t off = (uint32_t)(n - 1) * 65536U;
+            char name[32] = {0};
+            uint64_t candidate = 0;
+            reg_get_str(125829632U + off, name, sizeof(name));
+            int grv = reg_get_bin(125830400U + off, &candidate, sizeof(candidate));
+            if (grv == 0 && candidate && !fallback_account) {
+                fallback_account = candidate;
+                fallback_slot = n;
+            }
+            if (grv == 0 && candidate && active_name[0] && streq(name, active_name)) {
+                account_id = candidate;
+                account_slot = n;
+                account_rv = 0;
+                break;
+            }
+        }
+        if (!account_id && fallback_account) {
+            account_id = fallback_account;
+            account_slot = fallback_slot;
+            account_rv = 0;
+        }
+    }
 
 #if defined(CONTROL_LAUNCH)
+    if (!valid_uid) {
+        send(222, "PS4 Cast launch blocked: no signed-in user");
+        callback("launch blocked uid=0xFFFFFFFF\n");
+        return -3;
+    }
+    // Prefer the public SystemService wrapper. Direct sceLncUtilLaunchApp did
+    // start the title, but on FW 11 it ignored param.user_id and the app came up
+    // ANONYMOUS. Established loaders use this wrapper with the same parameter
+    // layout, and it performs the ShellUI-facing launch bookkeeping.
+    void *system = dlopen("/system/common/lib/libSceSystemService.sprx", 0);
+    int (*launch)(const char *, const char **, LncAppParam *) = dlsym(system, "sceSystemServiceLaunchApp");
     void *lnc = dlopen("/system/common/lib/libSceLncUtil.sprx", 0);
     int (*lnc_init)(void) = dlsym(lnc, "sceLncUtilInitialize");
-    int (*launch)(const char *, const char **, LncAppParam *) = dlsym(lnc, "sceLncUtilLaunchApp");
-    if (!launch) launch = dlsym(lnc, "sceLncUtilStartLaunchAppByTitleId");
     if (lnc_init) lnc_init();
     if (!launch) {
-        void *system = dlopen("/system/common/lib/libSceSystemService.sprx", 0);
-        launch = dlsym(system, "sceSystemServiceLaunchApp");
-        if (!launch) launch = dlsym(system, "sceLncUtilStartLaunchAppByTitleId");
-        if (!launch) launch = dlsym(system, "sceLncUtilLaunchApp");
+        launch = dlsym(lnc, "sceLncUtilStartLaunchAppByTitleId");
+        if (!launch) launch = dlsym(lnc, "sceLncUtilLaunchApp");
     }
     if (!launch) {
         send(222, "PS4 Cast ctrl launch symbol missing");
@@ -459,7 +531,7 @@ int main(void)
         .user_id = (uint32_t)uid,
         .app_opt = 0,
         .crash_report = 0,
-        .LaunchAppCheck_flag = 2
+        .LaunchAppCheck_flag = 0
     };
     rv = launch(TITLE_ID, NULL, &param);
     char cb[0x200] = {0};
@@ -472,6 +544,8 @@ int main(void)
     append_inplace(cb, hx);
     append_inplace(cb, " title=");
     append_inplace(cb, TITLE_ID);
+    append_inplace(cb, " uid=");
+    append_hex64(cb, (uint32_t)uid);
     if (get_big_app2) {
         append_inplace(cb, " big=");
         append_hex64(cb, (uint32_t)get_big_app2());
@@ -610,10 +684,20 @@ int main(void)
     return rv;
 	#elif defined(CONTROL_APP_STATUS)
 	    char report[0x400] = {0};
+	    append_inplace(report, "user uid=");
+	    append_hex64(report, (uint32_t)uid);
+		    append_inplace(report, " valid=");
+		    append_dec(report, valid_uid);
+		    append_inplace(report, " account_rv=");
+		    append_dec(report, account_rv);
+		    append_inplace(report, " account_id=");
+		    append_hex64(report, account_id);
+		    append_inplace(report, " account_slot=");
+		    append_dec(report, account_slot);
+		    append_inplace(report, "\n");
 	    get_lnc_appid(report);
 	    get_appinst_status(report);
 	    callback(report);
-	    send(222, "PS4 Cast app status sent");
 	    return 0;
 	#elif defined(CONTROL_REBOOT)
 	    send(222, "PS4 Cast ctrl rebooting");

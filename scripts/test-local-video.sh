@@ -5,6 +5,7 @@ PS4=${PS4_IP:-192.168.1.253}
 HOST=${HOST_IP:-192.168.1.139}
 PORT=${LOCAL_VIDEO_PORT:-8001}
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"/ps4-api.sh
 VIDEO=${1:-test.mp4}
 
 python3 -u -m http.server "$PORT" --bind "$HOST" --directory "$ROOT/app/assets" >/tmp/ps4cast_local_video.log 2>&1 &
@@ -17,7 +18,7 @@ trap cleanup EXIT
 sleep 1
 URL="http://$HOST:$PORT/$VIDEO"
 echo "Playing $URL"
-curl -sS -m 5 -X POST "http://$PS4:8080/play" --data-binary "$URL"
+ps4_post "play" -m5 --data-binary "$URL"
 echo
 
 for _ in $(seq 1 12); do

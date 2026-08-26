@@ -242,11 +242,26 @@ static const GfxColor MUT    = { 0x9a, 0xa4, 0xc8 };
 static const GfxColor FAINT  = { 0x6b, 0x73, 0x98 };
 static const GfxColor INK    = { 0x07, 0x0a, 0x14 };
 static const GfxColor PAPER  = { 0xf4, 0xf7, 0xff };
-static const GfxColor BTN_X  = { 0x86, 0xa9, 0xff };
-static const GfxColor BTN_O  = { 0xff, 0x73, 0x88 };
-static const GfxColor BTN_T  = { 0x44, 0xe0, 0xa6 };
 // Kept for the (compiled-out) BOOT_MINIMAL diagnostic path.
 static const GfxColor WHITE  = { 0xf3, 0xf6, 0xff };
+
+typedef enum { HOME_CAST = 0, HOME_IPTV = 1 } HomeMode;
+typedef enum { PLAYBACK_CAST = 0, PLAYBACK_IPTV = 1 } PlaybackOrigin;
+
+#ifndef BOOT_MINIMAL
+#define HOME_MODE_PATH "/data/ps4cast_home_mode"
+static HomeMode home_mode_load(void) {
+    char c = '0';
+    int fd = sceKernelOpen(HOME_MODE_PATH, 0, 0);
+    if (fd >= 0) { sceKernelRead(fd, &c, 1); sceKernelClose(fd); }
+    return c == '1' ? HOME_IPTV : HOME_CAST;
+}
+static void home_mode_save(HomeMode mode) {
+    char c = mode == HOME_IPTV ? '1' : '0';
+    int fd = sceKernelOpen(HOME_MODE_PATH, 0x0201 | 0x0400 /*WRONLY|CREAT|TRUNC*/, 0666);
+    if (fd >= 0) { sceKernelWrite(fd, &c, 1); sceKernelClose(fd); }
+}
+#endif
 
 static void fmt_time(double sec, char *out, int cap) {
     if (sec < 0) sec = 0;
@@ -269,13 +284,6 @@ static void basename_of(const char *url, char *out, int cap) {
 }
 
 // ---- modern UI helpers (mirrored in tools/uipreview.c) -------------------
-static void thick_line(Gfx *g, float x0, float y0, float x1, float y1, float th, GfxColor c) {
-    float dx = x1 - x0, dy = y1 - y0, len = __builtin_sqrtf(dx * dx + dy * dy);
-    if (len < 0.001f) return;
-    float nx = -dy / len * (th / 2), ny = dx / len * (th / 2);
-    gfx_tri(g, (int)(x0 + nx), (int)(y0 + ny), (int)(x0 - nx), (int)(y0 - ny), (int)(x1 + nx), (int)(y1 + ny), c);
-    gfx_tri(g, (int)(x0 - nx), (int)(y0 - ny), (int)(x1 + nx), (int)(y1 + ny), (int)(x1 - nx), (int)(y1 - ny), c);
-}
 static void gtext(Gfx *g, int x, int y, const char *s, int sc, GfxColor c, int tr) {
     if (sc >= 4) gfx_text_tr(g, x + 2, y + 2, s, sc, INK, tr);
     gfx_text_tr(g, x, y, s, sc, c, tr);
@@ -286,12 +294,6 @@ static void stext(Gfx *g, int x, int y, const char *s, int sc, GfxColor c) {
     gfx_text(g, x + 2, y + 2, s, sc, INK);
     gfx_text(g, x, y, s, sc, c);
 }
-// Centre text on an arbitrary x (ctext centres on the whole screen), for the
-// split home screen where each pane has its own centre.
-static void ctext_at(Gfx *g, int cx, int y, const char *s, int sc, GfxColor c) {
-    gfx_text(g, cx - gfx_text_w(s, sc) / 2, y, s, sc, c);
-}
-
 static void ctext(Gfx *g, int cy, const char *s, int sc, GfxColor c, int tr) {
     int w = gfx_text_tr_w(s, sc, tr);
     gtext(g, (g->width - w) / 2, cy, s, sc, c, tr);
@@ -313,23 +315,20 @@ static void icon_cast(Gfx *g, int cx, int cy, int box) {
     gfx_arc(g, dx, dy, (int)(s * 0.24f), th, 1, ACCENT);
     gfx_arc(g, dx, dy, (int)(s * 0.42f), th, 1, ACCENT);
 }
-static void btn_cross(Gfx *g, int cx, int cy, int r, GfxColor c) {
-    float t = r * 0.42f;
-    thick_line(g, cx - r * 0.7f, cy - r * 0.7f, cx + r * 0.7f, cy + r * 0.7f, t, c);
-    thick_line(g, cx - r * 0.7f, cy + r * 0.7f, cx + r * 0.7f, cy - r * 0.7f, t, c);
-}
-static void btn_circle(Gfx *g, int cx, int cy, int r, GfxColor c) {
-    int th = (int)(r * 0.42f); if (th < 2) th = 2;
-    for (int q = 0; q < 4; q++) gfx_arc(g, cx, cy, r, th, q, c);
-}
-static void btn_triangle(Gfx *g, int cx, int cy, int r, GfxColor c) {
-    float t = r * 0.40f;
-    float ax = cx, ay = cy - r;
-    float bx = cx - r * 0.92f, by = cy + r * 0.75f;
-    float dx = cx + r * 0.92f, dy = cy + r * 0.75f;
-    thick_line(g, ax, ay, bx, by, t, c);
-    thick_line(g, bx, by, dx, dy, t, c);
-    thick_line(g, dx, dy, ax, ay, t, c);
+
+// The receiver and IPTV browser are presentation modes only. Networking stays
+// live in both, so an incoming cast can always interrupt the home screen.
+static void draw_home_tabs(Gfx *g, HomeMode mode, int channels) {
+    int w = 610, h = 58, x = (g->width - w) / 2, y = 38, half = w / 2;
+    panel(g, x, y, w, h, 8, SURF, 245);
+    gfx_round(g, x + (mode == HOME_IPTV ? half : 0) + 4, y + 4,
+              half - 8, h - 8, 6, ACCENT);
+    const char *cast = "L1  Cast receiver";
+    char tv[48]; snprintf(tv, sizeof(tv), "Live TV  %d  R1", channels);
+    int c1 = x + (half - gfx_text_w(cast, 2)) / 2;
+    int c2 = x + half + (half - gfx_text_w(tv, 2)) / 2;
+    gfx_text(g, c1, y + 21, cast, 2, mode == HOME_CAST ? INK : MUT);
+    gfx_text(g, c2, y + 21, tv, 2, mode == HOME_IPTV ? INK : MUT);
 }
 static void draw_qr_card(Gfx *g, const char *url, int cx, int top, int module) {
     int quiet = 3;
@@ -345,72 +344,47 @@ static void draw_qr_card(Gfx *g, const char *url, int cx, int top, int module) {
         for (int xx = 0; xx < QR_SIZE; xx++)
             if (qr.m[yy][xx]) gfx_rect(g, qx + xx * module, qy + yy * module, module, module, INK);
 }
-// control hint: PS4 button glyph + label. kinds: 0 cross,1 circle,2 triangle,3 seek
-static int legend(Gfx *g, int x, int cy, int kind, const char *label) {
-    int r = 13, gx = x + r;
-    if (kind == 0) btn_cross(g, gx, cy, r, BTN_X);
-    else if (kind == 1) btn_circle(g, gx, cy, r, BTN_O);
-    else if (kind == 2) btn_triangle(g, gx, cy, r, BTN_T);
-    else {
-        gfx_tri(g, gx + 4, cy, gx + 12, cy - 7, gx + 12, cy + 7, MUT);
-        gfx_tri(g, gx - 4, cy, gx - 12, cy - 7, gx - 12, cy + 7, MUT);
-    }
-    gfx_text(g, x + r * 2 + 12, cy - 8, label, 2, MUT);
-    return r * 2 + 12 + gfx_text_w(label, 2) + 40;
-}
-static void draw_legend_row(Gfx *g, int cx, int ly) {
-    struct { int k; const char *l; } items[] = { {0,"Pause"},{1,"Stop"},{3,"Seek"},{2,"Exit"} };
-    int total = 0;
-    for (int i = 0; i < 4; i++) total += 13 * 2 + 12 + gfx_text_w(items[i].l, 2) + 40;
-    int lx = cx - (total - 40) / 2;
-    for (int i = 0; i < 4; i++) lx += legend(g, lx, ly, items[i].k, items[i].l);
-}
-
 static void draw_lobby(Gfx *g, const char *ip, int net_ok) {
     gfx_vgrad(g, 0, 0, g->width, g->height, BG_TOP, BG_BOT);
-    gfx_rect_a(g, 0, 0, g->width, 360, ACCENT, 14);
     int W = g->width;
 
-    // brand row, centered: logo tile + wordmark
+#ifdef BOOT_MINIMAL
+    draw_home_tabs(g, HOME_CAST, 0);
+#else
+    draw_home_tabs(g, HOME_CAST, httpd_chan_count());
+#endif
+
+    // Compact receiver identity; the QR and ready state remain the primary task.
     int track = 0, ws = 6;
     const char *wm = "PS4 Cast";
     int ww = gfx_text_tr_w(wm, ws, track);
-    int box = 92, group = box + 26 + ww, gx = (W - group) / 2, brandCy = 150;
+    int box = 82, group = box + 24 + ww, gx = (W - group) / 2, brandCy = 172;
     icon_cast(g, gx + box / 2, brandCy, box);
     gtext(g, gx + box + 26, brandCy - (ws * 8) / 2, wm, ws, TXT, track);
-    ctext(g, 250, "Wireless Cast Receiver", 2, FAINT, 0);
+    ctext(g, 242, "Ready to receive", 3, LIVE, 0);
 
     if (net_ok) {
         char url[80];
-        snprintf(url, sizeof(url), "http://%s:%d", ip, PORT);
-        draw_qr_card(g, url, W / 2, 320, 9);
-        int below = 320 + ((QR_SIZE + 6) * 9 + 60) + 40;
-        ctext(g, below, "Scan with your phone to open the controls", 3, MUT, 0);
+        if (httpd_pairing_required() && httpd_token()[0])
+            snprintf(url, sizeof(url), "http://%s:%d/?t=%s", ip, PORT, httpd_token());
+        else
+            snprintf(url, sizeof(url), "http://%s:%d", ip, PORT);
+        draw_qr_card(g, url, W / 2, 300, 9);
+        int below = 300 + ((QR_SIZE + 6) * 9 + 60) + 34;
+        ctext(g, below, "Scan to open phone controls", 3, MUT, 0);
 
         int uw = gfx_text_tr_w(url, 4, 0);
-        int pw = uw + 64, ph = 64, px = (W - pw) / 2, py = below + 52;
-        panel(g, px, py, pw, ph, ph / 2, SURF2, 235);
+        int pw = uw + 64, ph = 58, px = (W - pw) / 2, py = below + 46;
+        panel(g, px, py, pw, ph, 8, SURF2, 235);
         gfx_circle(g, px + 30, py + ph / 2, 6, LIVE);
         gtext(g, px + 52, py + (ph - 32) / 2, url, 4, TXT, 0);
-        ctext(g, py + ph + 34, "or cast from any DLNA / UPnP app on your network", 2, FAINT, 0);
+        ctext(g, py + ph + 28, "Browser helper, direct link, or DLNA / UPnP", 2, FAINT, 0);
     } else {
         ctext(g, 470, "No network connection", 5, TXT, 0);
         ctext(g, 560, "Connect the PS4 to Wi-Fi or LAN, then relaunch.", 3, MUT, 0);
     }
 
-    // status chip
-    char st[160];
-#ifdef BOOT_MINIMAL
-    snprintf(st, sizeof(st), "minimal boot diagnostic");
-#else
-    snprintf(st, sizeof(st), "%s", player_status());
-#endif
-    int sw = gfx_text_w(st, 2) + 60, sx = (W - sw) / 2, sy = 884;
-    panel(g, sx, sy, sw, 44, 22, SURF, 220);
-    gfx_circle(g, sx + 26, sy + 22, 5, net_ok ? LIVE : FAINT);
-    gfx_text(g, sx + 42, sy + 14, st, 2, MUT);
-
-    draw_legend_row(g, W / 2, 984);
+    ctext(g, 1010, "L1 / R1  switch mode        Triangle  exit", 2, MUT, 0);
 }
 
 #ifndef BOOT_MINIMAL
@@ -525,7 +499,7 @@ static uint32_t pad_held(PadState *p) {
 static int    g_scrubActive = 0;
 static double g_scrubTarget = 0;
 
-static void draw_hud(Gfx *g) {
+static void draw_hud(Gfx *g, PlaybackOrigin origin) {
     double cur = 0, dur = 0;
     player_progress(&cur, &dur);
     if (g_scrubActive) cur = g_scrubTarget;   // preview the position being scrubbed to
@@ -539,15 +513,14 @@ static void draw_hud(Gfx *g) {
     // title + status (bottom-left, above the scrubber). Bigger + brighter than
     // before so the status/time read cleanly from the couch.
     char title[160];
-    basename_of(httpd_last_push(), title, sizeof(title));
-    stext(g, barX, barY - 100, title, 4, TXT);
-    stext(g, barX, barY - 46, paused ? "Paused" : player_status(), 3, TXT);
-
-    // play/paused state (right, above the scrubber)
-    const char *badge = paused ? "PAUSED" : "PLAYING";
-    int bx = barX + barW - gfx_text_w(badge, 3);
-    gfx_circle(g, bx - 22, barY - 34, 6, paused ? WARN : LIVE);
-    stext(g, bx, barY - 46, badge, 3, paused ? WARN : LIVE);
+    if (origin == PLAYBACK_IPTV && httpd_chan_current() >= 0)
+        httpd_chan_get(httpd_chan_current(), title, sizeof(title), NULL, 0);
+    else
+        basename_of(httpd_last_push(), title, sizeof(title));
+    stext(g, barX, barY - 92, title, 4, TXT);
+    const char *state = paused ? "Paused" : (origin == PLAYBACK_IPTV ? "Live TV" : "Playing");
+    gfx_circle(g, barX + 6, barY - 32, 6, paused ? WARN : LIVE);
+    stext(g, barX + 24, barY - 44, state, 3, paused ? WARN : TXT);
 
     if (dur > 0) {
         // seekable VOD: scrubber + times
@@ -570,136 +543,117 @@ static void draw_hud(Gfx *g) {
     }
 }
 
-// Jump to the first channel of the next (dir +1) or previous (dir -1) IPTV
-// group relative to `sel`, for fast Left/Right group navigation in the zapper.
-static int chan_group_jump(int sel, int dir) {
-    int n = httpd_chan_count();
-    if (n <= 0) return sel;
-    if (sel < 0) sel = 0;
-    char g0[48]; httpd_chan_group(sel, g0, sizeof(g0));
-    if (dir > 0) {
-        for (int k = 1; k <= n; k++) {
-            int i = (sel + k) % n; char g[48]; httpd_chan_group(i, g, sizeof(g));
-            if (strcmp(g, g0) != 0) return i;            // first of the next group
-        }
-        return sel;
-    }
-    int start = sel;                                     // back up to start of current group
-    for (int k = 1; k < n; k++) {
-        int i = (sel - k + n) % n; char g[48]; httpd_chan_group(i, g, sizeof(g));
-        if (strcmp(g, g0) != 0) break; start = i;
-    }
-    int last = (start - 1 + n) % n;                      // last of the previous group
-    char gp[48]; httpd_chan_group(last, gp, sizeof(gp));
-    int pstart = last;
-    for (int k = 1; k < n; k++) {
-        int i = (last - k + n) % n; char g[48]; httpd_chan_group(i, g, sizeof(g));
-        if (strcmp(g, gp) != 0) break; pstart = i;
-    }
-    return pstart;                                       // first of the previous group
+static int chan_filtered_pos(int absolute) {
+    int n = httpd_chan_filter_count();
+    for (int i = 0; i < n; i++) if (httpd_chan_filter_abs(i) == absolute) return i;
+    return -1;
 }
 
-// TV-box-style channel list overlay: a fast, scrollable list of the loaded
-// playlist with the highlighted selection and a live marker on the tuned one.
+static int chan_rail_for_abs(int absolute) {
+    char grp[48]; httpd_chan_group(absolute, grp, sizeof(grp));
+    if (!grp[0]) return 0;
+    int n = httpd_chan_rail_count();
+    for (int i = 2; i < n; i++) {
+        char name[80]; httpd_chan_rail_name(i, name, sizeof(name));
+        if (strcmp(name, grp) == 0) return i;
+    }
+    return 0;
+}
 
-// ---- home screen: cast panel (left) + bouquets/channels (right) ----------
-// Left keeps the original lobby (QR + cast URL) so phone casting stays visible.
-// Right is a two-level browser: bouquets, then that bouquet's channels. You pick
-// a bouquet (Cross) to open it, pick a channel (Cross) to watch; Circle backs
-// out. L2/R2 step bouquets from either level.
+// ---- Live TV home: one full-width bouquet/channel browser ----------------
+// Cast reception remains active while this screen is open. Keeping the two
+// products visually separate makes the current input semantics obvious.
 static void draw_channel_home(Gfx *g, int sel, int railSel, int inChannels,
                               const char *ip, int net_ok) {
     gfx_vgrad(g, 0, 0, g->width, g->height, BG_TOP, BG_BOT);
     int W = g->width, H = g->height;
-    int midX = 700;                                  // split: cast panel | browser
+    draw_home_tabs(g, HOME_IPTV, httpd_chan_count());
 
-    // ---------------- left: cast panel (QR + URL) ----------------
-    int cx = midX / 2;
-    icon_cast(g, cx, 150, 84);
-    ctext_at(g, cx, 214, "PS4 Cast", 5, TXT);
-    if (net_ok) {
-        char url[80]; snprintf(url, sizeof(url), "http://%s:%d", ip, PORT);
-        draw_qr_card(g, url, cx, 292, 6);
-        int below = 292 + ((QR_SIZE + 6) * 6 + 44) + 26;
-        ctext_at(g, cx, below, "Scan to cast from your phone", 2, MUT);
-        int uw = gfx_text_tr_w(url, 3, 0);
-        int pw = uw + 48, ph = 52, px = cx - pw / 2, py = below + 36;
-        panel(g, px, py, pw, ph, ph / 2, SURF2, 235);
-        gfx_circle(g, px + 24, py + ph / 2, 5, LIVE);
-        gtext(g, px + 42, py + (ph - 24) / 2, url, 3, TXT, 0);
-        ctext_at(g, cx, py + ph + 30, "or any DLNA / UPnP app", 2, FAINT);
-    } else {
-        ctext_at(g, cx, 320, "No network", 4, WARN);
-    }
-    gfx_rect_a(g, midX, 60, 1, H - 160, HAIR, 30);   // divider
-
-    // ---------------- right: bouquets / channels ----------------
-    int lx = midX + 44, lw = W - lx - 56, ly = 120, rowH = 54;
+    int lx = 150, lw = W - 300, ly = 200, rowH = 58;
     char rail[80]; httpd_chan_rail_name(railSel, rail, sizeof(rail));
-    gfx_round(g, lx, 52, 6, 30, 3, ACCENT);
-    gtext(g, lx + 18, 50, inChannels ? rail : "Bouquets", 4, TXT, 0);
+    gfx_round(g, lx, 136, 6, 34, 3, ACCENT);
+    gtext(g, lx + 20, 132, inChannels ? rail : "Bouquets", 5, TXT, 0);
     char sub[80];
     int n = inChannels ? httpd_chan_filter_count() : httpd_chan_rail_count();
     snprintf(sub, sizeof(sub), inChannels ? "%d channels" : "%d groups", n);
-    gfx_text(g, W - 56 - gfx_text_w(sub, 2), 60, sub, 2, FAINT);
-    gfx_rect_a(g, lx, 96, lw, 1, HAIR, 30);
+    gfx_text(g, lx + lw - gfx_text_w(sub, 2), 150, sub, 2, FAINT);
+    gfx_rect_a(g, lx, 184, lw, 1, HAIR, 30);
 
-    int rows = (H - ly - 120) / rowH;
+    if (httpd_chan_count() <= 0) {
+        icon_cast(g, W / 2, 390, 90);
+        ctext(g, 474, "No IPTV playlist loaded", 5, TXT, 0);
+        ctext(g, 544, "Open the web controls and add an M3U playlist", 3, MUT, 0);
+        if (net_ok) {
+            char url[80]; snprintf(url, sizeof(url), "http://%s:%d", ip, PORT);
+            ctext(g, 602, url, 3, ACC_LT, 0);
+        }
+        ctext(g, H - 52, "L1 / R1  switch mode        Triangle  exit", 2, MUT, 0);
+        return;
+    }
+
+    int rows = (H - ly - 112) / rowH;
     int start = sel - rows / 2;
     if (start > n - rows) start = n - rows;
     if (start < 0) start = 0;
     int cur = httpd_chan_current();
     for (int r = 0; r < rows && start + r < n; r++) {
         int i = start + r, y = ly + r * rowH, on = (i == sel);
-        if (on) gfx_round_a(g, lx, y, lw, rowH - 6, 12, ACCENT, 235);
+        if (on) gfx_round_a(g, lx, y, lw, rowH - 6, 8, ACCENT, 235);
         if (!inChannels) {
             char nm[80]; httpd_chan_rail_name(i, nm, sizeof(nm));
-            gfx_text(g, lx + 20, y + (rowH - 6) / 2 - 12, nm, 3, on ? INK : TXT);
+            gfx_text(g, lx + 24, y + (rowH - 6) / 2 - 12, nm, 3, on ? INK : TXT);
             gfx_text(g, lx + lw - 40, y + (rowH - 6) / 2 - 8, ">", 2, on ? INK : FAINT);
         } else {
             int abs = httpd_chan_filter_abs(i);
             if (abs < 0) continue;
             char nm[96]; httpd_chan_get(abs, nm, sizeof(nm), NULL, 0);
-            int maxch = (lw - 190) / 24; if (maxch < 6) maxch = 6;
+            int maxch = (lw - 240) / 24; if (maxch < 6) maxch = 6;
             if ((int)strlen(nm) > maxch) nm[maxch] = 0;
             char num[8]; snprintf(num, sizeof(num), "%d", abs + 1);
-            gfx_text(g, lx + 18, y + (rowH - 6) / 2 - 8, num, 2, on ? INK : FAINT);
-            gfx_text(g, lx + 96, y + (rowH - 6) / 2 - 12, nm, 3, on ? INK : TXT);
-            if (httpd_chan_is_fav(abs))
-                gfx_text(g, lx + lw - 100, y + (rowH - 6) / 2 - 8, "FAV", 2, on ? INK : WARN);
-            if (abs == cur) gfx_circle(g, lx + lw - 28, y + (rowH - 6) / 2, 6, on ? INK : LIVE);
+            gfx_text(g, lx + 24, y + (rowH - 6) / 2 - 8, num, 2, on ? INK : FAINT);
+            gfx_text(g, lx + 118, y + (rowH - 6) / 2 - 12, nm, 3, on ? INK : TXT);
+            if (httpd_chan_is_fav(abs)) gfx_text(g, lx + lw - 142, y + 17, "FAV", 2, on ? INK : WARN);
+            if (abs == cur) {
+                gfx_circle(g, lx + lw - 50, y + (rowH - 6) / 2, 6, on ? INK : LIVE);
+                gfx_text(g, lx + lw - 36, y + 18, "LIVE", 1, on ? INK : LIVE);
+            }
         }
     }
-    if (n == 0) ctext_at(g, lx + lw / 2, ly + 50, "Empty", 3, MUT);
+    if (n == 0) ctext(g, ly + 70, "No channels in this bouquet", 3, MUT, 0);
 
     ctext(g, H - 56, inChannels
-        ? "Up/Down channel   Cross watch   Square favourite   Circle back   L2/R2 bouquet"
-        : "Up/Down bouquet   Cross open   L2/R2 bouquet", 2, MUT, 0);
+        ? "Up/Down channel   Cross watch   Square favourite   Circle bouquets   L2/R2 bouquet"
+        : "Up/Down bouquet   Cross open   L1/R1 switch mode", 2, MUT, 0);
 }
 
-static void draw_channel_overlay(Gfx *g, int sel) {
-    int n = httpd_chan_count();
-    if (n <= 0) return;
+// The playback guide reuses the same filtered selection as the Live TV home.
+// Browsing never tunes automatically; Cross is the single commit action.
+static void draw_channel_guide(Gfx *g, int sel, int railSel) {
+    int n = httpd_chan_filter_count();
+    if (n <= 0) {
+        int W = 800, H = 190, x = 56, y = (g->height - H) / 2;
+        panel(g, x, y, W, H, 12, INK, 232);
+        gtext(g, x + 34, y + 28, "Channel guide", 4, TXT, 0);
+        gfx_text(g, x + 34, y + 92, "No channels in this bouquet", 3, MUT);
+        gfx_text(g, x + 34, y + 146, "Left/Right bouquet   Circle close", 2, MUT);
+        return;
+    }
     int cur = httpd_chan_current();
-    if (sel < 0) sel = cur < 0 ? 0 : cur;
+    if (sel < 0) sel = 0;
     if (sel >= n) sel = n - 1;
 
-    int K = 9, rowH = 76, headH = 72, footH = 50;
+    int K = 9, rowH = 70, headH = 76, footH = 56;
     int shown = n < K ? n : K;
-    int W = 660, H = headH + shown * rowH + footH;
+    int W = 800, H = headH + shown * rowH + footH;
     int x = 56, y = (g->height - H) / 2;
-    panel(g, x, y, W, H, 24, INK, 226);
+    panel(g, x, y, W, H, 12, INK, 232);
 
-    // header: accent tick + title + count (+ current group, if any)
     gfx_round(g, x + 28, y + 26, 6, 28, 3, ACCENT);
-    gtext(g, x + 46, y + 24, "Channels", 3, TXT, 0);
+    gtext(g, x + 46, y + 22, "Channel guide", 4, TXT, 0);
     char cnt[24]; snprintf(cnt, sizeof(cnt), "%d", n);
+    char rail[80]; httpd_chan_rail_name(railSel, rail, sizeof(rail));
     gfx_text(g, x + W - 28 - gfx_text_w(cnt, 2), y + 30, cnt, 2, FAINT);
-    char grp[48]; httpd_chan_group(sel, grp, sizeof(grp));
-    if (grp[0]) {
-        int gw = gfx_text_w(grp, 2);
-        gfx_text(g, x + W - 28 - gfx_text_w(cnt, 2) - 26 - gw, y + 30, grp, 2, ACC_LT);
-    }
+    gfx_text(g, x + W - 60 - gfx_text_w(cnt, 2) - gfx_text_w(rail, 2), y + 30, rail, 2, ACC_LT);
     gfx_rect_a(g, x + 24, y + headH - 12, W - 48, 1, HAIR, 30);
 
     int start = sel - K / 2;
@@ -707,27 +661,44 @@ static void draw_channel_overlay(Gfx *g, int sel) {
     if (start < 0) start = 0;
 
     for (int r = 0; r < K && start + r < n; r++) {
-        int idx = start + r, rowY = y + headH + r * rowH;
+        int pos = start + r, idx = httpd_chan_filter_abs(pos), rowY = y + headH + r * rowH;
+        if (idx < 0) continue;
         int rx = x + 18, rw = W - 36;
-        int seld = (idx == sel);
-        gfx_round_a(g, rx, rowY + 6, rw, rowH - 12, 14, seld ? ACCENT : SURF, seld ? 240 : 130);
+        int seld = (pos == sel);
+        gfx_round_a(g, rx, rowY + 6, rw, rowH - 12, 8, seld ? ACCENT : SURF, seld ? 240 : 130);
 
         char name[96];
         httpd_chan_get(idx, name, sizeof(name), NULL, 0);
-        int maxch = (rw - 200) / 24; if (maxch < 4) maxch = 4;   // scale-3 name
+        int maxch = (rw - 230) / 24; if (maxch < 4) maxch = 4;
         if ((int)strlen(name) > maxch) name[maxch] = '\0';
 
         char num[8]; snprintf(num, sizeof(num), "%d", idx + 1);
         GfxColor numc = seld ? INK : FAINT, nc = seld ? INK : TXT;
         gfx_text(g, rx + 26, rowY + rowH / 2 - 4, num, 2, numc);
         gfx_text(g, rx + 104, rowY + rowH / 2 - 12, name, 3, nc);
-        if (idx == cur) {   // live marker on the tuned channel
-            int dx = rx + rw - 40;
+        if (idx == cur) {
+            int dx = rx + rw - 72;
             gfx_circle(g, dx, rowY + rowH / 2, 6, seld ? INK : LIVE);
             gfx_text(g, dx + 14, rowY + rowH / 2 - 8, "LIVE", 1, seld ? INK : LIVE);
         }
     }
-    gfx_text(g, x + 28, y + H - 34, "Up/Down channel   Left/Right group   Cross watch", 2, MUT);
+    gfx_text(g, x + 28, y + H - 36,
+             "Up/Down select   Left/Right bouquet   Cross watch   Circle close", 2, MUT);
+}
+
+static void draw_channel_banner(Gfx *g) {
+    int cur = httpd_chan_current();
+    if (cur < 0) return;
+    char name[96], grp[48];
+    if (!httpd_chan_get(cur, name, sizeof(name), NULL, 0)) return;
+    httpd_chan_group(cur, grp, sizeof(grp));
+    int x = 64, y = 64, w = 680, h = 108;
+    panel(g, x, y, w, h, 8, INK, 226);
+    gfx_round(g, x + 24, y + 22, 6, h - 44, 3, ACCENT);
+    gfx_text(g, x + 48, y + 22, name, 4, TXT);
+    gfx_text(g, x + 48, y + 72, grp[0] ? grp : "Live TV", 2, MUT);
+    gfx_circle(g, x + w - 70, y + h / 2, 7, LIVE);
+    gfx_text(g, x + w - 52, y + h / 2 - 8, "LIVE", 1, LIVE);
 }
 
 // Top-right stream telemetry, toggled by the touchpad. Plain shadowed text with
@@ -764,9 +735,14 @@ int main(void) {
         for (;;) {}
     }
 
-    // Clear both buffers up front so nothing shows garbage.
-    gfx_clear(&g, BG); gfx_present(&g, 0);
-    gfx_clear(&g, BG); gfx_present(&g, 1);
+    // Initialize every rotating scanout buffer before any partial overlay can
+    // touch it. Leaving the third triple-buffer surface undefined can flash old
+    // direct-memory contents during startup or the first playback transition.
+    int bootFrameID = 0;
+    for (int i = 0; i < GFX_BUFFER_COUNT; i++) {
+        gfx_clear(&g, BG);
+        gfx_present(&g, bootFrameID++);
+    }
 
     // Start the freeze watchdog (auto-recovers a frozen app instead of a reboot).
     g_heartbeat = sceKernelGetProcessTime();
@@ -776,7 +752,7 @@ int main(void) {
     scePthreadCreate(&wd, NULL, watchdog_main, NULL, "ps4cast_wd");
 
 #ifdef BOOT_MINIMAL
-    int frameID = 2;
+    int frameID = bootFrameID;
     for (;;) {
         draw_lobby(&g, "0.0.0.0", 0);
         text_centered(&g, 735, "Minimal build: graphics only, no network, no player.", 3, MUTED);
@@ -800,18 +776,17 @@ int main(void) {
         notify("PS4 Cast " APP_VER " ready  -  http://%s:%d", ip, PORT);
     }
 
-    char url[1024];
-    int frameID = 2;
+    char url[2048];
+    int frameID = bootFrameID;
     int everDrew = 0;
     int running = 1;
     uint64_t hudUntil = 0;
-    int navSel = -1;                  // highlighted channel in the zapper overlay
-    uint64_t chanUntil = 0;           // overlay visible until this time
-    uint64_t chanTuneAt = 0;          // pending tune time (settle-to-tune)
+    uint64_t channelBannerUntil = 0;  // compact feedback after trigger zapping
     int statsOn = 0;                  // touchpad-toggled stream stats overlay
     double netBps = 0;                // sampled download throughput (bytes/sec, smoothed)
     uint64_t rxT0 = 0, rxB0 = 0;      // throughput sampling anchor
     int fpsCount = 0, fpsVal = 0; uint64_t fpsT0 = 0;
+    unsigned fpsSeenGen = player_present_generation();
     char lastUrl[1024] = "";          // resume: track the currently playing URL
     int resumePending = 0;            // resume: seek to saved position once dur known
     uint64_t resumeDeadline = 0, lastResumeSave = 0;
@@ -822,7 +797,9 @@ int main(void) {
     uint64_t noUserSince = 0;         // first time we saw NO valid signed-in user (debounce)
     uint64_t scrubStart = 0, scrubStep = 0;   // continuous-scrub timing
     int homeSel = 0, railSel = 0, inChannels = 0;  // home browser: bouquet level -> channel level
-    int iptvMode = 0;                              // playback started from a bouquet (enables channel zap)
+    int guideOpen = 0;
+    HomeMode homeMode = home_mode_load();
+    PlaybackOrigin playbackOrigin = PLAYBACK_CAST;
     PadState pad;
     pad_init(&pad);
     sys_diag_update();                // prime the user/system snapshot before the loop reads it
@@ -843,36 +820,7 @@ int main(void) {
         if (userOk) noUserSince = 0;
         else if (noUserSince == 0) noUserSince = now;
 
-        // ---- TV-box channel zapper: D-pad Up/Down browse the loaded playlist ----
         int nch = httpd_chan_count();
-        if (nch > 0 && (pressed & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN))) {
-            if (navSel < 0 || now > chanUntil) {       // (re)open at the tuned channel
-                navSel = httpd_chan_current(); if (navSel < 0) navSel = 0;
-            } else if (pressed & ORBIS_PAD_BUTTON_UP) {
-                navSel = (navSel - 1 + nch) % nch;
-            } else {
-                navSel = (navSel + 1) % nch;
-            }
-            chanUntil = now + 6000000ULL;
-            chanTuneAt = now + 450000ULL;              // tune shortly after you settle
-            hudUntil = now + 5000000ULL;
-            pressed &= ~(ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN);  // don't also seek
-        }
-        // While the overlay is up, Left/Right jump between IPTV groups (fast
-        // navigation of big playlists); only then — otherwise they seek.
-        if (nch > 0 && now < chanUntil && (pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT))) {
-            if (navSel < 0) { navSel = httpd_chan_current(); if (navSel < 0) navSel = 0; }
-            navSel = chan_group_jump(navSel, (pressed & ORBIS_PAD_BUTTON_RIGHT) ? 1 : -1);
-            chanUntil = now + 6000000ULL;
-            chanTuneAt = now + 450000ULL;
-            hudUntil = now + 5000000ULL;
-            pressed &= ~(ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT);
-        }
-        // Cross while the overlay is up = watch the highlighted channel now.
-        if (nch > 0 && now < chanUntil && (pressed & ORBIS_PAD_BUTTON_CROSS)) {
-            chanTuneAt = now;
-            pressed &= ~(ORBIS_PAD_BUTTON_CROSS | ORBIS_PAD_BUTTON_OPTIONS);
-        }
         // Touchpad toggles the lightweight stream-stats overlay.
         if (pressed & ORBIS_PAD_BUTTON_TOUCH_PAD) statsOn = !statsOn;
 
@@ -923,110 +871,178 @@ int main(void) {
             }
         }
 
-        // Settle-to-tune: switch to the highlighted channel. Hold the current
-        // frame over the switch (no blank "Connecting" / home flash) — the old
-        // picture stays until the new channel produces its first frame.
-        if (chanTuneAt && now >= chanTuneAt) {
-            chanTuneAt = 0;
-            if (navSel >= 0 && navSel != httpd_chan_current()) {
-                char curl[1024];
-                if (httpd_chan_get(navSel, NULL, 0, curl, sizeof(curl))) {
-                    int wasPlaying = player_started() && everDrew;
-                    httpd_chan_set_current(navSel);
-                    int rc = player_play(curl);
-                    if (rc != 0 || !wasPlaying) everDrew = 0;   // only blank on first tune / failure
-                    hudUntil = now + 6000000ULL;
-                    chanUntil = now + 3500000ULL;
-                    reconnecting = 0; reconnects = 0;
-                }
+        // ---- idle mode switch + Live TV home browser --------------------------
+        if (!player_started() && pressed) {
+            if ((pressed & ORBIS_PAD_BUTTON_L1) && homeMode != HOME_CAST) {
+                homeMode = HOME_CAST; home_mode_save(homeMode);
             }
-        }
+            if ((pressed & ORBIS_PAD_BUTTON_R1) && homeMode != HOME_IPTV) {
+                homeMode = HOME_IPTV; home_mode_save(homeMode);
+            }
 
-        // ---- home browser: bouquets -> channels -------------------------------
-        if (!player_started() && httpd_chan_count() > 0 && pressed) {
-            if (!inChannels) {
-                int rn = httpd_chan_rail_count();
-                if (pressed & ORBIS_PAD_BUTTON_UP)   railSel = (railSel - 1 + rn) % rn;
-                if (pressed & ORBIS_PAD_BUTTON_DOWN) railSel = (railSel + 1) % rn;
-                if (pressed & ORBIS_PAD_BUTTON_CROSS) {
-                    httpd_chan_rail_select(railSel);
-                    inChannels = 1; homeSel = 0;
-                }
-            } else {
-                int shown = httpd_chan_filter_count();
-                if (shown > 0) {
-                    if (pressed & ORBIS_PAD_BUTTON_UP)   homeSel = (homeSel - 1 + shown) % shown;
-                    if (pressed & ORBIS_PAD_BUTTON_DOWN) homeSel = (homeSel + 1) % shown;
-                }
-                if (pressed & ORBIS_PAD_BUTTON_CIRCLE) { inChannels = 0; }
-                if (pressed & ORBIS_PAD_BUTTON_SQUARE) {
-                    int abs = httpd_chan_filter_abs(homeSel);
-                    if (abs >= 0) { httpd_chan_toggle_fav(abs);
-                        notify(httpd_chan_is_fav(abs) ? "Added to favourites" : "Removed from favourites"); }
-                }
-                if (pressed & ORBIS_PAD_BUTTON_CROSS) {
-                    int abs = httpd_chan_filter_abs(homeSel);
-                    char curl[1024];
-                    if (abs >= 0 && httpd_chan_get(abs, NULL, 0, curl, sizeof(curl))) {
-                        httpd_chan_set_current(abs);
-                        iptvMode = 1;              // playing FROM a bouquet
-                        player_play(curl);
-                        everDrew = 0; reconnecting = 0; reconnects = 0;
-                        hudUntil = now + 6000000ULL;
+            if (homeMode == HOME_IPTV && nch > 0) {
+                if (!inChannels) {
+                    int rn = httpd_chan_rail_count();
+                    if (pressed & ORBIS_PAD_BUTTON_UP)   railSel = (railSel - 1 + rn) % rn;
+                    if (pressed & ORBIS_PAD_BUTTON_DOWN) railSel = (railSel + 1) % rn;
+                    if (pressed & ORBIS_PAD_BUTTON_CROSS) {
+                        httpd_chan_rail_select(railSel);
+                        inChannels = 1; homeSel = 0;
+                    }
+                } else {
+                    int shown = httpd_chan_filter_count();
+                    if (shown > 0) {
+                        if (pressed & ORBIS_PAD_BUTTON_UP)   homeSel = (homeSel - 1 + shown) % shown;
+                        if (pressed & ORBIS_PAD_BUTTON_DOWN) homeSel = (homeSel + 1) % shown;
+                    }
+                    if (pressed & ORBIS_PAD_BUTTON_CIRCLE) inChannels = 0;
+                    if (pressed & ORBIS_PAD_BUTTON_SQUARE) {
+                        int abs = httpd_chan_filter_abs(homeSel);
+                        if (abs >= 0) {
+                            httpd_chan_toggle_fav(abs);
+                            notify(httpd_chan_is_fav(abs) ? "Added to favourites" : "Removed from favourites");
+                        }
+                    }
+                    if (pressed & ORBIS_PAD_BUTTON_CROSS) {
+                        int abs = httpd_chan_filter_abs(homeSel);
+                        char curl[1024];
+                        if (abs >= 0 && httpd_chan_get(abs, NULL, 0, curl, sizeof(curl))) {
+                            httpd_chan_set_current(abs);
+                            playbackOrigin = PLAYBACK_IPTV;
+                            guideOpen = 0;
+                            player_play(curl);
+                            everDrew = 0; reconnecting = 0; reconnects = 0;
+                            hudUntil = now + 5000000ULL;
+                        }
                     }
                 }
-            }
-            // L2/R2 step bouquets from either level.
-            if (pressed & (ORBIS_PAD_BUTTON_L2 | ORBIS_PAD_BUTTON_R2)) {
-                int rn = httpd_chan_rail_count();
-                railSel = (railSel + ((pressed & ORBIS_PAD_BUTTON_R2) ? 1 : rn - 1)) % rn;
-                httpd_chan_rail_select(railSel);
-                homeSel = 0;
-            }
-        }
-
-        // ---- IPTV mode: Up/Down zap channels within the open bouquet ----------
-        // Only when playback was started FROM a bouquet, so a cast video keeps
-        // Up/Down for scrubbing.
-        if (player_started() && iptvMode && pressed &&
-            (pressed & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN |
-                        ORBIS_PAD_BUTTON_L2 | ORBIS_PAD_BUTTON_R2))) {
-            if (pressed & (ORBIS_PAD_BUTTON_L2 | ORBIS_PAD_BUTTON_R2)) {
-                int rn = httpd_chan_rail_count();
-                railSel = (railSel + ((pressed & ORBIS_PAD_BUTTON_R2) ? 1 : rn - 1)) % rn;
-                httpd_chan_rail_select(railSel);
-                homeSel = 0;
-            } else {
-                int shown = httpd_chan_filter_count();
-                if (shown > 0) {
-                    homeSel = (homeSel + ((pressed & ORBIS_PAD_BUTTON_DOWN) ? 1 : shown - 1)) % shown;
+                // Triggers step bouquets while browsing, without changing modes.
+                if (pressed & (ORBIS_PAD_BUTTON_L2 | ORBIS_PAD_BUTTON_R2)) {
+                    int rn = httpd_chan_rail_count();
+                    railSel = (railSel + ((pressed & ORBIS_PAD_BUTTON_R2) ? 1 : rn - 1)) % rn;
+                    httpd_chan_rail_select(railSel);
+                    homeSel = 0;
                 }
             }
-            int abs = httpd_chan_filter_abs(homeSel);
-            char curl[1024];
-            if (abs >= 0 && httpd_chan_get(abs, NULL, 0, curl, sizeof(curl))) {
-                char nm[96]; httpd_chan_get(abs, nm, sizeof(nm), NULL, 0);
-                httpd_chan_set_current(abs);
-                player_play(curl);
-                notify("%s", nm);
-                everDrew = 0; reconnecting = 0; reconnects = 0;
-                hudUntil = now + 6000000ULL;
+        }
+
+        // ---- IPTV playback: one guide state + distinct quick-zap controls ------
+        int tuneAbs = -1;
+        if (player_started() && playbackOrigin == PLAYBACK_IPTV && nch > 0) {
+            if (!guideOpen && (pressed & ORBIS_PAD_BUTTON_DOWN)) {
+                guideOpen = 1;
+                {
+                    int p = chan_filtered_pos(httpd_chan_current());
+                    if (p < 0) {
+                        railSel = 0; httpd_chan_rail_select(railSel);
+                        p = chan_filtered_pos(httpd_chan_current());
+                    }
+                    homeSel = p >= 0 ? p : 0;
+                }
+                pressed &= ~ORBIS_PAD_BUTTON_DOWN;
+                hudUntil = 0;
+            }
+
+            if (guideOpen) {
+                int shown = httpd_chan_filter_count();
+                if (shown > 0) {
+                    if (pressed & ORBIS_PAD_BUTTON_UP) homeSel = (homeSel - 1 + shown) % shown;
+                    if (pressed & ORBIS_PAD_BUTTON_DOWN) homeSel = (homeSel + 1) % shown;
+                    if (pressed & ORBIS_PAD_BUTTON_L1) homeSel = (homeSel - 8 + shown * 8) % shown;
+                    if (pressed & ORBIS_PAD_BUTTON_R1) homeSel = (homeSel + 8) % shown;
+                }
+                if (pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT)) {
+                    int rn = httpd_chan_rail_count();
+                    railSel = (railSel + ((pressed & ORBIS_PAD_BUTTON_RIGHT) ? 1 : rn - 1)) % rn;
+                    httpd_chan_rail_select(railSel);
+                    homeSel = 0;
+                }
+                if (pressed & ORBIS_PAD_BUTTON_SQUARE) {
+                    int abs = httpd_chan_filter_abs(homeSel);
+                    if (abs >= 0) {
+                        httpd_chan_toggle_fav(abs);
+                        notify(httpd_chan_is_fav(abs) ? "Added to favourites" : "Removed from favourites");
+                    }
+                }
+                if (pressed & ORBIS_PAD_BUTTON_CROSS) {
+                    tuneAbs = httpd_chan_filter_abs(homeSel);
+                    guideOpen = 0;
+                }
+                if (pressed & ORBIS_PAD_BUTTON_CIRCLE) guideOpen = 0;
+                pressed &= ~(ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN |
+                             ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT |
+                             ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1 |
+                             ORBIS_PAD_BUTTON_SQUARE | ORBIS_PAD_BUTTON_CROSS |
+                             ORBIS_PAD_BUTTON_CIRCLE);
+            } else {
+                // Up is a non-destructive information peek. Down opened the guide.
+                if (pressed & ORBIS_PAD_BUTTON_UP) {
+                    channelBannerUntil = now + 3500000ULL;
+                    pressed &= ~ORBIS_PAD_BUTTON_UP;
+                }
+                // L1/R1: previous/next channel within the current bouquet.
+                if (pressed & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1)) {
+                    int shown = httpd_chan_filter_count();
+                    int pos = chan_filtered_pos(httpd_chan_current());
+                    if (shown <= 0 || pos < 0) {
+                        railSel = 0; httpd_chan_rail_select(railSel);
+                        shown = httpd_chan_filter_count(); pos = chan_filtered_pos(httpd_chan_current());
+                    }
+                    if (shown > 0) {
+                        if (pos < 0) pos = 0;
+                        homeSel = (pos + ((pressed & ORBIS_PAD_BUTTON_R1) ? 1 : shown - 1)) % shown;
+                        tuneAbs = httpd_chan_filter_abs(homeSel);
+                    }
+                    pressed &= ~(ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1);
+                }
+                // L2/R2: previous/next non-empty bouquet. It tunes one channel and
+                // shows only the compact banner, never the full guide.
+                if (pressed & (ORBIS_PAD_BUTTON_L2 | ORBIS_PAD_BUTTON_R2)) {
+                    int rn = httpd_chan_rail_count();
+                    int dir = (pressed & ORBIS_PAD_BUTTON_R2) ? 1 : -1;
+                    for (int tries = 0; tries < rn; tries++) {
+                        railSel = (railSel + (dir > 0 ? 1 : rn - 1)) % rn;
+                        httpd_chan_rail_select(railSel);
+                        if (httpd_chan_filter_count() > 0) {
+                            homeSel = 0; tuneAbs = httpd_chan_filter_abs(0); break;
+                        }
+                    }
+                    pressed &= ~(ORBIS_PAD_BUTTON_L2 | ORBIS_PAD_BUTTON_R2);
+                }
+            }
+
+            if (tuneAbs >= 0) {
+                if (tuneAbs != httpd_chan_current()) {
+                    char curl[1024];
+                    if (httpd_chan_get(tuneAbs, NULL, 0, curl, sizeof(curl))) {
+                        int wasPlaying = player_started() && everDrew;
+                        httpd_chan_set_current(tuneAbs);
+                        int rc = player_play(curl);
+                        if (rc != 0 || !wasPlaying) everDrew = 0;
+                        reconnecting = 0; reconnects = 0;
+                    }
+                }
+                channelBannerUntil = now + 3500000ULL;
+                hudUntil = 0;
             }
         }
 
-        // ---- continuous scrub -------------------------------------------------
+        // In casting mode Down only reveals/hides the lightweight HUD. A loaded
+        // IPTV playlist can never steal the cast transport controls.
+        if (player_started() && playbackOrigin == PLAYBACK_CAST &&
+            (pressed & ORBIS_PAD_BUTTON_DOWN)) {
+            hudUntil = now < hudUntil ? 0 : now + 5000000ULL;
+            pressed &= ~ORBIS_PAD_BUTTON_DOWN;
+        }
+
+        // ---- casting-mode continuous scrub -----------------------------------
         // Holding a seek button sweeps a preview target (accelerating for L1/R1,
-        // fine for the D-pad) and commits ONE seek on release. A quick tap is
-        // just a very short hold, so single presses still step as before.
-        if (player_started()) {
+        // fine for Left/Right) and commits ONE seek on release.
+        if (player_started() && playbackOrigin == PLAYBACK_CAST) {
             double sc = 0, sd = 0; player_progress(&sc, &sd);
             const uint32_t SEEKB = ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1 |
-                                   ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT |
-                                   ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN;
+                                   ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT;
             uint32_t hs = held & SEEKB;
-            // While the channel overlay is up the D-pad browses channels, so only
-            // the shoulder buttons scrub then.
-            if (nch > 0 && now < chanUntil) hs &= (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1);
             if (hs && sd > 0) {
                 if (!g_scrubActive) { g_scrubActive = 1; g_scrubTarget = sc; scrubStart = now; scrubStep = 0; }
                 if (now - scrubStep >= 90000ULL) {          // ~11 steps/sec
@@ -1034,11 +1050,9 @@ int main(void) {
                     double step;
                     if (hs & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1))
                         step = 15.0 + heldSec * 60.0;       // coarse, accelerates the longer you hold
-                    else if (hs & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN))
-                        step = 5.0;                          // medium
                     else
                         step = 1.0;                          // fine (Left/Right)
-                    if (hs & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_DOWN)) step = -step;
+                    if (hs & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_LEFT)) step = -step;
                     g_scrubTarget += step;
                     if (g_scrubTarget < 0) g_scrubTarget = 0;
                     if (g_scrubTarget > sd) g_scrubTarget = sd;
@@ -1055,20 +1069,22 @@ int main(void) {
         }
 
         if (player_started() && pressed) {
-            double cur = 0, dur = 0;
-            player_progress(&cur, &dur);
             hudUntil = sceKernelGetProcessTime() + 5000000ULL;
             if (pressed & (ORBIS_PAD_BUTTON_CROSS | ORBIS_PAD_BUTTON_OPTIONS)) {
                 player_pause(!player_is_paused());
                 hudUntil = sceKernelGetProcessTime() + 9000000ULL;
             }
-            // Relative so rapid presses ACCUMULATE. These used to seek from `cur`
-            // (g_curSec), which only updates once the decode thread applies the
-            // seek — so a second press before that recomputed the same target and
-            // did nothing. Tapping R1 three times now jumps +180s, not +60s.
-            if (pressed & ORBIS_PAD_BUTTON_SQUARE) { player_seek(0); notify("Restarted from the beginning"); }
+            if (pressed & ORBIS_PAD_BUTTON_SQUARE) {
+                if (playbackOrigin == PLAYBACK_IPTV && httpd_chan_current() >= 0) {
+                    int c = httpd_chan_current(); httpd_chan_toggle_fav(c);
+                    notify(httpd_chan_is_fav(c) ? "Added to favourites" : "Removed from favourites");
+                } else {
+                    player_seek(0); notify("Restarted from the beginning");
+                }
+            }
             if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
                 player_stop();
+                guideOpen = 0;
                 everDrew = 0; reconnecting = 0; reconnects = 0;
             }
         }
@@ -1090,10 +1106,14 @@ int main(void) {
         }
         if (httpd_take_stop_request()) {
             player_stop();
+            guideOpen = 0;
             everDrew = 0; reconnecting = 0; reconnects = 0;
         }
         if (httpd_take_play_request(url, sizeof(url))) {
-            iptvMode = 0;    // pushed from phone/DLNA -> D-pad scrubs, not zaps
+            playbackOrigin = PLAYBACK_CAST;
+            homeMode = HOME_CAST;
+            guideOpen = 0;
+            httpd_chan_set_current(-1);
             if (!userOk) {
                 notify("Sign in a PS4 user to cast");   // playing under ANONYMOUS crashes SceShellUI
             } else {
@@ -1105,7 +1125,20 @@ int main(void) {
                 hudUntil = sceKernelGetProcessTime() + 6000000ULL;
             }
         }
-        if (httpd_take_player_request(url, sizeof(url))) {
+        int playerRequestKind = httpd_take_player_request(url, sizeof(url));
+        if (playerRequestKind) {
+            playbackOrigin = playerRequestKind == 2 ? PLAYBACK_IPTV : PLAYBACK_CAST;
+            homeMode = playbackOrigin == PLAYBACK_IPTV ? HOME_IPTV : HOME_CAST;
+            guideOpen = 0;
+            if (playbackOrigin == PLAYBACK_IPTV) {
+                railSel = chan_rail_for_abs(httpd_chan_current());
+                httpd_chan_rail_select(railSel);
+                homeSel = chan_filtered_pos(httpd_chan_current());
+                if (homeSel < 0) homeSel = 0;
+                inChannels = 1;
+            } else {
+                httpd_chan_set_current(-1);
+            }
             if (!userOk) {
                 notify("Sign in a PS4 user to cast");
             } else {
@@ -1176,7 +1209,8 @@ int main(void) {
             int drew = player_render(&g);   // always pump frames while started
             if (drew) {
                 everDrew = 1;
-                fpsCount++;                 // count real presented video frames
+                unsigned shown = player_present_generation();
+                if (shown != fpsSeenGen) { fpsCount++; fpsSeenGen = shown; }
                 if (reconnecting) reconnecting = 0;          // recovered
                 if (healthySince == 0) healthySince = now;
                 else if (now - healthySince > 8000000ULL) reconnects = 0;  // stable -> reset budget
@@ -1205,18 +1239,21 @@ int main(void) {
                 gfx_round(&g, gx, gy, gw, gh, gh / 2, SURF2);
                 int fillw = gw * player_buffer_pct() / 100; if (fillw < 0) fillw = 0; if (fillw > gw) fillw = gw;
                 if (fillw > gh) gfx_round(&g, gx, gy, fillw, gh, gh / 2, ACCENT);
-                ctext(&g, py + 140, "Circle  Stop      Left  seek back", 2, MUT, 0);
+                ctext(&g, py + 140,
+                      playbackOrigin == PLAYBACK_IPTV ? "Circle  stop      Down  channel guide"
+                                                      : "Circle  stop      Left  seek back",
+                      2, MUT, 0);
                 hudUntil = sceKernelGetProcessTime() + 2000000ULL;  // keep HUD visible too
             }
 
-            // The channel overlay replaces the HUD while browsing (no clutter).
-            int overlay = (sceKernelGetProcessTime() < chanUntil && httpd_chan_count() > 0);
-            if (!overlay && (!everDrew || player_is_paused() || sceKernelGetProcessTime() < hudUntil)) {
-                draw_hud(&g);
+            // The guide replaces the HUD while browsing, so only one control
+            // surface is ever visible over playback.
+            if (!guideOpen && (!everDrew || player_is_paused() || sceKernelGetProcessTime() < hudUntil)) {
+                draw_hud(&g, playbackOrigin);
                 player_request_bar_clear();   // HUD scrubber/times sit on the bottom bar
             }
         } else if (!reconnecting) {
-            if (httpd_chan_count() > 0)
+            if (homeMode == HOME_IPTV)
                 draw_channel_home(&g, inChannels ? homeSel : railSel, railSel, inChannels, ip, net_ok);
             else
                 draw_lobby(&g, ip, net_ok);
@@ -1224,9 +1261,12 @@ int main(void) {
         }
         // (while reconnecting with no live player, the last frame is kept on screen)
 
-        // Channel zapper overlay sits on top of whatever is showing.
-        if (sceKernelGetProcessTime() < chanUntil && httpd_chan_count() > 0) {
-            draw_channel_overlay(&g, navSel);
+        if (guideOpen && player_started() && playbackOrigin == PLAYBACK_IPTV) {
+            draw_channel_guide(&g, homeSel, railSel);
+            player_request_bar_clear();
+        } else if (player_started() && playbackOrigin == PLAYBACK_IPTV &&
+                   sceKernelGetProcessTime() < channelBannerUntil) {
+            draw_channel_banner(&g);
             player_request_bar_clear();
         }
 

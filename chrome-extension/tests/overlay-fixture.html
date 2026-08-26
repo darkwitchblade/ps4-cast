@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Long-form video test</title>
+  <style>
+    html,body{height:100%;margin:0;background:#252b2f;color:#eef3ef;font-family:sans-serif}
+    main{height:100%;display:grid;place-items:center}.stage{width:82vw;aspect-ratio:16/9;background:#101316;display:grid;place-items:center}
+    video{width:100%;height:100%}.caption{position:fixed;left:24px;top:22px;font-size:18px}
+  </style>
+</head>
+<body>
+  <main><div class="stage"><video id="movie"></video></div></main><div class="caption">Fixture: playing iframe video</div>
+  <script>
+    const media=document.getElementById('movie');
+    Object.defineProperties(media,{paused:{value:false},ended:{value:false},readyState:{value:4},duration:{value:6267},currentTime:{value:48},currentSrc:{value:'https://media.example/master.m3u8'}});
+    window.chrome={runtime:{sendMessage:async(message)=>message.type==='CAST_BEST'?{ok:true,message:'Sent'}:{ok:true,overlay:true,count:1},onMessage:{addListener(){}}}};
+  </script>
+  <script src="../overlay.js"></script>
+  <script src="../content.js"></script>
+</body>
+</html>

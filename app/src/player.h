@@ -4,15 +4,25 @@
 
 #include "gfx.h"
 
+// The web UI uploads into a fixed app-owned file and queues this private URL.
+// Keeping the filesystem path out of HTTP input prevents arbitrary file reads.
+#define PLAYER_LOCAL_UPLOAD_URL  "ps4cast-local://upload"
+#define PLAYER_LOCAL_UPLOAD_PATH "/data/ps4cast_upload.bin"
+
 int  player_init(void);              // initialize playback backend; 0 ok
 int  player_play(const char *url);   // start streaming a URL/file; 0 ok
 void player_stop(void);              // stop current playback
 int  player_is_active(void);         // 1 while playback is active (post-buffer)
 int  player_started(void);           // 1 from Start until Stop (drives the pump)
 int  player_is_live(void);           // 1 if the current source is a live stream
+int  player_is_local(void);          // 1 while the uploaded local file is open
 int  player_render(Gfx *g);          // blit newest video frame to g; 1 if drawn
+unsigned player_present_generation(void); // changes once per newly shown video frame
 void player_request_bar_clear(void); // call when an overlay draws over the letterbox bars (prevents ghosting)
 const char *player_status(void);     // short human-readable status line
+const char *player_error_code(void); // stable web-UI error category, empty when clear
+const char *player_error_message(void); // actionable user-facing detail
+void player_clear_error(void);       // dismiss the current playback error
 void player_debug(char *out, int len); // live playback debug state (one line)
 
 // Transport controls (safe to call from the http thread: they set flags the

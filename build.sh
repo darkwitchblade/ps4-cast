@@ -6,6 +6,12 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export OO_PS4_TOOLCHAIN="$HERE/oo/OpenOrbis/PS4Toolchain"
+# PkgTool.Core is a self-contained .NET executable. macOS periodically removes
+# files from its default per-process extraction directory while the tool is
+# starting, producing a random "PkgTool.Core.dll does not exist" failure. Keep
+# its extraction cache in a stable ignored directory for reproducible builds.
+export DOTNET_BUNDLE_EXTRACT_BASE_DIR="$HERE/.dotnet-bundle"
+mkdir -p "$DOTNET_BUNDLE_EXTRACT_BASE_DIR"
 
 if [ ! -d "$OO_PS4_TOOLCHAIN" ]; then
     echo "Toolchain missing at $OO_PS4_TOOLCHAIN" >&2

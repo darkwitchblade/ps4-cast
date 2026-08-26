@@ -3,6 +3,7 @@ extern void watchdog_kick(void);
 extern const char *watchdog_note(const char *w);
 #include "httpsrc.h"
 #include "aseg.h"
+#include "hls_parse.h"
 #include "trace.h"
 
 #include <stdio.h>
@@ -15,30 +16,30 @@ extern const char *watchdog_note(const char *w);
 // httpsrc so ffmpeg's mpegts/mov demuxer sees one continuous byte stream. All
 // networking (http + https/BearSSL + redirects) is reused from httpsrc.
 
-#define HLS_MAX_SEGMENTS 8192
 #define PLAYLIST_CAP     (4 * 1024 * 1024)
 #define HLS_MEM_SEG_CAP  (16 * 1024 * 1024)
 #define HLS_PREFETCH_MAX 10          // deeper buffer: thin-margin live CDN streams need more segments ahead
 #define HLS_AUDIO_PREFETCH_SLOTS 3
 
-static char  **g_segs;            // resolved absolute segment URLs
-static int     g_segCount;
-// RFC 8216: #EXT-X-DISCONTINUITY marks a change in encoding/timestamps/track
-// layout. Segments after one must be decoded against fresh decoder + clock
-// state, otherwise stale references and timestamps corrupt playback. Flag the
-// segment that FOLLOWS the tag so the seg-demux path can bump the reset
-// generation exactly there.
-static unsigned char g_segDisc[HLS_MAX_SEGMENTS];
-static int     g_segDurMs[HLS_MAX_SEGMENTS]; // EXTINF duration for VOD seeking
-static int64_t g_totalDurMs;
-static int     g_pendDisc;        // next segment starts a discontinuity
+// Playlist state (segments, variants, live flags) lives in hls_parse.c's
+// HlsPlaylist so the pure parsing/selection code is host-testable. The macros
+// below keep every existing reference in this file unchanged.
+static HlsPlaylist g_pl;
+#define g_segs         g_pl.segs
+#define g_segCount     g_pl.segCount
+#define g_segDisc      g_pl.segDisc
+#define g_segDurMs     g_pl.segDurMs
+#define g_totalDurMs   g_pl.totalDurMs
+#define g_pendDisc     g_pl.pendDisc
+#define g_initSeg      g_pl.initSeg
+#define g_isLive       g_pl.isLive
+#define g_targetDurMs  g_pl.targetDurMs
+#define g_mediaSeq     g_pl.mediaSeq
+#define g_variants     g_pl.variants
 static int     g_segIdx;          // current segment being read
-static char   *g_initSeg;         // fMP4 init segment URL (EXT-X-MAP), or NULL
 static int     g_initPending;     // 1 = init segment still to be streamed first
 static char    g_mediaUrl[2048];  // current media playlist URL (for live refresh)
-static int     g_isLive;          // no EXT-X-ENDLIST: refresh playlist at the end
-static int     g_targetDurMs;     // EXT-X-TARGETDURATION for live refresh pacing
-static int     g_mediaSeq;        // EXT-X-MEDIA-SEQUENCE for sliding live windows
+#define g_variantCount g_pl.variantCount
 // Does the body we parsed actually belong to the URL we asked for?
 static volatile unsigned g_openGen = 0;   // bumped on every close/open
 // Retry traces fire ~3x/second and were evicting everything else from the ring
@@ -87,19 +88,20 @@ static int               g_memLen, g_memPos;
 static int               g_liveFetchFailStreak;
 static volatile uint64_t g_hlsRxBytes;   // total bytes fetched (video+audio), for the stats overlay
 static char              g_vLastUrl[96] = "";
+static char              g_segFail[96] = "";   // last VOD-segment open failure detail
+static int               g_forceAsegSeg = 0;   // httpsrc dead for this origin: serve via aseg
 static int               g_vLastRc, g_vLastBytes, g_vLastMs, g_vFailCount;
 static uint64_t          g_vOpenUs;
 
-// ABR: master-playlist variants. We rank by a software-decode-friendly score
-// (codec, resolution, bitrate, fps) — see variant_score — and downshift when the
-// buffer keeps draining.
-#define HLS_MAX_VARIANTS 24
-enum { VC_H264 = 0, VC_HEVC, VC_VP9, VC_AV1, VC_OTHER };
-typedef struct { int bw, height, fps, codec; char url[2048]; char agroup[64]; } HlsVariant;
-static HlsVariant g_variants[HLS_MAX_VARIANTS];
-static int        g_variantCount;
 static int        g_curVariant = -1;   // index into g_variants
 static int        g_sepAudio = 0;      // master has a separate audio rendition (EXT-X-MEDIA)
+static volatile int g_upshiftReq;
+static int        g_fastFetchStreak;
+static int        g_estBandwidth;
+static int        g_autoMaxHeight = 720;
+static int        g_requestedMaxHeight = 720;
+
+static int next_higher_variant(int current);
 
 // ---- separate audio rendition (EXT-X-MEDIA:TYPE=AUDIO) ---------------------
 // When present, the audio is its own playlist of audio-only segments. We parse
@@ -126,13 +128,6 @@ static int               g_aLastRc, g_aLastBytes, g_aLastMs, g_aFailCount;
 static const char *codec_name(int c) {
     return c == VC_H264 ? "avc" : c == VC_HEVC ? "hevc" : c == VC_VP9 ? "vp9" : c == VC_AV1 ? "av1" : "?";
 }
-static int codec_from_str(const char *codecs) {  // CODECS="avc1.x,mp4a.y"
-    if (strstr(codecs, "avc1") || strstr(codecs, "avc3") || strstr(codecs, "h264")) return VC_H264;
-    if (strstr(codecs, "hvc1") || strstr(codecs, "hev1") || strstr(codecs, "dvh"))  return VC_HEVC;
-    if (strstr(codecs, "vp09") || strstr(codecs, "vp9"))  return VC_VP9;
-    if (strstr(codecs, "av01"))                            return VC_AV1;
-    return VC_OTHER;
-}
 
 extern uint64_t sceKernelGetProcessTime(void); // microseconds, monotonic
 
@@ -142,19 +137,6 @@ static void short_url(const char *url, char *out, int cap) {
     const char *p = url;
     if (n >= cap) p = url + n - (cap - 1);
     snprintf(out, cap, "%s", p);
-}
-
-static void prefer_plain_s3(char *url, int cap) {
-    (void)cap;
-    if (!url) return;
-    if (strncmp(url, "https://", 8) != 0) return;
-    const char *slash = strchr(url + 8, '/');
-    int hostLen = slash ? (int)(slash - (url + 8)) : (int)strlen(url + 8);
-    if (hostLen <= 0) return;
-    if (strstr(url + 8, ".amazonaws.com") && strstr(url + 8, ".amazonaws.com") < url + 8 + hostLen) {
-        memmove(url + 7, url + 8, strlen(url + 8) + 1);
-        memcpy(url, "http://", 7);
-    }
 }
 
 static void configure_prefetch_depth(void) {
@@ -189,10 +171,11 @@ const char *hls_debug(void) {
             scePthreadMutexUnlock(&g_aprefMtx);
         }
         snprintf(b, sizeof(b),
-                 "hls v%d/%d %s %dp %dk%s%s seg=%d/%d pf=%d/%d vf=%dms/%dKB/rc%d/f%d af=%d/%d %dms/%dKB/rc%d/f%d st=%d[%s] reuse=%d hop=%d plen=%d p=%s VAR=%s SEG0=%s",
+                 "hls v%d/%d %s %dp %dk%s%s%s seg=%d/%d pf=%d/%d vf=%dms/%dKB/rc%d/f%d af=%d/%d %dms/%dKB/rc%d/f%d st=%d[%s] reuse=%d hop=%d plen=%d p=%s VAR=%s SEG0=%s",
                  g_curVariant + 1, g_variantCount, codec_name(v->codec), v->height,
                  v->bw / 1000, v->fps ? (v->fps > 30 ? "60" : "") : "",
-                 g_sepAudio ? " SEPAUDIO" : "", g_segIdx, g_segCount,
+                 g_sepAudio ? " SEPAUDIO" : "", g_initSeg ? " FMP4LOCK" : "",
+                 g_segIdx, g_segCount,
                  cached, g_prefUp ? g_prefDepth : 0,
                  g_vLastMs, g_vLastBytes / 1024, g_vLastRc, g_vFailCount,
                  acached, g_aprefUp ? HLS_AUDIO_PREFETCH_SLOTS : 0,
@@ -209,11 +192,12 @@ const char *hls_debug(void) {
             scePthreadMutexUnlock(&g_prefMtx);
         }
         snprintf(b, sizeof(b),
-                 "hls media%s seg=%d/%d pf=%d/%d vf=%dms/%dKB/rc%d/f%d url=%s",
+                 "hls media%s seg=%d/%d pf=%d/%d vf=%dms/%dKB/rc%d/f%d url=%s%s%s",
                  g_isLive ? " live" : "", g_segIdx, g_segCount,
                  cached, g_prefUp ? g_prefDepth : 0,
                  g_vLastMs, g_vLastBytes / 1024, g_vLastRc, g_vFailCount,
-                 g_vLastUrl);
+                 g_vLastUrl,
+                 g_segFail[0] ? " segfail=" : "", g_segFail);
         return b;
     }
     return g_dbg;   // pre-roll / errors
@@ -230,20 +214,35 @@ int hls_is_url(const char *url) {
 int hls_generation(void) { return g_segGen; }
 int hls_reset_generation(void) { return g_resetGen; }
 int hls_is_live(void) { return g_isLive; }
+int hls_is_fmp4(void) { return g_active && g_initSeg != NULL; }
 int hls_can_segment_demux(void) {
     // Segment-demux feeds TS (Annex-B) media playlists straight to the hardware
     // H.264 decoder. Enabled for BOTH live and VOD: the "VOD GPU-fault after ~30s"
     // that this used to be disabled for was actually the SceShellUI crash on an
     // ANONYMOUS user (CE-36329-3) — NOT a decode/GPU fault — and is fixed
-    // separately (user-guard + PowerTick). fMP4 (EXT-X-MAP) still stays on the
-    // generic software AVIO path; only TS playlists segment-demux.
+    // separately (user-guard + PowerTick). fMP4 (EXT-X-MAP) stays on the generic
+    // continuous AVIO/MOV demuxer; its H.264 packets may still use hardware decode.
     // Runtime escape hatch: POST /hwdecode disables HW globally (-> SW) without a
     // rebuild if a specific VOD stream ever misbehaves on HW.
     return g_active && !g_initSeg;
 }
+void hls_set_decode_cap(int max_height) {
+    if (max_height < 240) max_height = 240;
+    if (max_height > 1080) max_height = 1080;
+    g_requestedMaxHeight = max_height;
+    g_autoMaxHeight = max_height;
+}
 int hls_can_seek(void) {
     return g_active && !g_isLive && !g_initSeg && !g_sepAudio &&
            g_segCount > 0 && g_totalDurMs > 0;
+}
+
+// Live-FLAGGED playlists may still hold seekable VOD content ("fake-live":
+// movie CDNs omit EXT-X-ENDLIST so players cannot download the file). Allow a
+// segment-index seek clamped to the currently known window; on a genuine live
+// sliding window this simply clamps to the oldest retained segment.
+int hls_can_seek_clamped(void) {
+    return g_active && !g_initSeg && !g_sepAudio && g_segCount > 0;
 }
 double hls_duration(void) {
     return g_totalDurMs > 0 ? (double)g_totalDurMs / 1000.0 : 0.0;
@@ -266,14 +265,16 @@ int hls_buffer_pct(void) {
     return pct > 100 ? 100 : pct;
 }
 
+static void rstrip(char *s) {
+    int n = (int)strlen(s);
+    while (n > 0 && (s[n-1] == '\r' || s[n-1] == '\n' || s[n-1] == ' ' || s[n-1] == '\t'))
+        s[--n] = '\0';
+}
+
 static void free_segs(void) {
-    if (g_segs) {
-        for (int i = 0; i < g_segCount; i++) free(g_segs[i]);
-        free(g_segs);
-        g_segs = NULL;
-    }
-    free(g_initSeg); g_initSeg = NULL; g_mediaUrl[0] = '\0';
-    g_segCount = 0; g_segIdx = 0; g_totalDurMs = 0;
+    hlspl_free(&g_pl);
+    g_mediaUrl[0] = '\0';
+    g_segIdx = 0;
 }
 
 // free_asegs is defined alongside the audio path below.
@@ -364,6 +365,25 @@ static void *prefetch_main(void *arg) {
         g_vLastRc = rc; g_vLastMs = ms; g_vLastBytes = len;
         if (rc != 0) g_vFailCount++;
 
+        // Conventional ABR: start conservatively, then promote only after
+        // several complete segments prove enough sustained headroom for the
+        // next rendition. A single cache hit must never trigger an upshift.
+        if (rc == 0 && len > 0 && ms > 0 && seg >= 0 && seg < g_segCount &&
+            g_curVariant >= 0 && g_curVariant < g_variantCount) {
+            int sample = (int)(((uint64_t)len * 8ULL * 1000ULL) / (uint64_t)ms);
+            g_estBandwidth = g_estBandwidth > 0 ? (g_estBandwidth * 3 + sample) / 4 : sample;
+            int higher = next_higher_variant(g_curVariant);
+            int dur = g_segDurMs[seg] > 0 ? g_segDurMs[seg] : g_targetDurMs;
+            if (higher >= 0 && dur > 0 && ms * 4 < dur * 3 &&
+                (int64_t)g_estBandwidth * 10 > (int64_t)g_variants[higher].bw * 14) {
+                if (++g_fastFetchStreak >= 3) { g_upshiftReq = 1; g_fastFetchStreak = 0; }
+            } else {
+                g_fastFetchStreak = 0;
+            }
+        } else if (rc != 0) {
+            g_fastFetchStreak = 0;
+        }
+
         scePthreadMutexLock(&g_prefMtx);
         if (g_prefStop) {
             if (buf) free(buf);
@@ -425,6 +445,11 @@ void hls_set_external_segment_fetch(int on) {
 // the sole owner of g_segIdx while the prefetch cache is rebuilt.
 int hls_seek_time(double seconds, double *actual) {
     if (!hls_can_seek()) return -1;
+    return hls_seek_clamped(seconds, actual);
+}
+
+int hls_seek_clamped(double seconds, double *actual) {
+    if (!hls_can_seek_clamped()) return -1;
     if (seconds < 0) seconds = 0;
     if (seconds > hls_duration()) seconds = hls_duration();
 
@@ -691,36 +716,6 @@ void hls_close(void) {
     g_active = 0; g_segPos = 0; g_initPending = 0; g_externalSegFetch = 0;
 }
 
-// Resolve a possibly-relative URL `ref` against `base` into out[cap].
-static void resolve_url(const char *base, const char *ref, char *out, int cap) {
-    if (strncmp(ref, "http://", 7) == 0 || strncmp(ref, "https://", 8) == 0) {
-        snprintf(out, cap, "%s", ref);
-        prefer_plain_s3(out, cap);
-        return;
-    }
-    // scheme://host[:port]
-    const char *p = strstr(base, "://");
-    if (!p) { snprintf(out, cap, "%s", ref); return; }
-    p += 3;
-    const char *host_end = strchr(p, '/');
-    if (ref[0] == '/') {
-        // absolute path: scheme://host + ref
-        int hostlen = host_end ? (int)(host_end - base) : (int)strlen(base);
-        snprintf(out, cap, "%.*s%s", hostlen, base, ref);
-        prefer_plain_s3(out, cap);
-        return;
-    }
-    // relative path: base up to last '/'
-    const char *last = host_end;
-    for (const char *s = host_end; s && *s; s++) {
-        if (*s == '/') last = s;
-        if (*s == '?') break;
-    }
-    int dirlen = last ? (int)(last - base + 1) : (int)strlen(base);
-    snprintf(out, cap, "%.*s%s", dirlen, base, ref);
-    prefer_plain_s3(out, cap);
-}
-
 // Fetch an entire (small) resource into a malloc'd NUL-terminated buffer.
 // Last playlist-fetch failure detail. "hls fetch failed" alone was useless: the
 // same channel fetches fine one minute and fails the next, and the aseg return
@@ -732,7 +727,7 @@ static char *fetch_all(const char *url, int *outlen) {
     int len = 0;
     char fetchUrl[2048];
     snprintf(fetchUrl, sizeof(fetchUrl), "%s", url);
-    prefer_plain_s3(fetchUrl, sizeof(fetchUrl));
+    hlspl_prefer_plain_s3(fetchUrl, sizeof(fetchUrl));
     int frc = aseg_fetch(fetchUrl, &raw, &len);
     g_lastFetchRc = frc; g_lastFetchLen = len;
     if (frc != 0 || !raw || len <= 0 || len >= PLAYLIST_CAP) {
@@ -749,180 +744,20 @@ static char *fetch_all(const char *url, int *outlen) {
 }
 
 // Trim trailing CR/LF/space.
-static void rstrip(char *s) {
-    int n = (int)strlen(s);
-    while (n > 0 && (s[n-1] == '\r' || s[n-1] == '\n' || s[n-1] == ' ' || s[n-1] == '\t'))
-        s[--n] = '\0';
-}
-
-static int has_unsupported_hls_tags(const char *body) {
-    // Only reject ACTUAL encryption. "#EXT-X-KEY:METHOD=NONE" explicitly means the
-    // segments are NOT encrypted (RFC 8216 4.3.2.4) and is emitted by real
-    // broadcasters (e.g. DW), so treating any EXT-X-KEY as encrypted rejected
-    // perfectly playable streams. Scan each tag and only bail on a real METHOD.
-    for (const char *k = strstr(body, "#EXT-X-KEY"); k; k = strstr(k + 1, "#EXT-X-KEY")) {
-        const char *m = strstr(k, "METHOD=");
-        const char *eol = strchr(k, '\n');
-        if (!m || (eol && m > eol)) continue;               // malformed tag: ignore
-        if (strncmp(m + 7, "NONE", 4) == 0) continue;       // not encrypted
-        snprintf(g_dbg, sizeof(g_dbg), "hls encrypted unsupported");
-        return 1;
-    }
-    if (strstr(body, "#EXT-X-BYTERANGE")) { snprintf(g_dbg, sizeof(g_dbg), "hls byterange unsupported"); return 1; }
-    return 0;
-}
-
-// Parse a media playlist body into the segment list. base = playlist URL.
-static int parse_media(char *body, const char *base) {
-    if (has_unsupported_hls_tags(body)) return -2;
-    g_segs = malloc(sizeof(char *) * HLS_MAX_SEGMENTS);
-    if (!g_segs) return -1;
-    g_segCount = 0;
-    g_isLive = strstr(body, "#EXT-X-ENDLIST") ? 0 : 1;
-    g_targetDurMs = 3000;
-    g_mediaSeq = 0;
-    g_pendDisc = 0;
-    g_totalDurMs = 0;
-    int pendingDurMs = 0;
-
-    char resolved[2048];
-    char *save = NULL;
-    for (char *line = strtok_r(body, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-        rstrip(line);
-        if (line[0] == '\0') continue;
-        if (line[0] == '#') {
-            const char *td = strstr(line, "#EXT-X-TARGETDURATION:");
-            if (td) {
-                int s = atoi(td + 22);
-                if (s > 0 && s < 120) g_targetDurMs = s * 1000;
-            }
-            const char *ms = strstr(line, "#EXT-X-MEDIA-SEQUENCE:");
-            if (ms) g_mediaSeq = atoi(ms + 22);
-            const char *inf = strstr(line, "#EXTINF:");
-            if (inf) {
-                double sec = strtod(inf + 8, NULL);
-                if (sec > 0.0 && sec < 36000.0)
-                    pendingDurMs = (int)(sec * 1000.0 + 0.5);
-            }
-            if (strstr(line, "#EXT-X-DISCONTINUITY")) g_pendDisc = 1;
-            // fMP4 init segment.
-            const char *map = strstr(line, "#EXT-X-MAP:");
-            if (map) {
-                const char *uri = strstr(map, "URI=\"");
-                if (uri) {
-                    uri += 5;
-                    const char *end = strchr(uri, '"');
-                    if (end) {
-                        char raw[2048];
-                        int l = (int)(end - uri);
-                        if (l >= (int)sizeof(raw)) l = sizeof(raw) - 1;
-                        memcpy(raw, uri, l); raw[l] = '\0';
-                        resolve_url(base, raw, resolved, sizeof(resolved));
-                        free(g_initSeg);
-                        g_initSeg = strdup(resolved);
-                    }
-                }
-            }
-            continue;
-        }
-        if (g_segCount >= HLS_MAX_SEGMENTS) break;
-        resolve_url(base, line, resolved, sizeof(resolved));
-        g_segs[g_segCount] = strdup(resolved);
-        if (g_segs[g_segCount]) {
-            int dur = pendingDurMs > 0 ? pendingDurMs : g_targetDurMs;
-            g_segDisc[g_segCount] = (unsigned char)g_pendDisc;
-            g_segDurMs[g_segCount] = dur;
-            g_totalDurMs += dur;
-            g_pendDisc = 0;
-            pendingDurMs = 0;
-            g_segCount++;
-        }
-    }
-    return g_segCount > 0 ? 0 : -1;
-}
-
 static int g_downshiftReq = 0;   // set by the player when the buffer keeps draining
 
-// Parse all master-playlist variants (codec/res/bitrate/fps), sorted by bw.
-static int collect_variants(const char *body, const char *base) {
-    g_variantCount = 0;
-    const char *p = body;
-    while ((p = strstr(p, "#EXT-X-STREAM-INF")) != NULL && g_variantCount < HLS_MAX_VARIANTS) {
-        const char *eol = strchr(p, '\n'); if (!eol) eol = p + strlen(p);
-        int bw = 0, height = 0, fps = 0, codec = VC_OTHER;
-        const char *bwp = strstr(p, "BANDWIDTH="); if (bwp && bwp < eol) bw = atoi(bwp + 10);
-        const char *rp = strstr(p, "RESOLUTION="); if (rp && rp < eol) { const char *x = strchr(rp, 'x'); if (x) height = atoi(x + 1); }
-        const char *fp = strstr(p, "FRAME-RATE="); if (fp && fp < eol) fps = atoi(fp + 11);
-        const char *cp = strstr(p, "CODECS=\"");
-        if (cp && cp < eol) { char cbuf[128]; const char *cs = cp + 8; const char *ce = strchr(cs, '"');
-            int cl = ce ? (int)(ce - cs) : 0; if (cl > 0 && cl < (int)sizeof(cbuf)) { memcpy(cbuf, cs, cl); cbuf[cl] = '\0'; codec = codec_from_str(cbuf); } }
-        char agroup[64] = "";
-        const char *ap = strstr(p, "AUDIO=\"");
-        if (ap && ap < eol) { const char *as = ap + 7; const char *ae = strchr(as, '"');
-            int al = ae ? (int)(ae - as) : 0; if (al > 0 && al < (int)sizeof(agroup)) { memcpy(agroup, as, al); agroup[al] = '\0'; } }
-        const char *nl = eol;
-        while (nl) {
-            const char *ls = nl + 1; const char *le = strchr(ls, '\n');
-            int llen = le ? (int)(le - ls) : (int)strlen(ls);
-            while (llen > 0 && (ls[llen-1] == '\r' || ls[llen-1] == ' ')) llen--;
-            if (llen > 0 && ls[0] != '#') {
-                char ref[2048]; int l = llen < (int)sizeof(ref) ? llen : (int)sizeof(ref) - 1;
-                memcpy(ref, ls, l); ref[l] = '\0';
-                resolve_url(base, ref, g_variants[g_variantCount].url, sizeof(g_variants[0].url));
-                g_variants[g_variantCount].bw = bw; g_variants[g_variantCount].height = height;
-                g_variants[g_variantCount].fps = fps; g_variants[g_variantCount].codec = codec;
-                strncpy(g_variants[g_variantCount].agroup, agroup, sizeof(g_variants[0].agroup) - 1);
-                g_variants[g_variantCount].agroup[sizeof(g_variants[0].agroup) - 1] = '\0';
-                g_variantCount++;
-                break;
-            }
-            nl = le;
-        }
-        p += 17;
-    }
-    for (int i = 1; i < g_variantCount; i++) {     // insertion sort by bandwidth
-        HlsVariant v = g_variants[i]; int j = i - 1;
-        while (j >= 0 && g_variants[j].bw > v.bw) { g_variants[j+1] = g_variants[j]; j--; }
-        g_variants[j+1] = v;
-    }
-    return g_variantCount;
-}
-
-// Variant score (lower = better) now that H.264 hardware decode is solid.
-// Prefer H.264 up to 1080p, avoid 4K/HEVC/VP9/AV1, and keep 60fps as a
-// cautious opt-in unless it is the only good option.
-static int variant_score(const HlsVariant *v) {
-    int s = 0;
-    switch (v->codec) {                         // codec is the dominant factor
-        case VC_H264:  s += 0;        break;
-        case VC_HEVC:  s += 700000;   break;
-        case VC_VP9:   s += 800000;   break;
-        case VC_AV1:   s += 1000000;  break;
-        default:       s += 250000;   break;    // unknown: cautious penalty
-    }
-    if (v->height > 1080)      s += 3000000;     // 4K+: reject unless no alternative
-    else if (v->height <= 0)   s += 20000;
-    else                       s += (1080 - v->height) / 4; // prefer 1080 over 720/360
-    if (v->bw > 12000000)      s += (v->bw - 12000000) / 100;
-    if (v->fps > 30)           s += 25000;       // 50/60fps is harder to present
-    // tie-break: prefer quality up to ~10Mbps for H.264 1080p
-    int q = v->bw < 10000000 ? v->bw : 10000000;
-    s += (10000000 - q) / 100000;
-    return s;
-}
-
-// Best-scoring variant; if maxBw>0, only consider variants strictly below it
-// (used for stepping down). Returns index, or -1 if none.
-static int pick_best(int maxBw) {
-    int best = -1, bestScore = 0x7fffffff;
+static int next_higher_variant(int current) {
+    if (current < 0 || current >= g_variantCount) return -1;
+    if (g_initSeg) return -1;
+    int next = -1;
     for (int i = 0; i < g_variantCount; i++) {
-        if (maxBw > 0 && g_variants[i].bw >= maxBw) continue;
-        int sc = variant_score(&g_variants[i]);
-        if (sc < bestScore) { bestScore = sc; best = i; }
+        HlsVariant *v = &g_variants[i];
+        if (v->codec != g_variants[current].codec || v->height > g_autoMaxHeight ||
+            v->bw <= g_variants[current].bw) continue;
+        if (next < 0 || v->bw < g_variants[next].bw) next = i;
     }
-    return best;
+    return next;
 }
-static int pick_start_variant(void) { int b = pick_best(0); return b < 0 ? 0 : b; }
 
 // Extract a quoted attribute value (KEY="value") from a single playlist line.
 // Returns 1 and fills out[] if found, else 0.
@@ -965,7 +800,7 @@ static int find_audio_uri(const char *body, const char *base, const char *group,
         if (rank > bestRank) { bestRank = rank; strncpy(bestUri, uri, sizeof(bestUri) - 1); bestUri[sizeof(bestUri)-1] = '\0'; }
     }
     if (bestRank < 0) return -1;
-    resolve_url(base, bestUri, out, cap);
+    hlspl_resolve_url(base, bestUri, out, cap);
     return 0;
 }
 
@@ -987,14 +822,14 @@ static int parse_audio_segs(char *body, const char *base) {
             if (map) {
                 char raw[2048];
                 if (attr_quoted(map, "URI=", raw, sizeof(raw))) {
-                    resolve_url(base, raw, resolved, sizeof(resolved));
+                    hlspl_resolve_url(base, raw, resolved, sizeof(resolved));
                     free(g_aInit); g_aInit = strdup(resolved);
                 }
             }
             continue;
         }
         if (g_asegCount >= HLS_MAX_SEGMENTS) break;
-        resolve_url(base, line, resolved, sizeof(resolved));
+        hlspl_resolve_url(base, line, resolved, sizeof(resolved));
         g_asegs[g_asegCount] = strdup(resolved);
         if (g_asegs[g_asegCount]) g_asegCount++;
     }
@@ -1049,7 +884,7 @@ static int load_variant(int idx) {
     watchdog_note("lv/free-segs");
     free_segs();
     watchdog_note("lv/parse");
-    if (parse_media(body, mediaUrl) != 0) { free(body); watchdog_note("lv/done"); return -1; }
+    if (hlspl_parse_media(&g_pl, body, mediaUrl) != 0) { free(body); watchdog_note("lv/done"); return -1; }
     watchdog_note("lv/done");
     strncpy(g_mediaUrl, mediaUrl, sizeof(g_mediaUrl) - 1);
     g_mediaUrl[sizeof(g_mediaUrl) - 1] = '\0';
@@ -1066,7 +901,9 @@ static int load_variant(int idx) {
 }
 
 // Request a one-step bitrate downshift (applied at the next segment boundary).
-void hls_request_downshift(void) { g_downshiftReq = 1; }
+void hls_request_downshift(void) {
+    if (!g_initSeg) g_downshiftReq = 1;
+}
 
 int hls_open(const char *url) {
     aseg_set_playlist_budget(1);   // small fetches: fail fast so a dead channel can't block the switch
@@ -1074,15 +911,21 @@ int hls_open(const char *url) {
     hls_close();                   // raises abort + joins the prefetch threads
     g_externalSegFetch = 0;
     aseg_resume();                 // ...so resume only AFTER they are gone, never before
+    aseg_clear_error();            // do not report a previous channel's HTTP failure
     watchdog_note("open/master");
     trace_mark("hls open gen=%u self=%p %s", g_openGen, (void *)scePthreadSelf(), url);
-    g_variantCount = 0; g_curVariant = -1; g_downshiftReq = 0; g_sepAudio = 0;
+    g_variantCount = 0; g_curVariant = -1; g_downshiftReq = 0; g_upshiftReq = 0;
+    g_fastFetchStreak = 0; g_estBandwidth = 0; g_autoMaxHeight = g_requestedMaxHeight; g_sepAudio = 0;
     g_vLastRc = g_vLastBytes = g_vLastMs = g_vFailCount = 0; g_vLastUrl[0] = '\0';
+    g_segFail[0] = '\0'; g_forceAsegSeg = 0;
     g_aLastRc = g_aLastBytes = g_aLastMs = g_aFailCount = 0; g_aLastUrl[0] = '\0';
 
     int len = 0;
     char *body = fetch_all(url, &len);
-    if (!body) { snprintf(g_dbg, sizeof(g_dbg), "hls fetch failed rc=%d len=%d", g_lastFetchRc, g_lastFetchLen);
+    if (!body) { snprintf(g_dbg, sizeof(g_dbg),
+                          "hls fetch failed rc=%d len=%d st=%d[%s] at=%s %s",
+                          g_lastFetchRc, g_lastFetchLen, aseg_last_status(),
+                          aseg_last_line(), aseg_bad_stage(), aseg_native_debug());
                  { aseg_set_playlist_budget(0); return -1; } }
     if (strstr(body, "#EXTM3U") == NULL) {
         snprintf(g_dbg, sizeof(g_dbg), "not a playlist");
@@ -1095,18 +938,34 @@ int hls_open(const char *url) {
         // so such streams would play silently. Flag it for telemetry.
         g_sepAudio = (strstr(body, "TYPE=AUDIO") != NULL && strstr(body, "URI=") != NULL);
         watchdog_note("open/variants");
-        collect_variants(body, url);
+        hlspl_collect_variants(&g_pl, body, url);
         if (g_variantCount == 0) { free(body); snprintf(g_dbg, sizeof(g_dbg), "no variant"); { aseg_set_playlist_budget(0); return -3; } }
         g_segIdx = 0;
         watchdog_note("open/load-variant");
-        if (load_variant(pick_start_variant()) != 0) { free(body); snprintf(g_dbg, sizeof(g_dbg), "variant fetch failed"); { aseg_set_playlist_budget(0); return -4; } }
+        if (load_variant(hlspl_pick_start_variant(&g_pl)) != 0) {
+            free(body);
+            snprintf(g_dbg, sizeof(g_dbg), "variant fetch failed st=%d[%s] at=%s %s",
+                     aseg_last_status(), aseg_last_line(), aseg_bad_stage(),
+                     aseg_native_debug());
+            { aseg_set_playlist_budget(0); return -4; }
+        }
+        if (g_initSeg) {
+            int fixedVariant = hlspl_pick_fmp4_start_variant(&g_pl, g_autoMaxHeight);
+            if (fixedVariant >= 0 && fixedVariant != g_curVariant &&
+                load_variant(fixedVariant) != 0) {
+                free(body);
+                snprintf(g_dbg, sizeof(g_dbg), "fmp4 fixed variant fetch failed st=%d[%s] at=%s",
+                         aseg_last_status(), aseg_last_line(), aseg_bad_stage());
+                { aseg_set_playlist_budget(0); return -4; }
+            }
+        }
         // Separate audio rendition: set up the parallel audio segment list now,
         // while we still hold the master body (needs the chosen variant's group).
         watchdog_note("open/audio-rend");
         if (g_sepAudio) setup_audio_rendition(body, url);
         free(body);
     } else {
-        if (parse_media(body, url) != 0) { snprintf(g_dbg, sizeof(g_dbg), "no segments"); free(body); hls_close(); { aseg_set_playlist_budget(0); return -5; } }
+        if (hlspl_parse_media(&g_pl, body, url) != 0) { snprintf(g_dbg, sizeof(g_dbg), "no segments"); free(body); hls_close(); { aseg_set_playlist_budget(0); return -5; } }
         strncpy(g_mediaUrl, url, sizeof(g_mediaUrl) - 1);
         g_mediaUrl[sizeof(g_mediaUrl) - 1] = '\0';
         free(body);
@@ -1150,7 +1009,7 @@ static int refresh_live_playlist(void) {
     int nextSeq = g_mediaSeq + g_segIdx;
     prefetch_stop();
     free_segs();
-    int rc = parse_media(body, mediaUrl);
+    int rc = hlspl_parse_media(&g_pl, body, mediaUrl);
     strncpy(g_mediaUrl, mediaUrl, sizeof(g_mediaUrl) - 1);
     g_mediaUrl[sizeof(g_mediaUrl) - 1] = '\0';
     free(body);
@@ -1197,15 +1056,32 @@ static int ensure_segment(void) {
         return -2;
     }
     short_url(u, g_vLastUrl, sizeof(g_vLastUrl));
-    int orc = httpsrc_open(u);
-    g_vLastRc = orc;
-    if (orc != 0) { g_vFailCount++; return -1; }
-    g_vLastBytes = 0;
-    g_vLastMs = 0;
-    g_vOpenUs = sceKernelGetProcessTime();
-    g_open = 1;
-    g_segPos = 0;
-    return 0;
+    if (!g_forceAsegSeg) {
+        int orc = httpsrc_open(u);
+        g_vLastRc = orc;
+        if (orc == 0) {
+            g_vLastBytes = 0;
+            g_vLastMs = 0;
+            g_open = 1;
+            g_segPos = 0;
+            return 0;
+        }
+        // Surface WHY the ranged reader refused this origin — previously this
+        // failed silently and surfaced only as a generic FFmpeg "format" error.
+        snprintf(g_segFail, sizeof(g_segFail), "%s", httpsrc_debug());
+        trace_mark("hls vseg open fail idx=%d rc=%d [%s]", g_segIdx, orc, g_segFail);
+    }
+    // Fallback: fetch the whole segment through aseg, whose native SceHttp
+    // fallback already proved it can reach origins that stall BearSSL. Served
+    // from memory exactly like a live segment. Once one segment succeeds this
+    // way, skip the (dead) httpsrc attempt for the rest of the stream.
+    if (open_mem_segment(u, g_segIdx) == 0) {
+        g_forceAsegSeg = 1;
+        return 0;
+    }
+    snprintf(g_segFail, sizeof(g_segFail), "aseg fallback also failed");
+    g_vFailCount++;
+    return -1;
 }
 
 int hls_read(uint8_t *buf, uint32_t len) {
@@ -1278,10 +1154,21 @@ int hls_read(uint8_t *buf, uint32_t len) {
             // the best-scoring variant with lower bitrate (keeps codec preference).
             if (g_downshiftReq && g_curVariant >= 0) {
                 g_downshiftReq = 0;
-                int lower = pick_best(g_variants[g_curVariant].bw);
+                g_upshiftReq = 0; g_fastFetchStreak = 0;
+                int lower = hlspl_pick_best(&g_pl, g_variants[g_curVariant].bw);
                 if (lower >= 0 && lower != g_curVariant) {
                     prefetch_stop();
+                    aseg_resume();
                     load_variant(lower);
+                    prefetch_start();
+                }
+            } else if (g_upshiftReq && g_curVariant >= 0) {
+                g_upshiftReq = 0;
+                int higher = next_higher_variant(g_curVariant);
+                if (higher >= 0) {
+                    prefetch_stop();
+                    aseg_resume();
+                    load_variant(higher);
                     prefetch_start();
                 }
             }
@@ -1347,6 +1234,7 @@ int hls_next_segment(uint8_t **outBuf, int *outLen, int *outResetGen) {
                 trace_mark("hls discontinuity at seg=%d -> reset=%d", seg, g_resetGen);
             }
             trace_mark("hls segdemux take next_idx=%d/%d gen=%d reset=%d", g_segIdx, g_segCount, g_segGen, g_resetGen);
+            stall0 = 0;                 // progress
             return 0;
         }
 
@@ -1357,7 +1245,21 @@ int hls_next_segment(uint8_t **outBuf, int *outLen, int *outResetGen) {
             g_memSeg = -1;
         }
         if (g_liveFetchFailStreak >= 2) refresh_live_playlist();
-        trace_mark("hls segdemux retry idx=%d/%d streak=%d", g_segIdx, g_segCount, g_liveFetchFailStreak);
+        if (RETRY_TRACE)
+            trace_mark("hls segdemux retry idx=%d/%d streak=%d", g_segIdx, g_segCount, g_liveFetchFailStreak);
+        // Give up on a channel whose SEGMENTS keep failing. The deadline used to
+        // sit only in the "ran out of segments" branch above, but a dead channel
+        // has plenty of segments -- they just 400 -- so it fell through to here and
+        // retried forever, parking the main thread inside avformat_find_stream_info
+        // and freezing every later channel change (measured: still stuck at 60s).
+        {   uint64_t now = sceKernelGetProcessTime();
+            if (!stall0) stall0 = now;
+            else if (now - stall0 > HLS_READ_STALL_US) {
+                trace_mark("hls segdemux give up after %llums idx=%d/%d streak=%d",
+                           (unsigned long long)((now - stall0) / 1000),
+                           g_segIdx, g_segCount, g_liveFetchFailStreak);
+                return -1;
+            } }
         sceKernelUsleep(300 * 1000);
     }
 }

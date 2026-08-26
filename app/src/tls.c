@@ -129,6 +129,7 @@ static int ll_read(void *ctx, unsigned char *buf, size_t len) {
         return n;
     }
     uint64_t t0 = sceKernelGetProcessTime();
+    int spins = 0;
     for (;;) {
         int n = sceNetRecv(t->sock, buf, len, 0);
         if (n > 0) return n;
@@ -136,7 +137,10 @@ static int ll_read(void *ctx, unsigned char *buf, size_t len) {
         uint64_t now = sceKernelGetProcessTime();
         if (now > t->rdDeadline || now - t0 > 4ULL * 1000 * 1000) return -1;
         watchdog_kick();
-        sceKernelUsleep(3000);
+        // See aseg.c: spin briefly before sleeping. BearSSL reassembles a record
+        // over many small reads, so a flat sleep here costs real throughput.
+        if (spins < 64) { spins++; sceKernelUsleep(200); }
+        else sceKernelUsleep(2000);
     }
 }
 static int ll_write(void *ctx, const unsigned char *buf, size_t len) {

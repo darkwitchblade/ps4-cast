@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Cast to PS4</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="brand"><span class="receiver-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>Cast to PS4</span></div>
+    <span class="connection" id="connection"><i></i><span>Not checked</span></span>
+  </header>
+
+  <main>
+    <section class="receiver">
+      <label for="receiver">Receiver</label>
+      <div class="receiver-row">
+        <input id="receiver" spellcheck="false" inputmode="url" placeholder="192.168.1.4:8080 or the TV URL with ?t=">
+        <button class="icon-button" id="test" type="button" title="Test receiver" aria-label="Test receiver">↻</button>
+      </div>
+    </section>
+
+    <section class="playing" aria-labelledby="playing-title">
+      <div class="section-head"><h1 id="playing-title">Playing now</h1><span id="sourceCount"></span></div>
+      <div id="sources" class="sources" aria-live="polite"></div>
+    </section>
+
+    <label class="overlay-setting"><input id="overlay" type="checkbox"><span>Show Cast button over playing video</span></label>
+    <p class="privacy">Media travels directly from its source to the PS4. Browser cookies and authorization are never sent.</p>
+    <div class="notice" id="notice" hidden></div>
+  </main>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

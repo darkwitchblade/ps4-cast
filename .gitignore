@@ -19,3 +19,24 @@ third_party/DirectPackageInstaller/
 dist/*.mp4
 portlibs/src/ffmpeg-6.1.6/
 portlibs/ffmpeg-611-known-good/
+__pycache__/
+*.pyc
+.devtools/
+.dotnet-bundle/
+.ps4-wake.credentials.json
+.ps4-wake.paired
+.chiaki-remote.paired
+.chiaki-account-id
+# large external trees (fetched by portlibs/fetch.sh + scripts/fetch-toolchain.sh)
+portlibs/src/
+portlibs/bearssl/
+portlibs/ffmpeg/
+portlibs/ffmpeg-611-known-good/
+portlibs/mbedtls-3.6.2/
+oo/
+toolchain/
+toolchain-llvm*.tar.gz
+.DS_Store
+tests/host/test_*
+tests/host/*.dSYM
+.impeccable.md

@@ -34,6 +34,9 @@ def main() -> int:
         print(f"payload POST -> HTTP {exc.code}")
         print(exc.read().decode("utf-8", "replace"))
         return 1
+    except urllib.error.URLError as exc:
+        print(f"payload POST failed: {exc.reason}")
+        return 1
 
 
 if __name__ == "__main__":

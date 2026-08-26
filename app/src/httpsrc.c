@@ -1,4 +1,5 @@
 #include "httpsrc.h"
+#include "urlopt.h"
 #include "tls.h"
 
 extern void watchdog_kick(void);
@@ -347,28 +348,33 @@ static int request_from_ex(uint64_t pos, int *status, int64_t *total, char *loc,
     // Do not send Range on the initial byte-0 open. Some HTTPS CDNs accept the
     // 206 header then deliver zero body bytes on a first ranged request; a plain
     // GET is the most compatible start. Real seeks still send Range below.
+    const char *xh = urlopt_headers();
+    const char *ua = strstr(xh, "User-Agent:") ? "" : "User-Agent: PS4Cast/1.0\r\n";
     int n;
     if (pos == 0) {
         n = snprintf(req, sizeof(req),
             "GET %s HTTP/1.1\r\n"
             "Host: %s\r\n"
-            "User-Agent: PS4Cast/1.0\r\n"
+            "%s%s"
             "Accept: */*\r\n"
             "Accept-Encoding: identity\r\n"
             "Connection: keep-alive\r\n"
             "\r\n",
-            g_path, g_host);
+            g_path, g_host, xh, ua);
     } else {
         n = snprintf(req, sizeof(req),
             "GET %s HTTP/1.1\r\n"
             "Host: %s\r\n"
-            "User-Agent: PS4Cast/1.0\r\n"
+            "%s%s"
             "Accept: */*\r\n"
             "Accept-Encoding: identity\r\n"
             "Range: bytes=%llu-\r\n"
             "Connection: keep-alive\r\n"
             "\r\n",
-            g_path, g_host, (unsigned long long)pos);
+            g_path, g_host, xh, ua, (unsigned long long)pos);
+    }
+    if (n <= 0 || n >= (int)sizeof(req)) {
+        conn_close(); snprintf(g_dbg, sizeof(g_dbg), "request headers too large"); return -3;
     }
     if (conn_write((const uint8_t *)req, n) != 0) {
         int te = g_tls ? tls_last_error(g_tls) : 0;

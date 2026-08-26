@@ -19,7 +19,7 @@
 // into a third buffer while the previous one is still scanning out, instead of
 // blocking on each flip. The v03.12 HW-decoder soak exonerated this as the
 // CE-36329-3 root cause, so restore it for smoother 40/50/60fps presentation.
-#define GFX_BUFFERS 3
+#define GFX_BUFFERS GFX_BUFFER_COUNT
 
 // Set in gfx_init; used by gfx_emergency_release to tear down the display/GPU
 // context on a fatal exit so the process stays reclaimable (not unkillable).
@@ -39,6 +39,8 @@ int gfx_init(Gfx *g, int width, int height) {
     g->depth  = 4;
     g->frameBufferSize = width * height * g->depth;
     g->activeIdx = 0;
+    for (int i = 0; i < GFX_BUFFERS; i++)
+        g->lastSubmitted[i] = -1;
 
     g->video = sceVideoOutOpen(ORBIS_VIDEO_USER_MAIN, ORBIS_VIDEO_OUT_BUS_MAIN, 0, 0);
     if (g->video < 0)
@@ -120,29 +122,34 @@ void gfx_present(Gfx *g, int frameID) {
     // as a display fault and fail-closed instead of continuing blind.
     int rc = sceVideoOutSubmitFlip(g->video, g->activeIdx, ORBIS_VIDEO_OUT_FLIP_VSYNC, frameID);
     if (rc < 0) gfx_fatal("submitflip", rc);   // negative = SCE error: display rejected the flip
+    g->lastSubmitted[g->activeIdx] = frameID;
     // Signal a clean GPU frame boundary every frame. Without this the system can
     // never find a quiesced point to suspend the app, so closing it from the menu
     // hits CPU_FAULT_SUBMITDONE_TIMEOUT_IN_SUSPEND and crashes instead of quitting.
     sceGnmSubmitDone();
 
-    // Advance to the next render target WITHOUT blocking on this flip. Then
-    // throttle only if too many flips are still outstanding: with GFX_BUFFERS
-    // buffers we let up to (GFX_BUFFERS-1) be in flight, which guarantees the
-    // buffer we're about to render into next has finished its flip.
-    g->activeIdx = (g->activeIdx + 1) % GFX_BUFFERS;
+    // A buffer becomes writable only after a frame newer than its previous flip
+    // is scanning. Waiting merely for that buffer's own flipArg is too early: at
+    // that point VideoOut is actively reading it, which caused partial frames.
+    int nextIdx = (g->activeIdx + 1) % GFX_BUFFERS;
+    int retiredFrame = g->lastSubmitted[nextIdx];
 
     // Hard ceiling: if flips stop completing the display/GPU has hung -> fail
     // closed with a precise reason (faster than the generic freeze-watchdog).
-    uint64_t t0 = sceKernelGetProcessTime();
-    for (;;) {
-        OrbisVideoOutFlipStatus st;
-        sceVideoOutGetFlipStatus(g->video, &st);
-        if (frameID - (int)st.flipArg <= (GFX_BUFFERS - 1))
-            break;
-        if (sceKernelGetProcessTime() - t0 > 3ULL * 1000 * 1000)
-            gfx_fatal("flip-stall", frameID - (int)st.flipArg);
-        sceKernelUsleep(1000);
+    if (retiredFrame >= 0) {
+        uint64_t t0 = sceKernelGetProcessTime();
+        for (;;) {
+            OrbisVideoOutFlipStatus st;
+            int src = sceVideoOutGetFlipStatus(g->video, &st);
+            if (src < 0) gfx_fatal("flip-status", src);
+            if ((int)st.flipArg > retiredFrame)
+                break;
+            if (sceKernelGetProcessTime() - t0 > 3ULL * 1000 * 1000)
+                gfx_fatal("flip-stall", retiredFrame);
+            sceKernelUsleep(1000);
+        }
     }
+    g->activeIdx = nextIdx;
 }
 #endif // GFX_HOST_PREVIEW
 

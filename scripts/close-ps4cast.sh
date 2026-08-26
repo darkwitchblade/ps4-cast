@@ -3,8 +3,9 @@ set -euo pipefail
 
 PS4=${PS4_IP:-192.168.1.253}
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"/ps4-api.sh
 
-if curl -sS -m 5 -X POST "http://$PS4:8080/quit" >/dev/null 2>&1; then
+if ps4_post "quit" -m5 >/dev/null 2>&1; then
   for _ in $(seq 1 12); do
     if ! curl -sS -m 2 "http://$PS4:8080/status" >/dev/null 2>&1; then
       echo "PS4 Cast closed gracefully."

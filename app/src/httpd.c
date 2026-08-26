@@ -1,4 +1,5 @@
 #include "httpd.h"
+#include "httpd_channels.h"
 #include "web_ui.h"
 #include "player.h"
 #include "goldhen.h"
@@ -39,7 +40,7 @@ static OrbisPthreadMutex g_mtx;
 static int               g_started = 0;
 static int               g_event_thread_up = 0;
 
-static char g_pending_url[1024];
+static char g_pending_url[2048];
 static int  g_player_pending = 0;
 static int  g_play_pending = 0;
 static int  g_stop_pending = 0;
@@ -69,30 +70,7 @@ static char g_recent[MAX_RECENT][URL_MAX]; static int g_recentN = 0;
 static char g_queue[MAX_QUEUE][URL_MAX];   static int g_queueHead = 0, g_queueN = 0;
 static char g_fav[MAX_FAV][URL_MAX];       static int g_favN = 0;
 
-// Loaded M3U/IPTV channel list, shared between the web UI and the on-screen
-// (D-pad) channel zapper. g_chanCur is the channel currently tuned, -1 if none.
-#define CHAN_NAME_MAX 96
-#define CHAN_GRP_MAX  48
-// Real IPTV playlists routinely carry thousands of channels; 256 silently
-// truncated them (the parse loop just stopped), losing most of the list.
-#define MAX_CHAN      2000
-static char g_chanName[MAX_CHAN][CHAN_NAME_MAX];
-static char g_chanGroup[MAX_CHAN][CHAN_GRP_MAX];
-static char g_chanUrl[MAX_CHAN][URL_MAX];
-static unsigned char g_chanFav[MAX_CHAN];
-static char g_filtLetter = 0;      // 0 = no letter filter
-static int  g_filtFav = 0;         // 1 = favourites only
-static int  g_filt[MAX_CHAN];
-static int  g_filtN = 0;
-static int  g_railRow = 0;      // selected bouquet row (0=All,1=Favourites,2+=groups)
-// Favourites + an on-screen filter. With thousands of channels the flat zapper
-// list is unusable, so the overlay can narrow to a starting letter (A-Z, '#' for
-// non-alphabetic) and/or favourites only. The filter maps filtered positions ->
-// absolute channel indices so navigation stays simple in main.c.
-
-static int  g_chanN = 0;
-static int  g_chanCur = -1;
-
+// The channel list itself lives in httpd_channels.c.
 // The most recently cast URL (HUD title); declared here so the channel-store
 // helpers above the request handlers can update it.
 static char g_last_push[1024];
@@ -140,6 +118,80 @@ static void favs_load(void) {
         if (line[0]) { strncpy(g_fav[g_favN], line, URL_MAX - 1); g_fav[g_favN][URL_MAX-1]='\0'; g_favN++; }
     }
 }
+static const char *ci_strstr(const char *hay, const char *needle);  // defined below
+static int g_cfgPair = 1;              // require the pairing token on mutations
+// ---- pairing token ---------------------------------------------------------
+// The receiver accepts commands from anyone on the LAN. A per-install token,
+// shown on the TV (URL text + QR), gates every state-changing endpoint. Exempt
+// by design: DLNA/UPnP clients (they cannot carry a token through SSDP
+// discovery) and read-only /status + /trace, which the dev pipeline polls.
+#define TOKEN_PATH "/data/ps4cast_token.txt"
+static char g_token[9] = "";        // 8 chars + NUL
+
+static void token_load_or_create(void) {
+    int fd = sceKernelOpen(TOKEN_PATH, 0 /*O_RDONLY*/, 0);
+    if (fd >= 0) {
+        char buf[16] = {0};
+        int n = (int)sceKernelRead(fd, buf, sizeof(buf) - 1);
+        sceKernelClose(fd);
+        if (n == 8) { memcpy(g_token, buf, 8); g_token[8] = '\0'; return; }
+    }
+    // 8 unambiguous chars from a high-resolution clock stir; the PS4 has no
+    // /dev/urandom in homebrew, and this only needs to be unique per install.
+    static const char cs[] = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+    uint64_t t = sceKernelGetProcessTime() ^ (uint64_t)(uintptr_t)&g_token;
+    for (int i = 0; i < 8; i++) { g_token[i] = cs[t & 31]; t ^= t >> 7; t *= 0x9E3779B97F4A7C15ULL; t >>= 9; }
+    g_token[8] = '\0';
+    fd = sceKernelOpen(TOKEN_PATH, 0x0201 | 0x0400, 0666);
+    if (fd >= 0) { sceKernelWrite(fd, g_token, 8); sceKernelClose(fd); }
+}
+
+const char *httpd_token(void) { return g_token; }
+int httpd_pairing_required(void) { return g_cfgPair; }
+
+// 1 if this request may proceed. token comes from ?t= on the path or the
+// X-PS4Cast-Token header. Constant-shape compare; this is a LAN convenience,
+// not a crypto boundary.
+static int token_ok(const char *path, const char *headers) {
+    if (!g_cfgPair || !g_token[0]) return 1;
+    const char *q = strchr(path, '?');
+    if (q) {
+        char t[16] = {0};
+        const char *tp = strstr(q, "t=");
+        if (tp && (tp == q + 1 || tp[-1] == '&')) {
+            int k = 0;
+            tp += 2;
+            while (tp[k] && tp[k] != '&' && k < 8) { t[k] = tp[k]; k++; }
+            t[k] = '\0';
+            if (k == 8 && strcmp(t, g_token) == 0) return 1;
+        }
+    }
+    const char *h = ci_strstr(headers, "x-ps4cast-token:");
+    if (h) {
+        h += 16;
+        while (*h == ' ') h++;
+        int k = 0;
+        while (h[k] && h[k] != '\r' && h[k] != '\n' && k < 8) k++;
+        return k == 8 && strncmp(h, g_token, 8) == 0;
+    }
+    return 0;
+}
+
+// Paths that must work without a token: UPnP/DLNA machinery (SSDP-discovered,
+// tokenless by protocol) and read-only diagnostics the dev pipeline polls.
+static int token_exempt(const char *path) {
+    static const char *const exempt[] = {
+        "/description.xml", "/AVTransport.xml", "/RenderingControl.xml",
+        "/ConnectionManager.xml", "/status", "/trace", "/crashlog", "/token", 0
+    };
+    for (int i = 0; exempt[i]; i++) {
+        int l = (int)strlen(exempt[i]);
+        if (strncmp(path, exempt[i], l) == 0 &&
+            (path[l] == '\0' || path[l] == '?')) return 1;
+    }
+    return strncmp(path, "/upnp/", 6) == 0;
+}
+
 // ---- persisted settings (debug toasts on/off) ----------------------------
 #define CFG_PATH "/data/ps4cast_cfg.txt"
 static void cfg_save(void) {
@@ -148,8 +200,8 @@ static void cfg_save(void) {
     char line[64];
     // avsync is user-tuned for their TV/soundbar; losing it on every relaunch
     // (while channels/recent/resume persisted) was an inconsistency.
-    int n = snprintf(line, sizeof(line), "debug=%d\navsync=%d\n",
-                     notify_get_debug(), player_get_avsync());
+    int n = snprintf(line, sizeof(line), "debug=%d\navsync=%d\npair=%d\n",
+                     notify_get_debug(), player_get_avsync(), g_cfgPair);
     sceKernelWrite(fd, line, n);
     sceKernelClose(fd);
 }
@@ -165,6 +217,8 @@ static void cfg_load(void) {
     if (d) notify_set_debug(atoi(d + 6));
     const char *a = strstr(buf, "avsync=");
     if (a) player_set_avsync(atoi(a + 7));
+    const char *p = strstr(buf, "pair=");
+    if (p) g_cfgPair = atoi(p + 5) ? 1 : 0;
 }
 
 // ---- resume positions: remember where each VOD was stopped, resume on replay.
@@ -247,40 +301,6 @@ int httpd_resume_get(const char *url) {
 // after every relaunch is painful. Persist the parsed channels to /data and
 // restore them on boot (no network needed). Callers hold g_mtx.
 #define CHAN_PATH "/data/ps4cast_channels.txt"
-static void chan_save_file(void) {
-    int fd = sceKernelOpen(CHAN_PATH, 0x0201 | 0x0400, 0666);
-    if (fd < 0) return;
-    char line[URL_MAX + CHAN_NAME_MAX + CHAN_GRP_MAX + 8];
-    for (int i = 0; i < g_chanN; i++) {
-        int n = snprintf(line, sizeof(line), "%s\t%s\t%s\t%d\n", g_chanName[i], g_chanGroup[i], g_chanUrl[i], g_chanFav[i] ? 1 : 0);
-        sceKernelWrite(fd, line, n);
-    }
-    sceKernelClose(fd);
-}
-static void chan_load_file(void) {
-    int fd = sceKernelOpen(CHAN_PATH, 0, 0);
-    if (fd < 0) return;
-    static char buf[MAX_CHAN * (URL_MAX + CHAN_NAME_MAX + CHAN_GRP_MAX + 8)];
-    int n = (int)sceKernelRead(fd, buf, sizeof(buf) - 1);
-    sceKernelClose(fd);
-    if (n <= 0) return;
-    buf[n] = '\0';
-    g_chanN = 0; g_chanCur = -1;
-    char *save = NULL;
-    for (char *ln = strtok_r(buf, "\n", &save); ln && g_chanN < MAX_CHAN; ln = strtok_r(NULL, "\n", &save)) {
-        char *t1 = strchr(ln, '\t'); if (!t1) continue; *t1 = '\0';
-        char *t2 = strchr(t1 + 1, '\t'); if (!t2) continue; *t2 = '\0';
-        const char *grp = t1 + 1, *url = t2 + 1; if (!url[0]) continue;
-        int fav = 0;
-        char *t3 = strchr(t2 + 1, '\t');           // optional 4th column: favourite
-        if (t3) { *t3 = '\0'; fav = atoi(t3 + 1) ? 1 : 0; }
-        strncpy(g_chanName[g_chanN], ln, CHAN_NAME_MAX - 1);   g_chanName[g_chanN][CHAN_NAME_MAX - 1] = '\0';
-        strncpy(g_chanGroup[g_chanN], grp, CHAN_GRP_MAX - 1);  g_chanGroup[g_chanN][CHAN_GRP_MAX - 1] = '\0';
-        strncpy(g_chanUrl[g_chanN], url, URL_MAX - 1);         g_chanUrl[g_chanN][URL_MAX - 1] = '\0';
-        g_chanFav[g_chanN] = (unsigned char)fav;
-        g_chanN++;
-    }
-}
 
 static void fav_toggle(const char *url) {
     scePthreadMutexLock(&g_mtx);
@@ -344,230 +364,6 @@ static void name_from_url(const char *url, char *out, int cap) {
     memcpy(out, slash, n); out[n] = '\0';
 }
 
-static void chan_add(const char *name, const char *group, const char *url) {
-    if (g_chanN >= MAX_CHAN) return;
-    strncpy(g_chanName[g_chanN], name, CHAN_NAME_MAX - 1);  g_chanName[g_chanN][CHAN_NAME_MAX - 1] = '\0';
-    strncpy(g_chanGroup[g_chanN], group ? group : "", CHAN_GRP_MAX - 1); g_chanGroup[g_chanN][CHAN_GRP_MAX - 1] = '\0';
-    strncpy(g_chanUrl[g_chanN], url, URL_MAX - 1);          g_chanUrl[g_chanN][URL_MAX - 1] = '\0';
-    g_chanN++;
-}
-
-// Pull a quoted #EXTINF attribute value, e.g. key = "group-title=\"".
-static void extinf_attr(const char *line, const char *key, char *out, int cap) {
-    out[0] = '\0';
-    const char *k = strstr(line, key);
-    if (!k) return;
-    k += strlen(key);
-    int i = 0;
-    while (k[i] && k[i] != '"' && i < cap - 1) { out[i] = k[i]; i++; }
-    out[i] = '\0';
-}
-
-// Parse a fetched M3U/IPTV playlist into the shared channel store (caller holds
-// g_mtx). A genuine HLS stream (#EXT-X- tags) is one castable entry, not a list.
-static void playlist_store(const char *text, const char *srcUrl) {
-    g_chanN = 0; g_chanCur = -1;
-    if (strstr(text, "#EXT-X-STREAM-INF") || strstr(text, "#EXT-X-TARGETDURATION") ||
-        strstr(text, "#EXT-X-MEDIA-SEQUENCE") || strstr(text, "#EXT-X-PLAYLIST-TYPE")) {
-        char nm[CHAN_NAME_MAX]; name_from_url(srcUrl, nm, sizeof(nm));
-        chan_add(nm, "", srcUrl);
-        return;
-    }
-    char pend[256]; pend[0] = '\0';
-    char pendGrp[CHAN_GRP_MAX]; pendGrp[0] = '\0';
-    char sticky[CHAN_GRP_MAX]; sticky[0] = '\0';   // #EXTGRP applies until changed
-    for (const char *p = text; *p && g_chanN < MAX_CHAN; ) {
-        const char *nl = strchr(p, '\n');
-        int len = nl ? (int)(nl - p) : (int)strlen(p);
-        char line[1100];
-        int ll = len < (int)sizeof(line) - 1 ? len : (int)sizeof(line) - 1;
-        memcpy(line, p, ll); line[ll] = '\0';
-        for (int i = (int)strlen(line) - 1; i >= 0 && (line[i]=='\r'||line[i]==' '||line[i]=='\t'); i--) line[i] = '\0';
-        char *s = line; while (*s == ' ' || *s == '\t') s++;
-        if (*s) {
-            if (strncmp(s, "#EXTINF:", 8) == 0) {
-                // Channel name = text after the first comma outside quotes
-                // (attributes like group-title="A,B" may contain commas).
-                const char *cur = s + 8; int inq = 0; const char *name = NULL;
-                for (; *cur; cur++) {
-                    if (*cur == '"') inq = !inq;
-                    else if (*cur == ',' && !inq) { name = cur + 1; break; }
-                }
-                if (name) {
-                    while (*name == ' ' || *name == '\t') name++;
-                    strncpy(pend, name, sizeof(pend) - 1); pend[sizeof(pend) - 1] = '\0';
-                }
-                extinf_attr(s, "group-title=\"", pendGrp, sizeof(pendGrp));
-            } else if (strncmp(s, "#EXTGRP:", 8) == 0) {
-                const char *g = s + 8; while (*g == ' ' || *g == '\t') g++;
-                strncpy(sticky, g, sizeof(sticky) - 1); sticky[sizeof(sticky) - 1] = '\0';
-            } else if (s[0] != '#') {
-                char nm[CHAN_NAME_MAX];
-                if (pend[0]) { strncpy(nm, pend, sizeof(nm) - 1); nm[sizeof(nm) - 1] = '\0'; }
-                else name_from_url(s, nm, sizeof(nm));
-                chan_add(nm, pendGrp[0] ? pendGrp : sticky, s);
-                pend[0] = '\0'; pendGrp[0] = '\0';
-            }
-            // other #directives (#EXTM3U, #EXTVLCOPT, ...) are ignored
-        }
-        if (!nl) break;
-        p = nl + 1;
-    }
-}
-
-// Serialize the channel store to JSON [{"n":..,"u":..},..] (caller holds g_mtx).
-static int chans_to_json(char *out, int cap) {
-    int o = 0;
-    out[o++] = '[';
-    for (int i = 0; i < g_chanN && o < cap - 2400; i++) {
-        if (i) out[o++] = ',';
-        out[o++] = '{';
-        o += snprintf(out + o, cap - o, "\"n\":"); json_str(out, cap, &o, g_chanName[i], 90);
-        o += snprintf(out + o, cap - o, ",\"g\":"); json_str(out, cap, &o, g_chanGroup[i], 44);
-        o += snprintf(out + o, cap - o, ",\"u\":"); json_str(out, cap, &o, g_chanUrl[i], 1000);
-        out[o++] = '}';
-    }
-    out[o++] = ']';
-    return o;
-}
-
-// ---- channel store accessors (for the on-screen D-pad zapper, main.c) -----
-
-static void filter_rebuild(void) {
-    g_filtN = 0;
-    for (int i = 0; i < g_chanN; i++) {
-        if (g_filtFav && !g_chanFav[i]) continue;
-        if (g_filtLetter) {
-            char c = g_chanName[i][0];
-            if (c >= 'a' && c <= 'z') c = (char)(c - 32);
-            if (g_filtLetter == '#') { if (c >= 'A' && c <= 'Z') continue; }
-            else if (c != g_filtLetter) continue;
-        }
-        g_filt[g_filtN++] = i;
-    }
-}
-
-void httpd_chan_filter(char letter, int favOnly) {
-    g_filtLetter = letter; g_filtFav = favOnly ? 1 : 0; g_railRow = favOnly ? 1 : 0;
-    scePthreadMutexLock(&g_mtx); filter_rebuild(); scePthreadMutexUnlock(&g_mtx);
-}
-char httpd_chan_filter_letter(void) { return g_filtLetter; }
-int  httpd_chan_filter_fav(void)    { return g_filtFav; }
-int  httpd_chan_filter_count(void)  { return (g_filtLetter || g_filtFav || g_railRow >= 2) ? g_filtN : g_chanN; }
-int  httpd_chan_filter_abs(int n) {
-    if (!(g_filtLetter || g_filtFav || g_railRow >= 2)) return (n >= 0 && n < g_chanN) ? n : -1;
-    return (n >= 0 && n < g_filtN) ? g_filt[n] : -1;
-}
-int  httpd_chan_is_fav(int i) { return (i >= 0 && i < g_chanN) ? g_chanFav[i] : 0; }
-void httpd_chan_toggle_fav(int i) {
-    if (i < 0 || i >= g_chanN) return;
-    scePthreadMutexLock(&g_mtx);
-    g_chanFav[i] = g_chanFav[i] ? 0 : 1;
-    filter_rebuild();
-    scePthreadMutexUnlock(&g_mtx);
-    chan_save_file();
-}
-// True if any channel starts with `letter` ('#' = non-alphabetic), so the A-Z
-// strip can grey out letters that would show an empty list.
-int httpd_chan_letter_has(char letter) {
-    for (int i = 0; i < g_chanN; i++) {
-        char c = g_chanName[i][0];
-        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
-        if (letter == '#') { if (!(c >= 'A' && c <= 'Z')) return 1; }
-        else if (c == letter) return 1;
-    }
-    return 0;
-}
-
-// ---- bouquet rail ---------------------------------------------------------
-// Row 0 = All, row 1 = Favourites, then each distinct group ("bouquet") in
-// playlist order. Selecting a row just drives httpd_chan_filter().
-int httpd_chan_rail_count(void) {
-    int n = 2;
-    for (int i = 0; i < g_chanN; i++) {
-        if (!g_chanGroup[i][0]) continue;
-        int seen = 0;
-        for (int j = 0; j < i; j++)
-            if (g_chanGroup[j][0] && strcmp(g_chanGroup[j], g_chanGroup[i]) == 0) { seen = 1; break; }
-        if (!seen) n++;
-    }
-    return n;
-}
-
-void httpd_chan_rail_name(int row, char *out, int cap) {
-    if (cap <= 0) return;
-    out[0] = 0;
-    if (row == 0) { snprintf(out, cap, "All"); return; }
-    if (row == 1) { snprintf(out, cap, "Favourites"); return; }
-    int n = 2;
-    for (int i = 0; i < g_chanN; i++) {
-        if (!g_chanGroup[i][0]) continue;
-        int seen = 0;
-        for (int j = 0; j < i; j++)
-            if (g_chanGroup[j][0] && strcmp(g_chanGroup[j], g_chanGroup[i]) == 0) { seen = 1; break; }
-        if (seen) continue;
-        if (n == row) { snprintf(out, cap, "%s", g_chanGroup[i]); return; }
-        n++;
-    }
-    snprintf(out, cap, "Group %d", row - 1);
-}
-
-// Apply a rail row as the active filter (keeps any A-Z letter narrowing).
-void httpd_chan_rail_select(int row) {
-    char letter = httpd_chan_filter_letter();
-    if (row == 1) { httpd_chan_filter(letter, 1); return; }
-    if (row <= 0) { httpd_chan_filter(letter, 0); return; }
-    char grp[CHAN_GRP_MAX]; httpd_chan_rail_name(row, grp, sizeof(grp));
-    scePthreadMutexLock(&g_mtx);
-    g_filtFav = 0; g_filtLetter = letter;
-    g_filtN = 0;
-    for (int i = 0; i < g_chanN; i++) {
-        if (strcmp(g_chanGroup[i], grp) != 0) continue;
-        if (g_filtLetter) {
-            char c = g_chanName[i][0];
-            if (c >= 'a' && c <= 'z') c = (char)(c - 32);
-            if (g_filtLetter == '#') { if (c >= 'A' && c <= 'Z') continue; }
-            else if (c != g_filtLetter) continue;
-        }
-        g_filt[g_filtN++] = i;
-    }
-    g_railRow = row;
-    scePthreadMutexUnlock(&g_mtx);
-}
-
-int httpd_chan_count(void) { return g_chanN; }
-int httpd_chan_current(void) { return g_chanCur; }
-// Copy channel i's name/url into caller buffers under lock (safe vs. reloads).
-int httpd_chan_get(int i, char *name, int nameCap, char *url, int urlCap) {
-    int ok = 0;
-    scePthreadMutexLock(&g_mtx);
-    if (i >= 0 && i < g_chanN) {
-        if (name && nameCap > 0) { strncpy(name, g_chanName[i], nameCap - 1); name[nameCap - 1] = '\0'; }
-        if (url && urlCap > 0)   { strncpy(url, g_chanUrl[i], urlCap - 1);   url[urlCap - 1] = '\0'; }
-        ok = 1;
-    }
-    scePthreadMutexUnlock(&g_mtx);
-    return ok;
-}
-// Copy channel i's group label (empty string if none).
-void httpd_chan_group(int i, char *out, int cap) {
-    if (!out || cap <= 0) return;
-    out[0] = '\0';
-    scePthreadMutexLock(&g_mtx);
-    if (i >= 0 && i < g_chanN) { strncpy(out, g_chanGroup[i], cap - 1); out[cap - 1] = '\0'; }
-    scePthreadMutexUnlock(&g_mtx);
-}
-// Mark channel i as the one now tuned (also updates the HUD title source).
-void httpd_chan_set_current(int i) {
-    scePthreadMutexLock(&g_mtx);
-    if (i >= -1 && i < g_chanN) {
-        g_chanCur = i;
-        if (i >= 0) { strncpy(g_last_push, g_chanUrl[i], sizeof(g_last_push) - 1); g_last_push[sizeof(g_last_push) - 1] = '\0'; }
-    }
-    scePthreadMutexUnlock(&g_mtx);
-}
-
-// Pop the next queued URL (main loop calls this on playback finish for autoplay).
 int httpd_take_next(char *out, int len) {
     int got = 0;
     scePthreadMutexLock(&g_mtx);
@@ -579,6 +375,13 @@ int httpd_take_next(char *out, int len) {
     scePthreadMutexUnlock(&g_mtx);
     return got;
 }
+
+// HUD title follows the tuned channel; the store lives in httpd_channels.c now.
+static void chan_tuned_push_cb(const char *url) {
+    strncpy(g_last_push, url, sizeof(g_last_push) - 1);
+    g_last_push[sizeof(g_last_push) - 1] = '\0';
+}
+static void chan_save_file(void) { httpd_channels_save(); }
 
 static const char DEVICE_XML[] =
 "<?xml version=\"1.0\"?>"
@@ -876,14 +679,95 @@ static void set_pending_play(const char *url) {
     player_interrupt();   // unblock a stuck read so the new cast is processed
 }
 
-static void set_pending_player(const char *url) {
+static void set_pending_player_named(const char *url, const char *recentUrl) {
     scePthreadMutexLock(&g_mtx);
     strncpy(g_pending_url, url, sizeof(g_pending_url) - 1);
     g_pending_url[sizeof(g_pending_url) - 1] = '\0';
     g_player_pending = 1;
     scePthreadMutexUnlock(&g_mtx);
+    recent_add(recentUrl ? recentUrl : url);
+    player_interrupt();
+}
+
+static void set_pending_player(const char *url) { set_pending_player_named(url, url); }
+
+static void set_pending_channel(const char *url) {
+    scePthreadMutexLock(&g_mtx);
+    strncpy(g_pending_url, url, sizeof(g_pending_url) - 1);
+    g_pending_url[sizeof(g_pending_url) - 1] = '\0';
+    g_player_pending = 2;
+    scePthreadMutexUnlock(&g_mtx);
     recent_add(url);
     player_interrupt();
+}
+
+static void set_pending_local_file(const char *displayName) {
+    // Local uploads are intentionally not added to Recents: the fixed file is
+    // replaced by every upload, so a historical entry would be misleading.
+    scePthreadMutexLock(&g_mtx);
+    strncpy(g_pending_url, PLAYER_LOCAL_UPLOAD_URL, sizeof(g_pending_url) - 1);
+    g_pending_url[sizeof(g_pending_url) - 1] = '\0';
+    g_player_pending = 1;
+    strncpy(g_last_push, displayName, sizeof(g_last_push) - 1);
+    g_last_push[sizeof(g_last_push) - 1] = '\0';
+    httpd_channels_tune(-1, NULL, 0);   // nothing tuned after a manual cast
+    scePthreadMutexUnlock(&g_mtx);
+    g_avt_event_dirty = 1;
+    player_interrupt();
+}
+
+static int form_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int form_value(const char *body, const char *key, char *out, int cap) {
+    int klen = (int)strlen(key);
+    if (cap <= 0) return 0;
+    out[0] = '\0';
+    for (const char *p = body; p && *p; ) {
+        const char *end = strchr(p, '&');
+        if (!end) end = p + strlen(p);
+        const char *eq = memchr(p, '=', (size_t)(end - p));
+        if (eq && eq - p == klen && memcmp(p, key, (size_t)klen) == 0) {
+            int o = 0;
+            for (const char *s = eq + 1; s < end && o < cap - 1; s++) {
+                unsigned char c = (unsigned char)*s;
+                if (c == '+') c = ' ';
+                else if (c == '%' && s + 2 < end) {
+                    int hi = form_hex(s[1]), lo = form_hex(s[2]);
+                    if (hi >= 0 && lo >= 0) { c = (unsigned char)((hi << 4) | lo); s += 2; }
+                }
+                if (c == 0 || c == '\r' || c == '\n' || c < 0x20 || c == 0x7f) continue;
+                out[o++] = (char)c;
+            }
+            out[o] = '\0';
+            return o;
+        }
+        p = *end ? end + 1 : end;
+    }
+    return 0;
+}
+
+static int append_cast_option(char *dst, int cap, const char *name, const char *value) {
+    if (!value || !value[0]) return 1;
+    int used = (int)strlen(dst);
+    int n = snprintf(dst + used, (size_t)(cap - used), "%c%s=", strchr(dst, '|') ? '&' : '|', name);
+    if (n < 0 || used + n >= cap) return 0;
+    used += n;
+    static const char hex[] = "0123456789ABCDEF";
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        unsigned char c = *p;
+        int escape = c == '%' || c == '&' || c == '\r' || c == '\n' || c < 0x20 || c == 0x7f;
+        if (used + (escape ? 3 : 1) >= cap) return 0;
+        if (escape) {
+            dst[used++] = '%'; dst[used++] = hex[c >> 4]; dst[used++] = hex[c & 15];
+        } else dst[used++] = (char)c;
+    }
+    dst[used] = '\0';
+    return 1;
 }
 
 static void send_soap_ok(OrbisNetId c, const char *action, const char *inner) {
@@ -1203,6 +1087,151 @@ static void *event_main(void *arg) {
     return NULL;
 }
 
+#define UPLOAD_TMP_PATH "/data/ps4cast_upload.part"
+#define UPLOAD_NAME_PATH "/data/ps4cast_upload.name"
+#define UPLOAD_MAX_BYTES (32ULL * 1024ULL * 1024ULL * 1024ULL)
+
+static int hex_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void decode_upload_name(const char *encoded, char *out, int cap) {
+    int n = 0;
+    for (int i = 0; encoded && encoded[i] && n < cap - 1; i++) {
+        unsigned char ch = (unsigned char)encoded[i];
+        if (ch == '%' && encoded[i + 1] && encoded[i + 2]) {
+            int hi = hex_value(encoded[i + 1]), lo = hex_value(encoded[i + 2]);
+            if (hi >= 0 && lo >= 0) { ch = (unsigned char)((hi << 4) | lo); i += 2; }
+        }
+        // Keep valid UTF-8 bytes for Arabic/accented titles, while preventing
+        // control characters or path/JSON punctuation from changing the HUD.
+        if (ch < 0x20 || ch == 0x7f) ch = ' ';
+        if (ch == '/' || ch == '\\' || ch == '"' || ch == '?' || ch == '#') ch = '_';
+        out[n++] = (char)ch;
+    }
+    while (n > 0 && out[n - 1] == ' ') n--;
+    out[n] = '\0';
+    if (!n) snprintf(out, cap, "Local file");
+}
+
+static int write_file_all(int fd, const void *data, int len) {
+    const uint8_t *p = (const uint8_t *)data;
+    int done = 0;
+    while (done < len) {
+        ssize_t wrote = (ssize_t)sceKernelWrite(fd, p + done, (size_t)(len - done));
+        if (wrote <= 0 || wrote > len - done) return -1;
+        done += (int)wrote;
+    }
+    return 0;
+}
+
+static uint64_t upload_file_size(void) {
+    int fd = sceKernelOpen(PLAYER_LOCAL_UPLOAD_PATH, 0 /*O_RDONLY*/, 0);
+    if (fd < 0) return 0;
+    off_t end = sceKernelLseek(fd, 0, 2 /*SEEK_END*/);
+    sceKernelClose(fd);
+    return end > 0 ? (uint64_t)end : 0;
+}
+
+static void upload_name_save(const char *name) {
+    int fd = sceKernelOpen(UPLOAD_NAME_PATH,
+                           0x0201 /*O_WRONLY|O_CREAT*/ | 0x0400 /*O_TRUNC*/, 0666);
+    if (fd < 0) return;
+    write_file_all(fd, name, (int)strlen(name));
+    sceKernelFsync(fd);
+    sceKernelClose(fd);
+}
+
+static void upload_name_load(char *out, int cap) {
+    if (!out || cap <= 0) return;
+    out[0] = '\0';
+    int fd = sceKernelOpen(UPLOAD_NAME_PATH, 0 /*O_RDONLY*/, 0);
+    if (fd >= 0) {
+        int n = (int)sceKernelRead(fd, out, (size_t)(cap - 1));
+        sceKernelClose(fd);
+        if (n > 0) out[n] = '\0';
+    }
+    if (!out[0]) snprintf(out, cap, "Uploaded video");
+}
+
+static void handle_local_upload(OrbisNetId c, const char *req, int reqLen,
+                                const char *hdrend, uint64_t contentLen) {
+    if (contentLen == 0) {
+        send_response(c, "400 Bad Request", "text/plain", "empty file", 10);
+        return;
+    }
+    if (contentLen > UPLOAD_MAX_BYTES) {
+        send_response(c, "413 Payload Too Large", "text/plain", "file too large", 14);
+        return;
+    }
+    if (ci_strstr(req, "Transfer-Encoding: chunked")) {
+        send_response(c, "411 Length Required", "text/plain", "content length required", 23);
+        return;
+    }
+
+    char encodedName[768], displayName[256];
+    encodedName[0] = '\0';
+    header_value(req, "X-PS4Cast-Filename:", encodedName, sizeof(encodedName));
+    decode_upload_name(encodedName, displayName, sizeof(displayName));
+
+    // A client using Expect must receive the interim response before it sends
+    // the body. Browsers normally skip this, but supporting it keeps curl useful.
+    if (ci_strstr(req, "Expect: 100-continue"))
+        send_all(c, "HTTP/1.1 100 Continue\r\n\r\n", 25);
+
+    sceKernelUnlink(UPLOAD_TMP_PATH);
+    int fd = sceKernelOpen(UPLOAD_TMP_PATH,
+                           0x0201 /*O_WRONLY|O_CREAT*/ | 0x0400 /*O_TRUNC*/, 0666);
+    if (fd < 0) {
+        send_response(c, "507 Insufficient Storage", "text/plain", "cannot create upload", 20);
+        return;
+    }
+
+    const char *body = hdrend + 4;
+    int already = reqLen - (int)(body - req);
+    if (already < 0) already = 0;
+    if ((uint64_t)already > contentLen) already = (int)contentLen;
+    uint64_t received = 0;
+    int failed = 0;
+    if (already > 0) {
+        failed = write_file_all(fd, body, already) != 0;
+        received = (uint64_t)already;
+    }
+
+    static uint8_t uploadBuf[64 * 1024];
+    while (!failed && received < contentLen) {
+        uint64_t left = contentLen - received;
+        int want = left < sizeof(uploadBuf) ? (int)left : (int)sizeof(uploadBuf);
+        int got = sceNetRecv(c, uploadBuf, want, 0);
+        if (got <= 0 || write_file_all(fd, uploadBuf, got) != 0) { failed = 1; break; }
+        received += (uint64_t)got;
+    }
+    if (!failed) sceKernelFsync(fd);
+    sceKernelClose(fd);
+
+    if (failed || received != contentLen) {
+        sceKernelUnlink(UPLOAD_TMP_PATH);
+        trace_mark("local upload failed name=%s bytes=%llu/%llu", displayName,
+                   (unsigned long long)received, (unsigned long long)contentLen);
+        send_response(c, "400 Bad Request", "text/plain", "upload interrupted", 18);
+        return;
+    }
+    if (sceKernelRename(UPLOAD_TMP_PATH, PLAYER_LOCAL_UPLOAD_PATH) != 0) {
+        sceKernelUnlink(UPLOAD_TMP_PATH);
+        send_response(c, "500 Internal Server Error", "text/plain", "cannot finalize upload", 22);
+        return;
+    }
+
+    upload_name_save(displayName);
+    trace_mark("local upload complete name=%s bytes=%llu", displayName,
+               (unsigned long long)contentLen);
+    set_pending_local_file(displayName);
+    send_response(c, "200 OK", "text/plain", "ok", 2);
+}
+
 static void handle_client(OrbisNetId c) {
     // One request is handled at a time by server_main, so static storage is safe
     // and avoids spending 8 KB of the HTTP thread stack before dispatch begins.
@@ -1223,10 +1252,27 @@ static void handle_client(OrbisNetId c) {
         n += r; req[n] = '\0';
         hdrend = strstr(req, "\r\n\r\n");
     }
-    if (hdrend) {
-        int clen = 0;
+    if (!hdrend) {
+        send_response(c, "400 Bad Request", "text/plain", "headers too large", 17);
+        return;
+    }
+
+    // Parse the route as soon as headers are complete. /upload owns its body as
+    // a byte stream; all normal command bodies remain bounded by req[].
+    char method[16] = {0}, path[256] = {0};
+    sscanf(req, "%15s %255s", method, path);
+    uint64_t contentLen = 0;
+    {
         const char *cl = ci_strstr(req, "Content-Length:");
-        if (cl) clen = atoi(cl + (int)strlen("Content-Length:"));
+        if (cl) contentLen = strtoull(cl + strlen("Content-Length:"), NULL, 10);
+    }
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/upload") == 0) {
+        handle_local_upload(c, req, n, hdrend, contentLen);
+        return;
+    }
+
+    {
+        int clen = contentLen > INT32_MAX ? INT32_MAX : (int)contentLen;
         int have = n - (int)((hdrend + 4) - req);           // body bytes already read
         while (clen > have && n < (int)sizeof(req) - 1) {    // wait for the rest of the body
             int r = sceNetRecv(c, req + n, sizeof(req) - 1 - n, 0);
@@ -1236,18 +1282,26 @@ static void handle_client(OrbisNetId c) {
         }
     }
 
-    // Method + path
-    char method[16] = {0}, path[256] = {0};
-    sscanf(req, "%15s %255s", method, path);
-
     const char *body = strstr(req, "\r\n\r\n");
     body = body ? body + 4 : "";
 
     if (strcmp(path, "/upnp/event/AVTransport") == 0 &&
         handle_avt_subscription(c, method, req)) return;
 
+    // Pairing gate: mutations and UI pages need the token shown on the TV.
+    // DLNA/UPnP and read-only /status + /trace stay open (token_exempt).
+    if (!token_exempt(path) && !token_ok(path, req)) {
+        send_response(c, "401 Unauthorized", "text/plain",
+                      "missing pairing token (see the TV screen)", 41);
+        return;
+    }
+
+    // Channel store endpoints (GET /channels, POST /channel/*).
+    if (httpd_channels_handle(c, method, path, body, send_response)) return;
+
     if (strcmp(method, "GET") == 0 &&
-        (strcmp(path, "/") == 0 || strncmp(path, "/index", 6) == 0)) {
+        (strcmp(path, "/") == 0 || strncmp(path, "/index", 6) == 0 ||
+         strcmp(path, "/handoff") == 0 || strcmp(path, "/setup") == 0)) {
         send_response(c, "200 OK", "text/html; charset=utf-8",
                       WEB_UI_HTML, (int)sizeof(WEB_UI_HTML) - 1);
         return;
@@ -1273,20 +1327,97 @@ static void handle_client(OrbisNetId c) {
         return;
     }
 
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/upload/status") == 0) {
+        char name[256], json[512];
+        uint64_t size = upload_file_size();
+        upload_name_load(name, sizeof(name));
+        int o = snprintf(json, sizeof(json), "{\"exists\":%d,\"size\":%llu,\"name\":",
+                         size > 0, (unsigned long long)size);
+        json_str(json, sizeof(json), &o, name, 255);
+        if (o < (int)sizeof(json) - 2) json[o++] = '}';
+        json[o] = '\0';
+        send_response(c, "200 OK", "application/json", json, o);
+        return;
+    }
+
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/upload/replay") == 0) {
+        if (!upload_file_size()) {
+            const char *m = "no uploaded file";
+            send_response(c, "404 Not Found", "text/plain", m, (int)strlen(m));
+            return;
+        }
+        char name[256];
+        upload_name_load(name, sizeof(name));
+        set_pending_local_file(name);
+        send_response(c, "200 OK", "text/plain", "ok", 2);
+        return;
+    }
+
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/upload/delete") == 0) {
+        int activeLocal = player_is_local();
+        int pendingLocal = 0;
+        scePthreadMutexLock(&g_mtx);
+        if (g_player_pending && strcmp(g_pending_url, PLAYER_LOCAL_UPLOAD_URL) == 0) {
+            g_player_pending = 0;
+            pendingLocal = 1;
+        }
+        if (activeLocal) g_stop_pending = 1;
+        if (activeLocal || pendingLocal) g_last_push[0] = '\0';
+        scePthreadMutexUnlock(&g_mtx);
+        if (activeLocal) player_interrupt();
+        sceKernelUnlink(PLAYER_LOCAL_UPLOAD_PATH);
+        sceKernelUnlink(UPLOAD_NAME_PATH);
+        sceKernelUnlink(UPLOAD_TMP_PATH);
+        player_clear_error();
+        trace_mark("local upload deleted active=%d pending=%d", activeLocal, pendingLocal);
+        send_response(c, "200 OK", "text/plain", "ok", 2);
+        return;
+    }
+
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/error/clear") == 0) {
+        player_clear_error();
+        send_response(c, "200 OK", "text/plain", "ok", 2);
+        return;
+    }
+
     if (strcmp(path, "/status") == 0) {
         char dbg[512];
         player_debug(dbg, sizeof(dbg));
-        char json[1800];
+        // Static because long URLs can nearly double when JSON-escaped; keeping
+        // this off the HTTP thread's stack also leaves headroom for diagnostics.
+        static char json[6144];
         int active = player_is_active();
         double cur = 0, dur = 0;
         player_progress(&cur, &dur);
-        int j = snprintf(json, sizeof(json),
-                         "{\"ver\":\"%s\",\"goldhen\":\"%s\",\"status\":\"%s\",\"ssdp\":\"%s\",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":\"%s\",\"diag\":\"%s\",\"pad\":\"%s\",\"hw_enabled\":%d,\"debug\":%d,\"chan_n\":%d,\"chan_cur\":%d,\"buf\":%d,\"rx\":%llu,\"sys\":\"%s\",\"fps\":%d,\"avsync\":%d}",
-                         APP_VER, goldhen_status(), player_status(), ssdp_status(),
-                         active, player_is_paused(), (int)(cur + 0.5), (int)(dur + 0.5), g_last_push, dbg, pad_diag_get(),
-                         player_hw_enabled(), notify_get_debug(), g_chanN, g_chanCur,
-                         player_buffer_pct(), (unsigned long long)player_rx_total(), sys_diag_get(), sys_get_fps(), player_get_avsync());
-        send_response(c, "200 OK", "application/json", json, j);
+        int o = 0, cap = (int)sizeof(json);
+#define JAPP(...) do { \
+            if (o < cap - 1) { \
+                int _n = snprintf(json + o, cap - o, __VA_ARGS__); \
+                if (_n < 0) _n = 0; \
+                o = _n >= cap - o ? cap - 1 : o + _n; \
+            } \
+        } while (0)
+        JAPP("{\"ver\":"); json_str(json, cap, &o, APP_VER, 16);
+        JAPP(",\"goldhen\":"); json_str(json, cap, &o, goldhen_status(), 96);
+        JAPP(",\"status\":"); json_str(json, cap, &o, player_status(), 159);
+        JAPP(",\"ssdp\":"); json_str(json, cap, &o, ssdp_status(), 159);
+        JAPP(",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":",
+             active, player_is_paused(), (int)(cur + 0.5), (int)(dur + 0.5));
+        json_str(json, cap, &o, g_last_push, 1023);
+        JAPP(",\"diag\":"); json_str(json, cap, &o, dbg, 511);
+        JAPP(",\"pad\":"); json_str(json, cap, &o, pad_diag_get(), 159);
+        JAPP(",\"hw_enabled\":%d,\"debug\":%d,\"pair\":%d,\"token\":\"%s\",\"chan_n\":%d,\"chan_cur\":%d,\"buf\":%d,\"rx\":%llu,\"sys\":",
+             player_hw_enabled(), notify_get_debug(), g_cfgPair, g_token,
+             httpd_chan_count(), httpd_chan_current(),
+             player_buffer_pct(), (unsigned long long)player_rx_total());
+        json_str(json, cap, &o, sys_diag_get(), 159);
+        JAPP(",\"fps\":%d,\"avsync\":%d,\"error_code\":", sys_get_fps(), player_get_avsync());
+        json_str(json, cap, &o, player_error_code(), 31);
+        JAPP(",\"error_message\":"); json_str(json, cap, &o, player_error_message(), 191);
+        JAPP("}");
+#undef JAPP
+        json[o] = '\0';
+        send_response(c, "200 OK", "application/json", json, o);
         return;
     }
 
@@ -1328,6 +1459,22 @@ static void handle_client(OrbisNetId c) {
         notify_set_debug(on);
         cfg_save();
         send_response(c, "200 OK", "text/plain", on ? "debug on" : "debug off", on ? 8 : 9);
+        return;
+    }
+
+    // Settings toggle: require the pairing token on state-changing requests.
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/pairing") == 0) {
+        g_cfgPair = body[0] != '0';
+        cfg_save();
+        send_response(c, "200 OK", "text/plain", g_cfgPair ? "pairing on" : "pairing off",
+                      g_cfgPair ? 10 : 11);
+        return;
+    }
+
+    // The token itself, so an already-paired phone can show it in Settings and
+    // the Chrome extension popup can copy it. Read-only, token-gated above.
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/token") == 0) {
+        send_response(c, "200 OK", "text/plain", g_token, 8);
         return;
     }
 
@@ -1418,6 +1565,41 @@ static void handle_client(OrbisNetId c) {
         g_last_push[sizeof(g_last_push) - 1] = '\0';
         set_pending_player(trimmed);
         send_response(c, "200 OK", "text/plain", "ok", 2);
+        return;
+    }
+
+    // Structured browser-extension handoff. Only non-secret compatibility
+    // headers are accepted; cookies/authorization are intentionally excluded.
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/cast") == 0) {
+        char media[1500], referer[500], origin[256], ua[300], kind[16], spec[2048];
+        form_value(body, "url", media, sizeof(media));
+        form_value(body, "referer", referer, sizeof(referer));
+        form_value(body, "origin", origin, sizeof(origin));
+        form_value(body, "ua", ua, sizeof(ua));
+        form_value(body, "kind", kind, sizeof(kind));
+        if ((strncmp(media, "http://", 7) != 0 && strncmp(media, "https://", 8) != 0) ||
+            strchr(media, '|')) {
+            const char *json = "{\"ok\":false,\"error\":\"bad media url\"}";
+            send_response(c, "400 Bad Request", "application/json", json, (int)strlen(json));
+            return;
+        }
+        snprintf(spec, sizeof(spec), "%s", media);
+        if (!append_cast_option(spec, sizeof(spec), "Referer", referer) ||
+            !append_cast_option(spec, sizeof(spec), "Origin", origin) ||
+            !append_cast_option(spec, sizeof(spec), "User-Agent", ua) ||
+            ((strcmp(kind, "hls") == 0 || strcmp(kind, "file") == 0) &&
+             !append_cast_option(spec, sizeof(spec), "Type", kind))) {
+            const char *json = "{\"ok\":false,\"error\":\"cast request too large\"}";
+            send_response(c, "413 Payload Too Large", "application/json", json, (int)strlen(json));
+            return;
+        }
+        strncpy(g_last_push, media, sizeof(g_last_push) - 1);
+        g_last_push[sizeof(g_last_push) - 1] = '\0';
+        set_pending_player_named(spec, media);
+        {
+            const char *json = "{\"ok\":true}";
+            send_response(c, "200 OK", "application/json", json, (int)strlen(json));
+        }
         return;
     }
 
@@ -1638,93 +1820,6 @@ static void handle_client(OrbisNetId c) {
         scePthreadMutexLock(&g_mtx); int n = json_list(j, sizeof(j), g_fav, g_favN); scePthreadMutexUnlock(&g_mtx);
         send_response(c, "200 OK", "application/json", j, n); return;
     }
-    // ---- channel list management (web UI) ---------------------------------
-    // GET /channels -> [{i,n,g,u,f},...] so the phone/browser can manage the
-    // list, which is far easier than editing it with a gamepad.
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/channels") == 0) {
-        static char j[96 * 1024];
-        scePthreadMutexLock(&g_mtx);
-        int o = 0; j[o++] = '[';
-        for (int i = 0; i < g_chanN && o < (int)sizeof(j) - 1600; i++) {
-            if (i) j[o++] = ',';
-            o += snprintf(j + o, sizeof(j) - o, "{\"i\":%d,\"n\":", i);
-            json_str(j, sizeof(j), &o, g_chanName[i], CHAN_NAME_MAX);
-            o += snprintf(j + o, sizeof(j) - o, ",\"g\":");
-            json_str(j, sizeof(j), &o, g_chanGroup[i], CHAN_GRP_MAX);
-            o += snprintf(j + o, sizeof(j) - o, ",\"u\":");
-            json_str(j, sizeof(j), &o, g_chanUrl[i], 1000);
-            o += snprintf(j + o, sizeof(j) - o, ",\"f\":%d}", g_chanFav[i] ? 1 : 0);
-        }
-        j[o++] = ']';
-        scePthreadMutexUnlock(&g_mtx);
-        send_response(c, "200 OK", "application/json", j, o); return;
-    }
-    // POST /channel/add   body: name\tgroup\turl
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/channel/add") == 0) {
-        char b[URL_MAX + CHAN_NAME_MAX + CHAN_GRP_MAX + 8];
-        strncpy(b, body, sizeof(b) - 1); b[sizeof(b) - 1] = 0;
-        for (int i = (int)strlen(b) - 1; i >= 0 && (b[i]=='\r'||b[i]=='\n'); i--) b[i] = 0;
-        char *t1 = strchr(b, '\t'), *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
-        if (!t1 || !t2) { send_response(c, "400 Bad Request", "text/plain", "need name\tgroup\turl", 20); return; }
-        *t1 = 0; *t2 = 0;
-        scePthreadMutexLock(&g_mtx);
-        chan_add(b, t1 + 1, t2 + 1);
-        scePthreadMutexUnlock(&g_mtx);
-        chan_save_file();
-        send_response(c, "200 OK", "text/plain", "ok", 2); return;
-    }
-    // POST /channel/edit  body: index\tname\tgroup\turl
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/channel/edit") == 0) {
-        char b[URL_MAX + CHAN_NAME_MAX + CHAN_GRP_MAX + 16];
-        strncpy(b, body, sizeof(b) - 1); b[sizeof(b) - 1] = 0;
-        for (int i = (int)strlen(b) - 1; i >= 0 && (b[i]=='\r'||b[i]=='\n'); i--) b[i] = 0;
-        char *t1 = strchr(b, '\t'); if (!t1) goto edit_bad; *t1 = 0;
-        char *t2 = strchr(t1 + 1, '\t'); if (!t2) goto edit_bad; *t2 = 0;
-        char *t3 = strchr(t2 + 1, '\t'); if (!t3) goto edit_bad; *t3 = 0;
-        {
-            int idx = atoi(b);
-            scePthreadMutexLock(&g_mtx);
-            if (idx >= 0 && idx < g_chanN) {
-                strncpy(g_chanName[idx], t1 + 1, CHAN_NAME_MAX - 1); g_chanName[idx][CHAN_NAME_MAX-1] = 0;
-                strncpy(g_chanGroup[idx], t2 + 1, CHAN_GRP_MAX - 1); g_chanGroup[idx][CHAN_GRP_MAX-1] = 0;
-                strncpy(g_chanUrl[idx], t3 + 1, URL_MAX - 1);        g_chanUrl[idx][URL_MAX-1] = 0;
-            }
-            filter_rebuild();
-            scePthreadMutexUnlock(&g_mtx);
-            chan_save_file();
-            send_response(c, "200 OK", "text/plain", "ok", 2); return;
-        }
-    edit_bad:
-        send_response(c, "400 Bad Request", "text/plain", "need i\tname\tgroup\turl", 23); return;
-    }
-    // POST /channel/del   body: index   (empty body = clear the whole list)
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/channel/del") == 0) {
-        scePthreadMutexLock(&g_mtx);
-        if (!body[0] || body[0] == '\n') { g_chanN = 0; g_chanCur = -1; }
-        else {
-            int idx = atoi(body);
-            if (idx >= 0 && idx < g_chanN) {
-                for (int i = idx; i < g_chanN - 1; i++) {
-                    memcpy(g_chanName[i], g_chanName[i+1], CHAN_NAME_MAX);
-                    memcpy(g_chanGroup[i], g_chanGroup[i+1], CHAN_GRP_MAX);
-                    memcpy(g_chanUrl[i], g_chanUrl[i+1], URL_MAX);
-                    g_chanFav[i] = g_chanFav[i+1];
-                }
-                g_chanN--;
-                if (g_chanCur == idx) g_chanCur = -1;
-                else if (g_chanCur > idx) g_chanCur--;
-            }
-        }
-        filter_rebuild();
-        scePthreadMutexUnlock(&g_mtx);
-        chan_save_file();
-        send_response(c, "200 OK", "text/plain", "ok", 2); return;
-    }
-    // POST /channel/fav   body: index   (toggles)
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/channel/fav") == 0) {
-        httpd_chan_toggle_fav(atoi(body));
-        send_response(c, "200 OK", "text/plain", "ok", 2); return;
-    }
 
     // Continue Watching: saved resume positions [{u,p,d},...], most recent first.
     if (strcmp(method, "GET") == 0 && strcmp(path, "/resume") == 0) {
@@ -1796,11 +1891,7 @@ static void handle_client(OrbisNetId c) {
                 uint8_t *txt = realloc(buf, (size_t)len + 1);
                 if (txt) {
                     buf = txt; buf[len] = '\0';
-                    scePthreadMutexLock(&g_mtx);
-                    playlist_store((const char *)buf, url);   // populate shared channel store
-                    chan_save_file();                         // persist so it survives a relaunch
-                    n = chans_to_json(out, CAP);
-                    scePthreadMutexUnlock(&g_mtx);
+                    n = httpd_channels_load_playlist((const char *)buf, url, out, CAP);
                 }
                 free(buf);
             }
@@ -1814,17 +1905,13 @@ static void handle_client(OrbisNetId c) {
     // Tune a channel from the loaded playlist by index. Body = index. Drives the
     // in-app player (same path as /avplay) and syncs the shared current-channel.
     if (strcmp(method, "POST") == 0 && strcmp(path, "/chan") == 0) {
-        int i = atoi(body);
         char curl[URL_MAX]; curl[0] = '\0';
-        scePthreadMutexLock(&g_mtx);
-        if (i >= 0 && i < g_chanN) {
-            g_chanCur = i;
-            strncpy(curl, g_chanUrl[i], sizeof(curl) - 1); curl[sizeof(curl) - 1] = '\0';
-            strncpy(g_last_push, curl, sizeof(g_last_push) - 1); g_last_push[sizeof(g_last_push) - 1] = '\0';
+        if (httpd_channels_tune(atoi(body), curl, sizeof(curl))) {
+            set_pending_channel(curl);
+            send_response(c, "200 OK", "text/plain", "ok", 2);
+        } else {
+            send_response(c, "400 Bad Request", "text/plain", "bad channel", 11);
         }
-        scePthreadMutexUnlock(&g_mtx);
-        if (curl[0]) { set_pending_player(curl); send_response(c, "200 OK", "text/plain", "ok", 2); }
-        else send_response(c, "400 Bad Request", "text/plain", "bad channel", 11);
         return;
     }
 
@@ -1846,6 +1933,11 @@ static void *server_main(void *arg) {
         OrbisNetId c = sceNetAccept(g_listen, NULL, NULL);
         if (c < 0)
             continue;
+        // A vanished phone must not leave the single HTTP worker blocked on an
+        // unfinished upload forever. This is microseconds on Orbis/BSD sockets.
+        int tmo = 30 * 1000 * 1000;
+        sceNetSetsockopt(c, SOL_SOCKET_PS4, SO_RCVTIMEO_PS4, &tmo, sizeof(tmo));
+        sceNetSetsockopt(c, SOL_SOCKET_PS4, SO_SNDTIMEO_PS4, &tmo, sizeof(tmo));
         handle_client(c);
         sceNetSocketClose(c);
     }
@@ -1854,10 +1946,13 @@ static void *server_main(void *arg) {
 
 int httpd_start(int port) {
     scePthreadMutexInit(&g_mtx, NULL, "ps4cast_mtx");
+    sceKernelUnlink(UPLOAD_TMP_PATH); // discard a partial upload left by power loss/crash
     favs_load();    // restore saved favorites from /data
     cfg_load();     // restore persisted settings (debug toasts)
+    token_load_or_create(); // pairing token for state-changing requests
     resume_load();  // restore saved per-URL resume positions
-    chan_load_file(); // restore the last-loaded channel list
+    httpd_channels_init(); // channel store mutex + restore the last-loaded list
+    httpd_channels_set_push_cb(chan_tuned_push_cb);
 
     g_listen = sceNetSocket("ps4cast", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_STREAM, 0);
     if (g_listen < 0)
@@ -1932,8 +2027,8 @@ int httpd_take_player_request(char *out, int len) {
     if (g_player_pending) {
         strncpy(out, g_pending_url, len - 1);
         out[len - 1] = '\0';
+        got = g_player_pending;
         g_player_pending = 0;
-        got = 1;
     }
     scePthreadMutexUnlock(&g_mtx);
     return got;

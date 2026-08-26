@@ -6,7 +6,8 @@ OBJCOPY := /opt/homebrew/opt/llvm/bin/llvm-objcopy
 YASM := yasm
 CFLAGS := --target=x86_64-pc-freebsd12-elf -fuse-ld=$(LD) -g -mcmodel=small -isystem $(DPI_PAYLOAD_DIR)/freebsd-headers -I$(DPI_PAYLOAD_DIR)/ps4-libjbc -nostdinc -nostdlib -fno-stack-protector -static -fPIE -ffreestanding
 CALLBACK_IP ?= 0x8B01A8C0U
-CFLAGS += -DCALLBACK_IP_ADDR=$(CALLBACK_IP)
+USER_ID ?= 0
+CFLAGS += -DCALLBACK_IP_ADDR=$(CALLBACK_IP) -DFALLBACK_USER_ID=$(USER_ID)
 LDFLAGS := -Wl,-T,payload.ld -Wl,-gc-sections
 LIB := build/lib.a
 JBC := $(wildcard $(DPI_PAYLOAD_DIR)/ps4-libjbc/*.c)
