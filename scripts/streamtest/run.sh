@@ -5,13 +5,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PS4=${PS4_IP:-192.168.1.4}
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"/ps4-api.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"/ps4-api.sh
 HOST=${HOST_IP:-$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)}
 PORT=${STREAMTEST_PORT:-8000}
 BASE="http://$HOST:$PORT/streamtest"
 SERVER_PID=""
 
 [ -n "$HOST" ] || { echo "Cannot determine Mac LAN IP; set HOST_IP." >&2; exit 2; }
+
+if [ ! -f "$ROOT/dist/streamtest/h264_360p.mp4" ]; then
+  echo "Generating playback fixtures"
+  "$ROOT/scripts/streamtest/gen.sh"
+fi
 
 cleanup() {
   ps4_post "stop" -m3 >/dev/null 2>&1 || true
@@ -49,6 +54,7 @@ CASES=(
   "vp9_720p.webm|SW"
   "hls/master.m3u8|HW"
   "hls_sep/master.m3u8|HW"
+  "hls_fmp4/stream.m3u8|HW"
 )
 
 printf "%-31s %-4s %5s %7s %18s %-12s\n" "SOURCE" "PATH" "FPS" "FRAMES" "DROPS(q/l/r)" "RESULT"
@@ -85,10 +91,12 @@ for spec in "${CASES[@]}"; do
     rd=$(printf '%s' "$diag" | sed -n 's/.*drop=[0-9]*(q[0-9]*\/l[0-9]*\/r\([0-9]*\)).*/\1/p'); rd=${rd:-0}
     case "$diag" in *ff/HW*) path=HW ;; *) path=SW ;; esac
     err=$(json_text "$last" error_code)
+    minfps=20
+    case "$clip" in *60fps*|*1080p60*) minfps=45 ;; esac
     if [ "$frames" -le 0 ] || [ -n "$err" ] || [ "$path" != "$expected" ]; then
       result=FAIL; failures=$((failures + 1))
-    elif [ "$maxfps" -le 0 ]; then
-      result=WARN
+    elif [ "$maxfps" -lt "$minfps" ] || [ "$qd" -gt 5 ]; then
+      result=FAIL; failures=$((failures + 1))
     fi
   fi
   printf "%-31s %-4s %5s %7s %5s/%-5s/%-5s %-12s\n" \
@@ -112,6 +120,19 @@ if [ "$failures" -eq 0 ]; then
   sleep 2
   resumed="$(status)"
   [ "$(json_num "$resumed" paused)" = "0" ] || { echo "FAIL: resume state was not applied"; failures=$((failures + 1)); }
+
+  echo "fMP4 HLS controls: reopen seek"
+  ps4_post "avplay" -m6 --data-binary "$BASE/hls_fmp4/stream.m3u8" >/dev/null
+  sleep 3
+  ps4_post "seek" -m4 --data-binary 6 >/dev/null
+  sleep 4
+  fmp4="$(status)"
+  fcur=$(json_num "$fmp4" cur); fcur=${fcur:-0}
+  ferr=$(json_text "$fmp4" error_code)
+  [ "$fcur" -ge 5 ] && [ -z "$ferr" ] || {
+    echo "FAIL: fMP4 seek did not resume near 6s (cur=$fcur err=${ferr:-none})"
+    failures=$((failures + 1))
+  }
 fi
 
 if [ "$failures" -gt 0 ]; then

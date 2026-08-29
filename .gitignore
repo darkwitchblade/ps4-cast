@@ -17,6 +17,7 @@ dist/*.pkg
 /tmp/
 third_party/DirectPackageInstaller/
 dist/*.mp4
+dist/streamtest/
 portlibs/src/ffmpeg-6.1.6/
 portlibs/ffmpeg-611-known-good/
 __pycache__/

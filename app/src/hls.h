@@ -7,8 +7,8 @@
 // (BearSSL) segments both work because all I/O goes through httpsrc.
 //
 // Scope: VOD and live media playlists, and master playlists (a variant is
-// chosen automatically). Finite muxed MPEG-TS VOD playlists can seek at segment
-// boundaries; live, fMP4 and separate-audio playlists remain non-seekable.
+// chosen automatically). Finite playlists seek at segment boundaries; fMP4 and
+// separate-audio streams reopen their demuxers at the coordinated target.
 #ifndef PS4CAST_HLS_H
 #define PS4CAST_HLS_H
 
@@ -30,8 +30,8 @@ int  hls_is_fmp4(void);                            // media playlist uses EXT-X-
 int  hls_can_segment_demux(void);                  // TS media playlist (live or VOD)
 void hls_set_decode_cap(int max_height);           // startup/ABR ceiling selected by player backend
 void hls_set_external_segment_fetch(int on);       // player owns TS read-ahead
-int  hls_can_seek(void);                           // finite muxed TS VOD only
-int  hls_can_seek_clamped(void);                   // any non-fMP4 HLS incl. fake-live
+int  hls_can_seek(void);                           // finite HLS with a known timeline
+int  hls_can_seek_clamped(void);                   // segment-index seek incl. fake-live
 double hls_duration(void);                         // EXTINF sum, seconds (0 unknown)
 int  hls_seek_time(double seconds, double *actual);// move to containing segment
 int  hls_seek_clamped(double seconds, double *actual); // live-flagged playlists

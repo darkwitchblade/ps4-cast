@@ -48,6 +48,9 @@ jobs:
       - name: Run host unit tests
         run: make -C tests/host test
 
+      - name: Run Chrome extension tests
+        run: npm --prefix chrome-extension test
+
       - name: Upload pkg artifact
         uses: actions/upload-artifact@v4
         with:

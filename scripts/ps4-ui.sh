@@ -7,7 +7,7 @@
 #   seq CODE...      send several keys with short gaps
 #   shot FILE        screenshot the stream window for visual verification
 # Buttons used by callers (macOS hid usage codes):
-#   36 Cross/Enter  49 Circle/Esc  123 Left  124 Right  125 Down  126 Up
+#   36 Cross/Enter  51 Circle/Backspace  123 Left  124 Right  125 Down  126 Up
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -28,13 +28,28 @@ session_pid() {
 
 stream_ready() {
   local p; p="$(session_pid)" || return 1
-  grep -q "successfully received streaminfo" "$LOG" 2>/dev/null
+  grep -Eq "successfully received streaminfo|Estimated source FPS" "$LOG" 2>/dev/null
+}
+
+stop_streams() {
+  local pids=""
+  if [ -f "$PIDFILE" ]; then pids="$(cat "$PIDFILE" 2>/dev/null || true)"; fi
+  # Recover sessions orphaned after a caller exits or Chiaki ignores SIGTERM.
+  local found; found="$(pgrep -f "$CHIAKI.*stream.*$PS4" 2>/dev/null || true)"
+  pids="$pids $found"
+  for p in $pids; do kill "$p" 2>/dev/null || true; done
+  sleep 1
+  for p in $pids; do
+    kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
+  done
+  rm -f "$PIDFILE"
 }
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
   start)
     if session_pid >/dev/null && stream_ready; then echo "stream already up"; exit 0; fi
+    stop_streams
     [ -s "$PAIRED" ] || { echo "not paired: run scripts/setup-remote-launch.sh first" >&2; exit 2; }
     nickname="$(sed -n 's/^nickname=//p' "$PAIRED" | head -1)"
     : > "$LOG"
@@ -50,11 +65,8 @@ case "$cmd" in
     exit 1
     ;;
   stop)
-    if p="$(session_pid)"; then
-      kill "$p" 2>/dev/null || true
-      rm -f "$PIDFILE"
-      echo "stream stopped"
-    fi
+    stop_streams
+    echo "stream stopped"
     ;;
   key|seq)
     p="$(session_pid)" || { echo "no stream session; run: $0 start" >&2; exit 2; }

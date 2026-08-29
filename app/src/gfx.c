@@ -24,6 +24,8 @@
 // Set in gfx_init; used by gfx_emergency_release to tear down the display/GPU
 // context on a fatal exit so the process stays reclaimable (not unkillable).
 static Gfx *g_gfx = NULL;
+static uint64_t g_flipUsTotal, g_flipUsMax, g_flipWaitUsTotal, g_flipWaitUsMax;
+static uint64_t g_flipCalls;
 
 // Pixel format used by sceVideoOut here is 32-bit; the proven sample encodes
 // 0x80000000 | (r<<16)|(g<<8)|b into each uint32 of the buffer.
@@ -39,6 +41,7 @@ int gfx_init(Gfx *g, int width, int height) {
     g->depth  = 4;
     g->frameBufferSize = width * height * g->depth;
     g->activeIdx = 0;
+    g_flipUsTotal = g_flipUsMax = g_flipWaitUsTotal = g_flipWaitUsMax = g_flipCalls = 0;
     for (int i = 0; i < GFX_BUFFERS; i++)
         g->lastSubmitted[i] = -1;
 
@@ -118,6 +121,7 @@ static void gfx_fatal(const char *what, int rc) {
 }
 
 void gfx_present(Gfx *g, int frameID) {
+    uint64_t flipT0 = sceKernelGetProcessTime();
     // A failed flip submit means the video-out/GPU rejected the frame — treat it
     // as a display fault and fail-closed instead of continuing blind.
     int rc = sceVideoOutSubmitFlip(g->video, g->activeIdx, ORBIS_VIDEO_OUT_FLIP_VSYNC, frameID);
@@ -133,6 +137,7 @@ void gfx_present(Gfx *g, int frameID) {
     // that point VideoOut is actively reading it, which caused partial frames.
     int nextIdx = (g->activeIdx + 1) % GFX_BUFFERS;
     int retiredFrame = g->lastSubmitted[nextIdx];
+    uint64_t waitT0 = sceKernelGetProcessTime();
 
     // Hard ceiling: if flips stop completing the display/GPU has hung -> fail
     // closed with a precise reason (faster than the generic freeze-watchdog).
@@ -149,7 +154,26 @@ void gfx_present(Gfx *g, int frameID) {
             sceKernelUsleep(1000);
         }
     }
+    uint64_t now = sceKernelGetProcessTime();
+    uint64_t waitUs = now - waitT0, flipUs = now - flipT0;
+    g_flipWaitUsTotal += waitUs;
+    g_flipUsTotal += flipUs;
+    g_flipCalls++;
+    if (waitUs > g_flipWaitUsMax) g_flipWaitUsMax = waitUs;
+    if (flipUs > g_flipUsMax) g_flipUsMax = flipUs;
     g->activeIdx = nextIdx;
+}
+
+void gfx_present_stats(uint64_t *avg_us, uint64_t *max_us,
+                       uint64_t *wait_avg_us, uint64_t *wait_max_us) {
+    if (avg_us) *avg_us = g_flipCalls ? g_flipUsTotal / g_flipCalls : 0;
+    if (max_us) *max_us = g_flipUsMax;
+    if (wait_avg_us) *wait_avg_us = g_flipCalls ? g_flipWaitUsTotal / g_flipCalls : 0;
+    if (wait_max_us) *wait_max_us = g_flipWaitUsMax;
+}
+
+void gfx_present_stats_reset(void) {
+    g_flipUsTotal = g_flipUsMax = g_flipWaitUsTotal = g_flipWaitUsMax = g_flipCalls = 0;
 }
 #endif // GFX_HOST_PREVIEW
 

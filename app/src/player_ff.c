@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <emmintrin.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -164,6 +165,8 @@ static char g_codecLabel[24] = "";
 static int  g_lastErr = 0;
 static int64_t g_lastLagUs = 0;
 static uint64_t g_presentUsTotal = 0, g_presentUsMax = 0, g_presentCalls = 0;
+static uint64_t g_decodeUsTotal = 0, g_decodeUsMax = 0, g_decodeCalls = 0;
+static uint64_t g_fqWaitUsTotal = 0, g_fqWaitUsMax = 0, g_fqWaitCalls = 0;
 static int  g_isHls = 0;
 static int  g_hlsSegGen = 0;
 static int  g_hlsResetGen = 0;
@@ -177,6 +180,8 @@ static int  g_hlsSegDemux = 0;
 #define PLAYER_DECODE_THREAD 1
 #define FQ_SLOTS 24
 #define HLS_START_FRAMES 5     // show the first frame after fewer buffered frames -> faster channel start
+#define PREVIDEO_SLOTS 512
+#define PREVIDEO_BYTES (32 * 1024 * 1024)
 
 typedef struct { AVFrame *frame; } FrameSlot;   // ref-counted clone, presented then freed
 static FrameSlot         g_fq[FQ_SLOTS];
@@ -200,8 +205,16 @@ static int               g_rebufHits = 0;      // consecutive rebuffers (for HLS
 static int               g_rebufTotal = 0;     // total rebuffers this playback (telemetry)
 static double            g_bytesPerSec = 0;    // bitrate estimate for time-based buffering
 static double            g_resumeSec = 2.0;    // buffered-seconds needed to resume (LAN vs remote)
+// Fragmented MP4 commonly stores a run of video samples before its audio
+// samples. Keep those samples compressed during startup so demux can reach and
+// decode the audio cushion without filling the much larger decoded-frame queue.
+static AVPacket          *g_preVideo[PREVIDEO_SLOTS];
+static int                g_preVideoCount;
+static int64_t            g_preVideoBytes;
+static int                g_preVideoAudioAfter;
 
 static void  fq_flush(void);
+static void  prevideo_clear(void);
 static void  ro_clear(void);
 static void  apply_hls_reset(void);
 static void  seg_readahead_start(void);
@@ -339,6 +352,7 @@ void player_stop(void) {
                  (unsigned long long)((stDec - st0) / 1000),
                  (unsigned long long)((stFetch - stDec) / 1000));
         fq_flush();
+        prevideo_clear();
         scePthreadCondDestroy(&g_fqNotFull);
         scePthreadCondDestroy(&g_fqNotEmpty);
         scePthreadMutexDestroy(&g_fqMtx);
@@ -451,6 +465,9 @@ int player_play(const char *url) {
     g_playUrl[sizeof(g_playUrl) - 1] = '\0';
     g_pkts = g_frames = g_drops = g_queueDrops = g_lateDrops = g_reorderDrops = 0;
     g_presentUsTotal = g_presentUsMax = g_presentCalls = 0;
+    g_decodeUsTotal = g_decodeUsMax = g_decodeCalls = 0;
+    g_fqWaitUsTotal = g_fqWaitUsMax = g_fqWaitCalls = 0;
+    gfx_present_stats_reset();
     g_audioPkts = g_videoPkts = 0; g_lastErr = 0; g_lastLagUs = 0;
     g_hwFailCount = 0;
     // The lobby or previous source may have filled every scanout buffer since
@@ -501,7 +518,7 @@ int player_play(const char *url) {
     if (g_isHls && g_hlsResumeSec >= 0) {
         double actual = 0;
         int src = hls_seek_clamped(g_hlsResumeSec, &actual);
-        trace_mark("seek fmp4 resume target=%.3f rc=%d actual=%.3f", g_hlsResumeSec, src, actual);
+        trace_mark("seek hls resume target=%.3f rc=%d actual=%.3f", g_hlsResumeSec, src, actual);
         g_hlsResumeSec = -1.0;
     }
 
@@ -746,6 +763,7 @@ int player_play(const char *url) {
     // Start the decode thread; main thread will only present. On failure fall
     // back to the single-thread decode-and-present path (g_threaded stays 0).
     g_threaded = 0; g_decStop = 0; g_decEof = 0; g_fqHead = g_fqCount = 0;
+    prevideo_clear();
     for (int i = 0; i < FQ_SLOTS; i++) g_fq[i].frame = NULL;
     scePthreadMutexInit(&g_fqMtx, NULL, "ps4cast_fq");
     scePthreadCondInit(&g_fqNotFull, NULL, "ps4cast_fqnf");
@@ -898,16 +916,26 @@ static void fq_flush(void) {
     scePthreadMutexUnlock(&g_fqMtx);
 }
 
+static void prevideo_clear(void) {
+    for (int i = 0; i < g_preVideoCount; i++)
+        if (g_preVideo[i]) av_packet_free(&g_preVideo[i]);
+    g_preVideoCount = 0;
+    g_preVideoBytes = 0;
+    g_preVideoAudioAfter = 0;
+}
+
 // Apply a pending seek. In threaded mode this runs on the decode thread; in
 // inline mode on the render thread. Either way the ffmpeg context is owned by
 // the caller.
 static void apply_seek(void) {
+    prevideo_clear();
     double sec = g_seekTo;
     uint64_t requestAt = g_seekRequestedAt;
     g_seekPending = 0;
     double actual = sec;
     int seekOk = 0;
-    if (g_isHls && hls_is_fmp4() && hls_can_seek_clamped()) {
+    if (g_isHls && (hls_is_fmp4() || hls_has_separate_audio()) &&
+        hls_can_seek_clamped()) {
         // fMP4 runs on the continuous AVIO/MOV demuxer: moov is already consumed
         // and a concatenated byte stream has no rewind, so seeking in place is
         // impossible. Rebuild at the target instead -- the fresh demuxer then
@@ -915,7 +943,8 @@ static void apply_seek(void) {
         g_hlsResumeSec = sec;
         g_liveRestartPending = 1;
         snprintf(g_status, sizeof(g_status), "seeking %ds", (int)(sec + 0.5));
-        trace_mark("seek fmp4 reopen target=%.3f", sec);
+        trace_mark("seek hls reopen target=%.3f fmp4=%d sepAudio=%d",
+                   sec, hls_is_fmp4(), hls_has_separate_audio());
         return;
     }
     if (g_isHls && hls_can_seek()) {
@@ -1019,13 +1048,21 @@ void player_stats(PlayerStats *s) {
 
 void player_debug(char *out, int len) {
     double ahead = (!g_isLocal && g_bytesPerSec > 0) ? (double)httpsrc_ahead_bytes() / g_bytesPerSec : 0;
+    uint64_t flipAvg = 0, flipMax = 0, flipWaitAvg = 0, flipWaitMax = 0;
+    gfx_present_stats(&flipAvg, &flipMax, &flipWaitAvg, &flipWaitMax);
     snprintf(out, len,
-             "ff%s%s%s %dx%d | fr=%ld drop=%ld(q%ld/l%ld/r%ld) q=%d/%d ro=%d cv=%lluus/%lluus ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s | %s | %s",
+             "ff%s%s%s %dx%d | fr=%ld drop=%ld(q%ld/l%ld/r%ld) q=%d/%d ro=%d cv=%llu/%llu dc=%llu/%llu qw=%llu/%llu flip=%llu/%llu(w%llu/%llu)us ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s | %s | %s",
              g_useHw ? "/HW" : "", g_isHls ? (g_hlsSegDemux ? "/hls-seg" : "/hls") : "", g_threaded ? "/T" : "", g_srcW, g_srcH,
              g_frames, g_drops, g_queueDrops, g_lateDrops, g_reorderDrops, g_fqCount, FQ_SLOTS,
              g_hwReorder,
              (unsigned long long)(g_presentCalls ? g_presentUsTotal / g_presentCalls : 0),
              (unsigned long long)g_presentUsMax,
+             (unsigned long long)(g_decodeCalls ? g_decodeUsTotal / g_decodeCalls : 0),
+             (unsigned long long)g_decodeUsMax,
+             (unsigned long long)(g_fqWaitCalls ? g_fqWaitUsTotal / g_fqWaitCalls : 0),
+             (unsigned long long)g_fqWaitUsMax,
+             (unsigned long long)flipAvg, (unsigned long long)flipMax,
+             (unsigned long long)flipWaitAvg, (unsigned long long)flipWaitMax,
              g_srCount, SEG_RING, g_rebufTotal, ahead,
              (long long)(g_lastLagUs / 1000), g_lastErr, vdec_hw_dmem_outstanding() / 1024,
              g_sepAudioMode ? g_aastream : g_astream, g_sepAudioMode ? "/sep" : "",
@@ -1240,7 +1277,9 @@ static int setup_separate_audio(void) {
 // stopping/seeking). Shared by the software and hardware decode paths.
 static int fq_push(AVFrame *cl) {
     scePthreadMutexLock(&g_fqMtx);
+    uint64_t waitT0 = 0;
     while (!g_decStop && !g_seekPending && g_fqCount >= FQ_SLOTS) {
+        if (!waitT0) waitT0 = sceKernelGetProcessTime();
         // The decode thread is the ONLY producer of audio as well as video, so
         // blocking here on a full video queue also stops audio being decoded and
         // the ring drains to empty — measured as fill swinging 2048ms -> 0ms with
@@ -1250,12 +1289,22 @@ static int fq_push(AVFrame *cl) {
         // one frame costs far less than a gap in the sound, and returning to the
         // loop lets the next audio packets be decoded.
         if (audio_fill_ms() < 400) {
+            if (waitT0) {
+                uint64_t waitUs = sceKernelGetProcessTime() - waitT0;
+                g_fqWaitUsTotal += waitUs; g_fqWaitCalls++;
+                if (waitUs > g_fqWaitUsMax) g_fqWaitUsMax = waitUs;
+            }
             g_drops++; g_queueDrops++;
             scePthreadMutexUnlock(&g_fqMtx);
             av_frame_free(&cl);
             return 1;
         }
         scePthreadCondTimedwait(&g_fqNotFull, &g_fqMtx, 20 * 1000);
+    }
+    if (waitT0) {
+        uint64_t waitUs = sceKernelGetProcessTime() - waitT0;
+        g_fqWaitUsTotal += waitUs; g_fqWaitCalls++;
+        if (waitUs > g_fqWaitUsMax) g_fqWaitUsMax = waitUs;
     }
     if (g_decStop || g_seekPending) { scePthreadMutexUnlock(&g_fqMtx); av_frame_free(&cl); return 0; }
     g_fq[(g_fqHead + g_fqCount) % FQ_SLOTS].frame = cl;
@@ -1370,7 +1419,11 @@ static void decode_video_hw(AVPacket *pkt) {
     while (av_bsf_receive_packet(g_bsf, g_hwPkt) == 0) {
         hw_observe_packet_order(g_hwPkt);
         VdecHwFrame hf;
+        uint64_t decodeT0 = sceKernelGetProcessTime();
         int got = vdec_hw_decode(g_hwPkt->data, g_hwPkt->size, g_hwPkt->pts, g_hwPkt->dts, &hf);
+        uint64_t decodeUs = sceKernelGetProcessTime() - decodeT0;
+        g_decodeUsTotal += decodeUs; g_decodeCalls++;
+        if (decodeUs > g_decodeUsMax) g_decodeUsMax = decodeUs;
         av_packet_unref(g_hwPkt);
         if (got < 0) { if (hw_failover_to_software(got)) break; continue; }
         if (got != 1) continue;
@@ -1397,6 +1450,73 @@ static void decode_video_hw(AVPacket *pkt) {
     }
 }
 
+// Decode one packet from the continuous demuxer. Keeping this in one helper
+// lets fMP4 startup replay its compressed staging queue through exactly the
+// same HW/SW path as ordinary packets.
+static int decode_video_packet(AVPacket *pkt) {
+    if (g_useHw) {
+        if (g_isHls && !hls_is_fmp4()) {
+            int gen = hls_generation();
+            if (gen != g_hlsSegGen) {
+                ro_clear();
+                if (g_bsf) av_bsf_flush(g_bsf);
+                vdec_hw_reset();
+                g_lastEmitPts = AV_NOPTS_VALUE;
+                g_hlsSegGen = gen;
+            }
+        }
+        decode_video_hw(pkt);
+        return !g_decStop && !g_seekPending;
+    }
+
+    if (avcodec_send_packet(g_vdec, pkt) < 0) return 1;
+    for (;;) {
+        int got = avcodec_receive_frame(g_vdec, g_frame);
+        if (got == AVERROR(EAGAIN)) break;
+        if (got < 0) { g_lastErr = got; break; }
+        g_frames++;
+        AVFrame *cl = av_frame_clone(g_frame);
+        av_frame_unref(g_frame);
+        if (!cl) continue;
+        if (!fq_push(cl)) return 0;
+    }
+    return 1;
+}
+
+static int prevideo_stage(AVPacket *pkt) {
+    if (g_preVideoCount >= PREVIDEO_SLOTS ||
+        g_preVideoBytes + pkt->size > PREVIDEO_BYTES)
+        return 0;
+    AVPacket *copy = av_packet_clone(pkt);
+    if (!copy) return 0;
+    g_preVideo[g_preVideoCount++] = copy;
+    g_preVideoBytes += copy->size;
+    return 1;
+}
+
+static int prevideo_drain(void) {
+    for (int i = 0; i < g_preVideoCount; i++) {
+        AVPacket *pkt = g_preVideo[i];
+        g_preVideo[i] = NULL;
+        if (pkt) {
+            int ok = decode_video_packet(pkt);
+            av_packet_free(&pkt);
+            if (!ok) {
+                for (int j = i + 1; j < g_preVideoCount; j++)
+                    if (g_preVideo[j]) av_packet_free(&g_preVideo[j]);
+                g_preVideoCount = 0;
+                g_preVideoBytes = 0;
+                g_preVideoAudioAfter = 0;
+                return 0;
+            }
+        }
+    }
+    g_preVideoCount = 0;
+    g_preVideoBytes = 0;
+    g_preVideoAudioAfter = 0;
+    return 1;
+}
+
 // HLS segment-demux hardware path: MPEG-TS packets are already annex-b (SPS/PPS
 // in-band, one access unit per packet), so feed them straight to the GPU decoder
 // — no bitstream filter. Unlike the direct path, the queue stores PTS in
@@ -1405,7 +1525,11 @@ static void decode_video_hw(AVPacket *pkt) {
 static void decode_video_hw_seg(AVPacket *pkt, AVRational vtb) {
     hw_observe_packet_order(pkt);
     VdecHwFrame hf;
+    uint64_t decodeT0 = sceKernelGetProcessTime();
     int got = vdec_hw_decode(pkt->data, pkt->size, pkt->pts, pkt->dts, &hf);
+    uint64_t decodeUs = sceKernelGetProcessTime() - decodeT0;
+    g_decodeUsTotal += decodeUs; g_decodeCalls++;
+    if (decodeUs > g_decodeUsMax) g_decodeUsMax = decodeUs;
     if (got < 0) { hw_failover_to_software(got); return; }
     if (got != 1) return;
     g_hwFailCount = 0;
@@ -1481,6 +1605,45 @@ static inline uint32_t pack_yuv(uint8_t y, int rv, int guv, int bu) {
     return 0x80000000u | ((uint32_t)r << 16) | ((uint32_t)gg << 8) | (uint32_t)b;
 }
 
+// Eight-pixel BT.709 limited-range NV12 -> BGRA conversion. PS4's Jaguar CPU
+// guarantees SSE2; processing four chroma pairs together removes most scalar
+// table traffic and per-pixel packing from the native-width 1080p path.
+static inline void convert_8_nv12(const uint8_t *y, const uint8_t *uv, uint32_t *out) {
+    const __m128i z = _mm_setzero_si128();
+    const __m128i bias16 = _mm_set1_epi16(16);
+    const __m128i bias128 = _mm_set1_epi16(128);
+    __m128i y8 = _mm_loadl_epi64((const __m128i *)y);
+    __m128i uv8 = _mm_loadl_epi64((const __m128i *)uv);
+    __m128i u16pairs = _mm_and_si128(uv8, _mm_set1_epi16(0x00ff));
+    __m128i v16pairs = _mm_srli_epi16(uv8, 8);
+    __m128i u4 = _mm_packus_epi16(u16pairs, z);
+    __m128i v4 = _mm_packus_epi16(v16pairs, z);
+    __m128i u8 = _mm_unpacklo_epi8(u4, u4);
+    __m128i v8 = _mm_unpacklo_epi8(v4, v4);
+
+    __m128i yw = _mm_sub_epi16(_mm_unpacklo_epi8(y8, z), bias16);
+    __m128i uw = _mm_sub_epi16(_mm_unpacklo_epi8(u8, z), bias128);
+    __m128i vw = _mm_sub_epi16(_mm_unpacklo_epi8(v8, z), bias128);
+    __m128i yc = _mm_mullo_epi16(yw, _mm_set1_epi16(74));
+    __m128i rw = _mm_adds_epi16(yc, _mm_mullo_epi16(vw, _mm_set1_epi16(115)));
+    __m128i gw = _mm_adds_epi16(yc, _mm_adds_epi16(
+        _mm_mullo_epi16(uw, _mm_set1_epi16(-14)),
+        _mm_mullo_epi16(vw, _mm_set1_epi16(-34))));
+    __m128i bw = _mm_adds_epi16(yc, _mm_mullo_epi16(uw, _mm_set1_epi16(135)));
+    rw = _mm_srai_epi16(rw, 6);
+    gw = _mm_srai_epi16(gw, 6);
+    bw = _mm_srai_epi16(bw, 6);
+
+    __m128i rb = _mm_packus_epi16(rw, z);
+    __m128i gb = _mm_packus_epi16(gw, z);
+    __m128i bb = _mm_packus_epi16(bw, z);
+    __m128i ab = _mm_set1_epi8((char)0x80);
+    __m128i bg = _mm_unpacklo_epi8(bb, gb);
+    __m128i ra = _mm_unpacklo_epi8(rb, ab);
+    _mm_storeu_si128((__m128i *)(out + 0), _mm_unpacklo_epi16(bg, ra));
+    _mm_storeu_si128((__m128i *)(out + 4), _mm_unpackhi_epi16(bg, ra));
+}
+
 static void prepare_present_map(int sw, int scaledW) {
     if (sw == g_presentMapSW && scaledW == g_presentMapDW) return;
     for (int x = 0; x < scaledW; x++) {
@@ -1502,7 +1665,10 @@ static void convert_band(const PresentJob *j, int b0, int b1) {
         const uint8_t *uvrow = j->uv + (size_t)(srcY >> 1) * j->uvpitch;
         uint32_t *out = j->dst + (size_t)(j->oy + oy) * j->dstPitch + j->ox;
         if (j->directX) {
-            for (int x = 0; x < j->scaledW; x += 2) {
+            int x = 0;
+            for (; x + 7 < j->scaledW; x += 8)
+                convert_8_nv12(yrow + x, uvrow + x, out + x);
+            for (; x < j->scaledW; x += 2) {
                 int u = uvrow[x], v = uvrow[x + 1];
                 int rv = g_rVTab[v], guv = g_gUTab[u] + g_gVTab[v], bu = g_bUTab[u];
                 out[x] = pack_yuv(yrow[x], rv, guv, bu);
@@ -1699,43 +1865,41 @@ static void *decode_thread_main(void *arg) {
 
         int rc = av_read_frame(g_fmt, g_pkt);
         if (rc < 0) {
+            if (g_preVideoCount > 0) prevideo_drain();
             if (g_useHw && g_roN > 0) ro_drain();   // flush remaining reordered frames
             g_decEof = 1; sceKernelUsleep(30000); continue;   // EOF: idle (resumable by seek)
         }
 
         g_pkts++;
         int sidx = g_pkt->stream_index;
-        if (g_haveAudio && sidx == g_astream) { g_audioPkts++; decode_audio_pkt(); av_packet_unref(g_pkt); continue; }
+        if (g_haveAudio && sidx == g_astream) {
+            g_audioPkts++;
+            decode_audio_pkt();
+            if (g_isHls && hls_is_fmp4() && g_preVideoCount > 0)
+                g_preVideoAudioAfter = 1;
+            av_packet_unref(g_pkt);
+            continue;
+        }
         if (sidx != g_vstream) { av_packet_unref(g_pkt); continue; }
         g_videoPkts++;
 
-        if (g_useHw) {
-            if (g_isHls && !hls_is_fmp4()) {
-                int gen = hls_generation();
-                if (gen != g_hlsSegGen) {
-                    ro_clear();
-                    if (g_bsf) av_bsf_flush(g_bsf);
-                    vdec_hw_reset();
-                    g_lastEmitPts = AV_NOPTS_VALUE;
-                    g_hlsSegGen = gen;
-                }
+        if (g_isHls && hls_is_fmp4() && g_haveAudio) {
+            // MOV fragments are commonly laid out as a video run followed by an
+            // audio run. At the first packet of the NEXT video run, release the
+            // previous run: its complete audio cushion is already decoded.
+            if (g_preVideoCount > 0 && g_preVideoAudioAfter &&
+                !prevideo_drain()) {
+                av_packet_unref(g_pkt);
+                continue;
             }
-            decode_video_hw(g_pkt); av_packet_unref(g_pkt); continue;
+            if (prevideo_stage(g_pkt)) { av_packet_unref(g_pkt); continue; }
+            // Pathological fragment: preserve order and stay memory-bounded.
+            if (!prevideo_drain()) { av_packet_unref(g_pkt); continue; }
+            if (prevideo_stage(g_pkt)) { av_packet_unref(g_pkt); continue; }
         }
 
-        if (avcodec_send_packet(g_vdec, g_pkt) < 0) { av_packet_unref(g_pkt); continue; }
+        decode_video_packet(g_pkt);
         av_packet_unref(g_pkt);
-
-        for (;;) {
-            int got = avcodec_receive_frame(g_vdec, g_frame);
-            if (got == AVERROR(EAGAIN)) break;
-            if (got < 0) { g_lastErr = got; break; }
-            g_frames++;
-            AVFrame *cl = av_frame_clone(g_frame);
-            av_frame_unref(g_frame);
-            if (!cl) continue;
-            if (!fq_push(cl)) break;
-        }
     }
     return NULL;
 }
@@ -2063,8 +2227,15 @@ static int render_threaded(Gfx *g) {
         // the clocks; steady-state production can then absorb segment/demux
         // jitter without trading pictures for sound.
         int startupAudioMs = g_isHls ? 1000 : 500;
+        // Fragmented MOV commonly emits a long run of video samples before the
+        // first audio burst. If presentation stays gated while that run fills
+        // the frame queue, fq_push must discard pictures just to let demux reach
+        // audio. Release the clocks only at near-full backpressure; normal HLS
+        // still waits for its full audio cushion.
+        int fmp4Backpressure = g_isHls && hls_is_fmp4() &&
+                               g_fqCount >= FQ_SLOTS - 2;
         int audioReady = !g_haveAudio || audio_fill_ms() >= startupAudioMs ||
-                         elapsed >= 2500000ULL || g_decEof;
+                         fmp4Backpressure || elapsed >= 2500000ULL || g_decEof;
         if ((!videoReady || !audioReady) && elapsed < 5000000ULL && !g_decEof)
             return 0;
         g_rebuffering = 0;

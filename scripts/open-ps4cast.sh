@@ -107,7 +107,7 @@ else
   # This avoids both a brittle fixed delay and input sent during negotiation.
   stream_ready=""
   for _ in $(seq 1 240); do
-    if grep -q "successfully received streaminfo" "$CHIAKI_LOG"; then
+    if grep -Eq "successfully received streaminfo|Estimated source FPS" "$CHIAKI_LOG"; then
       stream_ready=1
       break
     fi

@@ -34,6 +34,9 @@ typedef struct {
 // Lifecycle
 int  gfx_init(Gfx *g, int width, int height);   // returns 0 on success
 void gfx_present(Gfx *g, int frameID);          // submit flip + wait + swap
+void gfx_present_stats(uint64_t *avg_us, uint64_t *max_us,
+                       uint64_t *wait_avg_us, uint64_t *wait_max_us);
+void gfx_present_stats_reset(void);
 // Best-effort release of the display/GPU context before a fatal _exit, so the
 // kernel can reclaim it and the process doesn't become unkillable. Idempotent.
 void gfx_emergency_release(void);

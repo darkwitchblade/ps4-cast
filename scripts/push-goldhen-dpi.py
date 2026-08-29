@@ -13,6 +13,7 @@ newer GoldHEN builds:
 from __future__ import annotations
 
 import argparse
+import errno
 import http.client
 import http.server
 import json
@@ -340,7 +341,7 @@ def send_agent_command(
         return b"".join(chunks).decode("utf-8", "replace").strip()
 
 
-def post_payload(ps4_ip: str, payload: bytes) -> tuple[int | None, bytes]:
+def post_payload(ps4_ip: str, payload: bytes) -> tuple[bool, int | None, bytes]:
     req = urllib.request.Request(
         f"http://{ps4_ip}:9090/payload",
         data=payload,
@@ -350,39 +351,45 @@ def post_payload(ps4_ip: str, payload: bytes) -> tuple[int | None, bytes]:
     try:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(req, timeout=15) as resp:
-            return resp.status, resp.read()
+            return True, resp.status, resp.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
-    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError) as exc:
+        return True, exc.code, exc.read()
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, OSError) and reason.errno in (
+            errno.ECONNREFUSED,
+            errno.EHOSTUNREACH,
+            errno.ENETUNREACH,
+        ):
+            return False, None, b""
+        # A timeout/reset after connect can mean GoldHEN accepted and started
+        # the payload without completing the HTTP response.
+        print(f"payload POST returned no HTTP acknowledgement: {exc}")
+        return True, None, b""
+    except (http.client.HTTPException, TimeoutError, ConnectionError) as exc:
         # Some GoldHEN builds execute the uploaded payload and close the socket
         # without returning an HTTP response. The metadata callback below is the
         # authoritative acknowledgement.
         print(f"payload POST returned no HTTP acknowledgement: {exc}")
-        return None, b""
+        return True, None, b""
 
 
-def wait_for_goldhen(ps4: str, port: int, timeout_s: int) -> bool:
-    """Wait until GoldHEN's payload listener accepts connections.
-
-    The payload server is armed from the console UI and (on this setup) does
-    not survive a title close -- so after the app-close pre-flight the port is
-    often DOWN again even though it was up a minute ago. Poll instead of
-    failing, prompting for one console-side rearm when needed.
-    """
+def post_payload_when_ready(
+    ps4: str, payload: bytes, timeout_s: int
+) -> tuple[int | None, bytes] | None:
+    """Retry the real POST until GoldHEN accepts it; never probe the one-shot port."""
     deadline = time.time() + timeout_s
     prompted = False
     while time.time() < deadline:
-        try:
-            with socket.create_connection((ps4, port), timeout=1):
-                return True
-        except OSError:
-            pass
+        accepted, status, body = post_payload(ps4, payload)
+        if accepted:
+            return status, body
         if not prompted:
-            print(f"GoldHEN :{port} is down (it does not survive an app close).")
+            print("GoldHEN :9090 is down (it does not survive an app close).")
             print(">> On the PS4: Settings -> GoldHEN -> Payload Server -> enable/re-arm now.")
             prompted = True
         time.sleep(2)
-    return False
+    return None
 
 
 def main() -> int:
@@ -438,11 +445,14 @@ def main() -> int:
                 close_running_app(args.ps4)
             else:
                 print("agent: not resident; --no-close set, skipping app-close pre-flight")
-            if not wait_for_goldhen(args.ps4, 9090, args.rearm_wait):
+            posted = post_payload_when_ready(
+                args.ps4, args.payload.read_bytes(), args.rearm_wait
+            )
+            if posted is None:
                 print("GoldHEN :9090 never came up; aborting without burning anything.", file=sys.stderr)
                 return 1
             print("bootstrapping once through GoldHEN :9090")
-            status, body = post_payload(args.ps4, args.payload.read_bytes())
+            status, body = posted
             if status is not None:
                 print(f"payload POST -> HTTP {status} {body[:120]!r}")
             install_status = send_agent_command(

@@ -109,6 +109,8 @@ static int        g_autoMaxHeight = 720;
 static int        g_requestedMaxHeight = 720;
 
 static int next_higher_variant(int current);
+static void apref_stop(void);
+static void apref_start(void);
 
 // ---- separate audio rendition (EXT-X-MEDIA:TYPE=AUDIO) ---------------------
 // When present, the audio is its own playlist of audio-only segments. We parse
@@ -117,6 +119,8 @@ static int next_higher_variant(int current);
 static char  **g_asegs;          // resolved audio segment URLs
 static int     g_asegCount;
 static int     g_asegIdx;        // current audio segment
+static int     g_asegDurMs[HLS_MAX_SEGMENTS];
+static int64_t g_aTotalDurMs;
 static char   *g_aInit;          // audio fMP4 init segment (EXT-X-MAP), or NULL
 static int     g_aInitPending;   // 1 = audio init still to be streamed first
 static int     g_audioReady;     // a separate audio rendition is parsed + usable
@@ -244,10 +248,9 @@ void hls_set_decode_cap(int max_height) {
 }
 int hls_can_seek(void) {
     // fMP4 (EXT-X-MAP) IS seekable: the init segment just has to be re-sent
-    // before the target media segment, which hls_seek_clamped now does. Separate
-    // audio still blocks it -- there is no audio segment index to move in step,
-    // so seeking video alone would desync A/V.
-    return g_active && !g_isLive && !g_sepAudio &&
+    // before the target media segment, which hls_seek_clamped now does. External
+    // audio renditions carry an independent EXTINF index and move with video.
+    return g_active && !g_isLive &&
            g_segCount > 0 && g_totalDurMs > 0;
 }
 
@@ -256,7 +259,7 @@ int hls_can_seek(void) {
 // segment-index seek clamped to the currently known window; on a genuine live
 // sliding window this simply clamps to the oldest retained segment.
 int hls_can_seek_clamped(void) {
-    return g_active && !g_sepAudio && g_segCount > 0;
+    return g_active && g_segCount > 0;
 }
 double hls_duration(void) {
     return g_totalDurMs > 0 ? (double)g_totalDurMs / 1000.0 : 0.0;
@@ -468,7 +471,8 @@ int hls_seek_clamped(double seconds, double *actual) {
     if (seconds > hls_duration()) seconds = hls_duration();
 
     prefetch_stop();
-    aseg_resume(); // external segment fetch resumes after the old cache is joined
+    apref_stop();
+    aseg_resume(); // both fetch owners are joined; clear their sticky abort
     if (g_open) { httpsrc_close(); g_open = 0; }
     if (g_memBuf) { free(g_memBuf); g_memBuf = NULL; }
     g_memSeg = -1; g_memLen = g_memPos = 0;
@@ -491,6 +495,31 @@ int hls_seek_clamped(double seconds, double *actual) {
     g_initPending = (g_initSeg != NULL);
     g_segGen++;
     g_resetGen++;
+
+    // Keep an external audio rendition on the same timeline. The player uses a
+    // full demuxer reopen for this case, so no audio decoder/thread owns these
+    // indices while they are changed.
+    if (g_audioReady) {
+        if (g_aBuf) { free(g_aBuf); g_aBuf = NULL; }
+        g_aBufLen = g_aBufPos = 0;
+        int atarget = g_asegCount;
+        int64_t astartMs = 0;
+        // Follow the VIDEO'S actual segment boundary. Audio playlists often use
+        // a different segment cadence; indexing both from the requested time can
+        // start audio several seconds ahead of a coarse-keyframe video segment.
+        int64_t audioWantMs = startMs;
+        for (int i = 0; i < g_asegCount; i++) {
+            int dur = g_asegDurMs[i] > 0 ? g_asegDurMs[i] : g_targetDurMs;
+            if (audioWantMs < astartMs + dur) { atarget = i; break; }
+            astartMs += dur;
+        }
+        g_asegIdx = atarget;
+        g_aInitPending = (g_aInit != NULL);
+        g_aAbort = 0;
+        if (!g_aInitPending) apref_start();
+        trace_mark("hls audio seek req=%.3f seg=%d/%d actual=%.3f",
+                   seconds, atarget, g_asegCount, (double)astartMs / 1000.0);
+    }
     if (actual) *actual = (double)startMs / 1000.0;
     trace_mark("hls seek req=%.3f seg=%d/%d actual=%.3f reset=%d",
                seconds, target, g_segCount, (double)startMs / 1000.0, g_resetGen);
@@ -824,33 +853,22 @@ static int find_audio_uri(const char *body, const char *base, const char *group,
 // Parse an audio media playlist body into the audio segment list (mirrors
 // parse_media but for the separate audio path). base = the audio playlist URL.
 static int parse_audio_segs(char *body, const char *base) {
-    g_asegs = malloc(sizeof(char *) * HLS_MAX_SEGMENTS);
-    if (!g_asegs) return -1;
-    g_asegCount = 0;
-    free(g_aInit); g_aInit = NULL;
-
-    char resolved[2048];
-    char *save = NULL;
-    for (char *line = strtok_r(body, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-        rstrip(line);
-        if (line[0] == '\0') continue;
-        if (line[0] == '#') {
-            const char *map = strstr(line, "#EXT-X-MAP:");
-            if (map) {
-                char raw[2048];
-                if (attr_quoted(map, "URI=", raw, sizeof(raw))) {
-                    hlspl_resolve_url(base, raw, resolved, sizeof(resolved));
-                    free(g_aInit); g_aInit = strdup(resolved);
-                }
-            }
-            continue;
-        }
-        if (g_asegCount >= HLS_MAX_SEGMENTS) break;
-        hlspl_resolve_url(base, line, resolved, sizeof(resolved));
-        g_asegs[g_asegCount] = strdup(resolved);
-        if (g_asegs[g_asegCount]) g_asegCount++;
+    HlsPlaylist *apl = calloc(1, sizeof(*apl));
+    if (!apl) return -1;
+    hlspl_init(apl);
+    int rc = hlspl_parse_media(apl, body, base);
+    if (rc == 0) {
+        g_asegs = apl->segs;
+        g_asegCount = apl->segCount;
+        g_aInit = apl->initSeg;
+        g_aTotalDurMs = apl->totalDurMs;
+        memcpy(g_asegDurMs, apl->segDurMs, sizeof(g_asegDurMs));
+        apl->segs = NULL;
+        apl->initSeg = NULL;
     }
-    return g_asegCount > 0 ? 0 : -1;
+    hlspl_free(apl);
+    free(apl);
+    return rc;
 }
 
 static void free_asegs(void) {
@@ -860,7 +878,8 @@ static void free_asegs(void) {
     }
     free(g_aInit); g_aInit = NULL;
     if (g_aBuf) { free(g_aBuf); g_aBuf = NULL; }
-    g_asegCount = 0; g_asegIdx = 0; g_aInitPending = 0;
+    g_asegCount = 0; g_asegIdx = 0; g_aInitPending = 0; g_aTotalDurMs = 0;
+    memset(g_asegDurMs, 0, sizeof(g_asegDurMs));
     g_aBufLen = g_aBufPos = 0; g_audioReady = 0;
 }
 

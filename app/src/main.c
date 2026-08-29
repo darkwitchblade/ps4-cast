@@ -407,6 +407,17 @@ typedef struct {
     int ok;
 } PadState;
 
+// HDMI-CEC TV remotes are exposed on the SPECIAL pad port. Reads on that port
+// can block, so it is owned exclusively by this worker; the render/HTTP threads
+// only consume atomically-published button state.
+static volatile uint32_t g_remotePressed;
+static volatile uint32_t g_remoteDown;
+static volatile int g_remoteStop;
+static volatile int g_remoteHandle = -1;
+static volatile int g_remoteReadRc = -999;
+static volatile int g_remoteConnected;
+static volatile int g_remoteIndex;
+
 static int pad_init(PadState *p) {
     memset(p, 0, sizeof(*p));
     for (int i = 0; i < 8; i++) p->handles[i] = -1;
@@ -470,7 +481,9 @@ static uint32_t pad_poll(PadState *p) {
         pressed |= pbits;
     }
     char diag[240];
-    int n = snprintf(diag, sizeof(diag), "pad n=%d", p->count);
+    int n = snprintf(diag, sizeof(diag), "pad n=%d rem(i=%d h=%d r=%d c=%d b=%08x)",
+                     p->count, g_remoteIndex, g_remoteHandle, g_remoteReadRc,
+                     g_remoteConnected, g_remoteDown);
     for (int i = 0; i < p->count && n < (int)sizeof(diag) - 1; i++) {
         n += snprintf(diag + n, sizeof(diag) - n,
                       " [%d t=%d i=%d h=%d r=%d xr=%d c=%d b=%08x ct=%d dc=%d x=%02x%02x%02x%02x%s]",
@@ -491,6 +504,54 @@ static uint32_t pad_held(PadState *p) {
     if (!p->ok) return 0;
     for (int i = 0; i < p->count; i++) if (p->readRc[i] == 0) m |= p->down[i];
     return m;
+}
+
+static void *remote_thread_main(void *arg) {
+    (void)arg;
+    int user = -1;
+    int h = -1;
+    int index = 0;
+    uint32_t prev = 0;
+    while (!g_remoteStop) {
+        if (h < 0) {
+            if (user < 0) sceUserServiceGetInitialUser(&user);
+            if (user < 0) { sceKernelUsleep(1000 * 1000); continue; }
+            g_remoteIndex = index;
+            h = scePadOpen(user, ORBIS_PAD_PORT_TYPE_SPECIAL, index, NULL);
+            g_remoteHandle = h;
+            if (h < 0) {
+                index = (index + 1) % 4;
+                sceKernelUsleep(1000 * 1000);
+                continue;
+            }
+            prev = 0;
+        }
+
+        OrbisPadData d;
+        memset(&d, 0, sizeof(d));
+        int rc = scePadReadStateExt(h, &d);
+        g_remoteReadRc = rc;
+        if (g_remoteStop) break;
+        if (rc != 0) {
+            scePadClose(h);
+            h = -1; g_remoteHandle = -1; g_remoteConnected = 0;
+            index = (index + 1) % 4;
+            __sync_lock_test_and_set(&g_remoteDown, 0);
+            sceKernelUsleep(500 * 1000);
+            continue;
+        }
+
+        g_remoteConnected = d.connected ? 1 : 0;
+        uint32_t down = d.connected ? d.buttons : 0;
+        uint32_t edges = down & ~prev;
+        prev = down;
+        __sync_lock_test_and_set(&g_remoteDown, down);
+        if (edges) __sync_fetch_and_or(&g_remotePressed, edges);
+        sceKernelUsleep(16 * 1000);
+    }
+    if (h >= 0) scePadClose(h);
+    g_remoteHandle = -1;
+    return NULL;
 }
 
 // Live scrub preview: while a seek button is held the HUD shows this target and
@@ -802,6 +863,10 @@ int main(void) {
     PlaybackOrigin playbackOrigin = PLAYBACK_CAST;
     PadState pad;
     pad_init(&pad);
+    OrbisPthread remoteThread;
+    int remoteThreadUp =
+        (scePthreadCreate(&remoteThread, NULL, remote_thread_main, NULL,
+                          "ps4cast_remote") == 0);
     sys_diag_update();                // prime the user/system snapshot before the loop reads it
 
     while (running) {
@@ -809,7 +874,8 @@ int main(void) {
         g_wdBusy = 0;                               // loop is alive again -> back to the strict 15s grace
         uint64_t now = sceKernelGetProcessTime();
         uint32_t pressed = pad_poll(&pad);
-        uint32_t held = pad_held(&pad);
+        pressed |= __sync_lock_test_and_set(&g_remotePressed, 0);
+        uint32_t held = pad_held(&pad) | g_remoteDown;
 
         // A valid PS4 user must be signed in. With an ANONYMOUS foreground user
         // (userId=0xffffffff -> sys_fg_user() <= 0) the system's VideoPlayingChecker
@@ -1299,6 +1365,12 @@ int main(void) {
 
         gfx_present(&g, frameID++);
     }
+    g_remoteStop = 1;
+    if (g_remoteHandle >= 0) scePadClose(g_remoteHandle);
+    // Do not join here: ReadStateExt is a platform HID call that may remain
+    // blocked after close. LoadExec tears down the process immediately below;
+    // waiting for this optional input worker would make clean exit less robust.
+    (void)remoteThreadUp;
     player_stop();
     audio_shutdown();
     // Clean close: returning from main / _exit can be read by the system as an
