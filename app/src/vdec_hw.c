@@ -90,10 +90,9 @@ static DMem    g_pool[POOL_MAX];
 static int     g_poolN, g_poolIdx;
 static uint64_t g_fbSize;
 static long    g_frames;
-static int     g_lastErr;
 static char    g_dbg[160] = "hw off";
 static long    g_openCount, g_closeCount, g_resetCount, g_faultCount, g_slowCount;
-static uint64_t g_lastOpenUs, g_lastCloseUs;
+static uint64_t g_lastCloseUs;
 
 // Input-timestamp FIFO: the decoder may emit a delayed/reordered picture, so we
 // push each AU's pts/dts on submit and pop the front when a frame comes out —
@@ -142,7 +141,6 @@ int vdec_hw_open(int maxW, int maxH, int profile, int level) {
     goldhen_enter(gh, sizeof(gh));            // privileged module load
 
     g_openCount++;
-    g_lastOpenUs = sceKernelGetProcessTime();
     trace_mark("vdec open #%ld %dx%d p%d/l%d", g_openCount, maxW, maxH, profile, level);
 
     int rc = bind_vdec2();
@@ -184,7 +182,7 @@ int vdec_hw_open(int maxW, int maxH, int profile, int level) {
     for (int i = 0; i < g_poolN; i++) {
         if (dmem_alloc(&g_pool[i], g_fbSize, MEM_ONION) != 0) { snprintf(g_dbg, sizeof(g_dbg), "hw pool %d", i); goto fail; }
     }
-    g_poolIdx = 0; g_frames = 0; g_lastErr = 0;
+    g_poolIdx = 0; g_frames = 0;
     goldhen_restore(NULL, 0);                 // decode runs unprivileged
     snprintf(g_dbg, sizeof(g_dbg), "hw H264 %dx%d p%d/l%d fb=%lluKB pool=%d open=%ld close=%ld slow=%ld fault=%ld",
              maxW, maxH, (int)cfg.profile, (int)cfg.maxLevel, (unsigned long long)(g_fbSize / 1024), g_poolN,
@@ -241,7 +239,7 @@ int vdec_hw_decode(const uint8_t *au, int len, int64_t pts, int64_t dts, VdecHwF
         if (g_fifoCount > 0) g_fifoCount--;              // decode failed -> undo the push
         g_faultCount++;
         trace_mark("vdec decode rc=%d frames=%ld", rc, g_frames);
-        g_lastErr = rc; return -1;
+        return -1;
     }
     g_frames++;
     if (!od.isValid || od.frameWidth == 0) return 0;     // accepted, picture buffered -> keep pts

@@ -21,7 +21,7 @@ int64_t wallclock_utc(void) { return T0 + 600; }
 void netmon_ip(char *out, int cap) { snprintf(out, (size_t)cap, "127.0.0.1"); }
 
 static const char *g_log;
-static int gets(const char *path) {
+static int count_gets(const char *path) {
     FILE *f = fopen(g_log, "r");
     if (!f) return 0;
     char line[512], want[256];
@@ -74,7 +74,7 @@ int main(int argc, char **argv) {
     CHECK(epg_now_next(2, now, &on, &nx) == 0);
     EpgProgramme sch[8];
     CHECK(epg_schedule(0, now, sch, 8) == 3 && strcmp(sch[2].title, "Evening") == 0);
-    CHECK(gets("/epg/guide.xml.gz") == 1);
+    CHECK(count_gets("/epg/guide.xml.gz") == 1);
     char path[1024];
     snprintf(path, sizeof path, "%s/ps4cast_epg.cache", getenv("PS4CAST_DATA"));
     CHECK(access(path, R_OK) == 0);
@@ -90,12 +90,12 @@ int main(int argc, char **argv) {
     // Back to the playlist's link: the copy in /data serves it, no download.
     epg_set_url("");
     WAIT(epg_loaded(), 30);
-    CHECK(gets("/epg/guide.xml.gz") == 1);
+    CHECK(count_gets("/epg/guide.xml.gz") == 1);
     CHECK(epg_now_next(0, now, &on, NULL) & 1);
 
     // Refresh downloads again.
     epg_refresh();
-    WAIT(gets("/epg/guide.xml.gz") == 2 && epg_loaded() && status_has("2 channels"), 30);
+    WAIT(count_gets("/epg/guide.xml.gz") == 2 && epg_loaded() && status_has("2 channels"), 30);
 
     // A page that is not a guide.
     snprintf(bad, sizeof bad, "%s/epg/page.html", base);

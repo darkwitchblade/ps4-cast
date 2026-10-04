@@ -14,8 +14,9 @@ int netpol_is_ipv4_literal(const char *host);
 int netpol_host_is_private(const char *host);
 
 // 1 if a Cookie supplied for `origin` may also be sent to `target`: the same
-// host, or a host under origin's parent domain (www.site.com -> cdn.site.com).
-// Anything else (a redirect to an unrelated host) must not receive it.
+// host or one under it, and for a www. host the rest of its domain
+// (www.site.com -> cdn.site.com, but never www.co.uk -> x.co.uk). Anything
+// else (a redirect to another host, even a sibling) must not receive it.
 int netpol_cookie_host_ok(const char *origin, const char *target);
 
 // Unix time (UTC midnight) of a compiler __DATE__ string ("Sep 27 2026"),

@@ -533,8 +533,12 @@ Goal: tolerate crashes during autonomous test loops without getting stuck.
   /data/ps4cast_cfg.txt, `POST /tlsverify`) turns verification off for users
   whose sources use self-signed certificates. The native SceHttp fallback
   honours the same switch.
-- Stream cookies (`|Cookie=`) are only sent to the page's own host and its
-  parent domain, never to CDNs on unrelated hosts after a redirect.
+- Stream cookies (`|Cookie=`) are only sent to the page's own host and hosts
+  under it; a `www.` host also covers the rest of its domain (www.site.com ->
+  cdn.site.com). Siblings in general are not covered: without the Public
+  Suffix List, "site.co.uk" -> "co.uk" or "d1.cloudfront.net" ->
+  "cloudfront.net" would hand the cookie to unrelated sites. A two-label
+  country registry ("co.uk", "com.au", "com.tn") never counts as a www base.
 
 ## HLS AES-128 and byte ranges
 

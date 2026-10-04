@@ -44,6 +44,21 @@ int main(void) {
     CHECK(!netpol_cookie_host_ok("www.site.com", "site.com.evil.com"));
     CHECK(!netpol_cookie_host_ok("1.2.3.4", "1.2.3.5"));
     CHECK(netpol_cookie_host_ok("1.2.3.4", "1.2.3.4"));
+    // Public suffixes: a sibling under a shared suffix is another site.
+    CHECK(!netpol_cookie_host_ok("site.co.uk", "evil.co.uk"));
+    CHECK(!netpol_cookie_host_ok("site.com.au", "evil.com.au"));
+    CHECK(!netpol_cookie_host_ok("d1.cloudfront.net", "d2.cloudfront.net"));
+    CHECK(!netpol_cookie_host_ok("user.github.io", "other.github.io"));
+    CHECK(!netpol_cookie_host_ok("www.co.uk", "evil.co.uk"));
+    CHECK(!netpol_cookie_host_ok("www.com.tn", "evil.com.tn"));
+    CHECK(!netpol_cookie_host_ok("site.co.uk", "co.uk"));
+    // ...while a site under one works as before.
+    CHECK(netpol_cookie_host_ok("www.site.co.uk", "cdn.site.co.uk"));
+    CHECK(netpol_cookie_host_ok("www.site.com.tn", "live.site.com.tn"));
+    CHECK(netpol_cookie_host_ok("site.co.uk", "cdn.site.co.uk"));
+    // A plain sibling is not trusted any more (no www. to say whose domain it is).
+    CHECK(!netpol_cookie_host_ok("cdn1.provider.com", "cdn2.provider.com"));
+    CHECK(netpol_cookie_host_ok("site.com", "www.site.com"));
     CHECK(!netpol_cookie_host_ok("", "site.com"));
 
     // __DATE__ parsing

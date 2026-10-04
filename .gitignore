@@ -38,11 +38,10 @@ oo/
 toolchain/
 toolchain-llvm*.tar.gz
 .DS_Store
-tests/host/test_hls_parse
-tests/host/test_urlopt
-tests/host/test_resolve
-tests/host/test_qr
-tests/host/test_token
+# host test binaries (every test_* except the sources and goldens)
+tests/host/test_*
+!tests/host/test_*.c
+!tests/host/test_*_golden.txt
 tests/host/*.dSYM
 .impeccable.md
 # per-install pairing token, saved by scripts so they don't have to hit

@@ -43,13 +43,22 @@ jobs:
         run: ./portlibs/build-ffmpeg-616.sh
 
       - name: Build PS4 Cast pkg
-        run: ./build.sh
+        run: ./build.sh WERROR=1
 
       - name: Run host unit tests
         run: make -C tests/host test
 
       - name: Run Chrome extension tests
         run: npm --prefix chrome-extension test
+
+      # The app's real hls/aseg/epg/logo/freetv code against a local server
+      # (tests/hls-e2e). Needs the BearSSL sources fetched above and Python's
+      # cryptography package for the encrypted-HLS fixtures.
+      - name: Run end-to-end tests
+        run: |
+          python3 -m venv .venv-e2e
+          .venv-e2e/bin/pip install --quiet cryptography
+          PYTHON=.venv-e2e/bin/python tests/hls-e2e/run.sh
 
       - name: Upload pkg artifact
         uses: actions/upload-artifact@v4

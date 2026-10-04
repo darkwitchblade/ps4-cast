@@ -237,7 +237,6 @@ static volatile int      g_nextStartupHeadstart = 0;
 static int               g_startupHeadstart = 0;
 static uint64_t          g_startupGateAt = 0;
 static int               g_emptyCnt = 0;       // debounce queue-empty
-static int               g_rebufHits = 0;      // consecutive rebuffers (for HLS ABR)
 static int               g_rebufTotal = 0;     // total rebuffers this playback (telemetry)
 static double            g_bytesPerSec = 0;    // bitrate estimate for time-based buffering
 static double            g_resumeSec = 2.0;    // buffered-seconds needed to resume (LAN vs remote)
@@ -1078,7 +1077,7 @@ static int play_open(const char *url, int requestedHeadstart, double resumeSec) 
     g_startupHeadstart = requestedHeadstart;
     g_startupGateAt = sceKernelGetProcessTime();
     g_rebuffering = (g_isHls || g_startupHeadstart) ? 1 : 0;
-    g_emptyCnt = 0; g_rebufHits = 0; g_rebufTotal = 0;
+    g_emptyCnt = 0; g_rebufTotal = 0;
 
     // Last cheap exit before threads start (the separate-audio probe above can
     // take seconds); a newer request would only have to tear all of this down.
@@ -1683,9 +1682,9 @@ void player_debug(char *out, int len) {
     uint64_t fbReused = 0, fbReshown = 0;   // presents that needed no drawing (see gfx.h)
     gfx_reuse_stats(&fbReused, &fbReshown);
     snprintf(out, len,
-             "ff%s%s%s %dx%d | fr=%ld drop=%ld(q%ld/l%ld/r%ld) q=%d/%d ro=%d cv=%llu/%llu dc=%llu/%llu qw=%llu/%llu flip=%llu/%llu(w%llu/%llu)us reuse=%llu/%llu lf=%d ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s | %s | %s",
+             "ff%s%s%s %dx%d | fr=%ld pk=%ld/a%ld drop=%ld(q%ld/l%ld/r%ld) q=%d/%d ro=%d cv=%llu/%llu dc=%llu/%llu qw=%llu/%llu flip=%llu/%llu(w%llu/%llu)us reuse=%llu/%llu lf=%d ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s | %s | %s",
              g_useHw ? "/HW" : "", g_isHls ? (g_hlsSegDemux ? "/hls-seg" : "/hls") : "", g_threaded ? "/T" : "", g_srcW, g_srcH,
-             g_frames, g_drops, g_queueDrops, g_lateDrops, g_reorderDrops, g_fqCount, FQ_SLOTS,
+             g_frames, g_pkts, g_audioPkts, g_drops, g_queueDrops, g_lateDrops, g_reorderDrops, g_fqCount, FQ_SLOTS,
              g_hwReorder,
              (unsigned long long)(g_presentCalls ? g_presentUsTotal / g_presentCalls : 0),
              (unsigned long long)g_presentUsMax,
@@ -3013,7 +3012,7 @@ static int render_threaded(Gfx *g) {
     if (g_gotFrame) {
         if (g_fqCount == 0 && !g_decEof) g_emptyCnt++; else g_emptyCnt = 0;
         if (!g_rebuffering && g_emptyCnt >= 4) {
-            g_rebuffering = 1; g_rebufTotal++; g_rebufHits++; audio_pause(1);
+            g_rebuffering = 1; g_rebufTotal++; audio_pause(1);
             // ABR: every rebuffer steps an HLS stream down a bitrate (downshift fast).
             if (g_isHls) hls_request_downshift();
         }

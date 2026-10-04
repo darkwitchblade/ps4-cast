@@ -14,7 +14,7 @@ state = {"k_rot": 0}
 def enc(key, iv, data):
     p = padding.PKCS7(128).padder(); d = p.update(data) + p.finalize()
     e = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor(); return e.update(d) + e.finalize()
-def rnd(n, seed): 
+def rnd(n, seed):
     import random; r = random.Random(seed); return bytes(r.getrandbits(8) for _ in range(n))
 def expect(name, data): open(os.path.join(OUT, name), "wb").write(data)
 

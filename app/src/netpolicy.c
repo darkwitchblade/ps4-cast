@@ -1,6 +1,7 @@
 #include "netpolicy.h"
 
 #include <string.h>
+#include <strings.h>
 
 static int lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
@@ -51,16 +52,36 @@ int netpol_host_is_private(const char *host) {
     return 0;
 }
 
+// A two-label name that is a country's second-level registry rather than a
+// site: "co.uk", "com.au", "com.tn". Without the full Public Suffix List
+// this is a heuristic, and it is only ever used to refuse.
+static int cc_registry(const char *d) {
+    static const char *const sld[] = {
+        "ac", "art", "asso", "biz", "co", "com", "ed", "edu", "firm", "gen", "go", "gob", "gouv", "gov",
+        "in", "ind", "info", "int", "lg", "ltd", "mil", "mobi", "ne", "net", "nic", "nom", "or", "org",
+        "plc", "presse", "rec", "res", "sch", "store", "tm", "web", 0 };
+    const char *dot = strchr(d, '.');
+    if (!dot || strchr(dot + 1, '.') || strlen(dot + 1) != 2) return 0;   // <label>.<2-letter TLD>
+    size_t n = (size_t)(dot - d);
+    for (int i = 0; sld[i]; i++)
+        if (strlen(sld[i]) == n && strncasecmp(d, sld[i], n) == 0) return 1;
+    return 0;
+}
+
 int netpol_cookie_host_ok(const char *origin, const char *target) {
     if (!origin || !target || !origin[0] || !target[0]) return 0;
     if (ieq(origin, target)) return 1;
     if (netpol_is_ipv4_literal(origin) || netpol_is_ipv4_literal(target)) return 0;
-    // Parent domain: drop the first label only when at least three remain, so
-    // "site.com" stays "site.com" rather than widening to "com".
-    const char *parent = origin;
-    const char *dot = strchr(origin, '.');
-    if (dot && strchr(dot + 1, '.')) parent = dot + 1;
-    return ieq(target, parent) || ends_with_label(target, parent);
+    if (ends_with_label(target, origin)) return 1;               // the origin's own subdomains
+    // "www.site.com" stands for "site.com", so its other hosts (cdn.site.com)
+    // qualify too. No other widening: dropping a first label in general can
+    // land on a suffix many unrelated sites share -- "site.co.uk" -> "co.uk",
+    // "d1.cloudfront.net" -> "cloudfront.net" -- and hand them the cookie.
+    if (strncasecmp(origin, "www.", 4) == 0) {
+        const char *base = origin + 4;
+        if (strchr(base, '.') && !cc_registry(base)) return ieq(target, base) || ends_with_label(target, base);
+    }
+    return 0;
 }
 
 // Days from 1970-01-01 to y-m-d (proleptic Gregorian; Howard Hinnant's algorithm).

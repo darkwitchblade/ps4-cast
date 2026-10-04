@@ -2,7 +2,7 @@
 # STABLE title id: DirectPackageInstaller updates it in place (one icon). The
 # display TITLE carries the version, and /status reports APP_VER so we always
 # know which build is actually running.
-VERSION     := 04.62
+VERSION     := 04.70
 TITLE       := PS4 Cast $(VERSION)
 TITLE_ID    := PCST00001
 CONTENT_ID  := IV0000-PCST00001_00-PS4CAST000000001
@@ -53,7 +53,8 @@ CPPFILES    := $(wildcard src/*.cpp)
 OBJS        := $(patsubst src/%.c, $(INTDIR)/%.o, $(CFILES)) \
                $(patsubst src/%.cpp, $(INTDIR)/%.o, $(CPPFILES))
 
-# Warnings: -Wall -Wextra on everything we write (the tree builds clean).
+# Warnings: -Wall -Wextra on everything we write. CI builds with WERROR=1 on
+# the current Homebrew LLVM, so a new diagnostic there fails the build.
 # FFmpeg and BearSSL are system includes so a newer compiler's findings in
 # their headers don't bury ours. `make WERROR=1` turns warnings into errors
 # (CI / pre-release); it stays off by default so a newer Homebrew LLVM with

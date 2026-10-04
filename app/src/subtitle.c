@@ -36,7 +36,6 @@ static char    g_spec[2048];         // source the choice and the external file 
 static int     g_pickId = -1;        // the user's choice for g_spec (survives reopens)
 static char    g_pickName[64], g_pickLang[16];
 static char    g_langPref[16];       // Settings: auto-select this language
-static int     g_isHls;
 static int64_t g_startUs;            // media timeline start; external cues are relative to it
 
 static SubList g_ext;                // external file (kept across reopens of the same source)
@@ -131,7 +130,7 @@ void sub_stream_opened(AVFormatContext *fmt, int isHls, const char *spec, int64_
         if (g_jobKind == JOB_EXTERNAL) start_job(JOB_NONE, NULL);   // a fetch for the old source
     }
     subs_list_clear(&g_live);
-    g_isHls = isHls;
+    (void)isHls;   // HLS subtitle renditions arrive through hls.c, not this stream's tracks
     g_startUs = startUs;
     g_trackN = 0;
     int ord = 0;

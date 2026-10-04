@@ -108,10 +108,10 @@ const char *httpsrc_debug(void) {
         scePthreadMutexUnlock(&g_mtx);
     }
     snprintf(b, sizeof(b),
-             "%s buf=%u%% fill=%uKB cache=%llu-%llu serve=%llu wait=%ld stall=%ld last=%dms rec=%ld seek=%ld eof=%d abort=%d",
+             "%s buf=%u%% fill=%uKB cache=%llu-%llu serve=%llu wait=%ld stall=%ld last=%dms rec=%ld ka=%ld seek=%ld eof=%d abort=%d",
              g_dbg, (unsigned)(fill * 100 / RING_CAP), (unsigned)(fill / 1024),
              (unsigned long long)start, (unsigned long long)raw, (unsigned long long)serve,
-             g_waits, g_stalls, g_lastWaitMs, g_reconnects, g_seeks, eof, aborting);
+             g_waits, g_stalls, g_lastWaitMs, g_reconnects, g_kalive, g_seeks, eof, aborting);
     return b;
 }
 uint64_t    httpsrc_size(void)  { return g_total; }
